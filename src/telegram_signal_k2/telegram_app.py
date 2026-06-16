@@ -147,6 +147,7 @@ def create_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("combined_status", combined_status_command))
     application.add_handler(CommandHandler("combined_rule", combined_rule_command))
     application.add_handler(CommandHandler("combined_bind", combined_bind_command))
+    application.add_handler(CommandHandler("combined_menu", combined_menu_command))
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pending_text_handler))
     application.add_error_handler(error_handler)
@@ -171,6 +172,7 @@ async def post_init(application: Application) -> None:
             BotCommand("combined_status", "стан combined mode"),
             BotCommand("combined_rule", "правило all_match або majority_match"),
             BotCommand("combined_bind", "прив'язати поточну гілку для combined"),
+            BotCommand("combined_menu", "кнопки combined таймфреймів"),
             BotCommand("signals_on", "увімкнути сигнали"),
             BotCommand("signals_off", "вимкнути сигнали"),
         ]
@@ -449,6 +451,20 @@ async def combined_status_command(update: Update, context: ContextTypes.DEFAULT_
     await message.reply_text(format_combined_status(chat.id, config))
 
 
+async def combined_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    runtime = get_runtime(context)
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or not await ensure_group_admin(update, context):
+        return
+
+    config = await get_or_create_combined_config(runtime, chat.id)
+    await message.reply_text(
+        build_combined_menu_text(chat.id, config),
+        reply_markup=build_combined_keyboard(config, runtime.settings.timeframes),
+    )
+
+
 async def pending_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     runtime = get_runtime(context)
     message = update.effective_message
@@ -494,6 +510,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await indicator_symbol_callback(query, context, data.removeprefix("indicator_symbol:"))
     elif data.startswith("indicator:"):
         await indicator_value_callback(query, context, data)
+    elif data == "combined_menu":
+        await combined_menu_callback(query, context)
+    elif data.startswith("combined_tf:"):
+        await combined_timeframe_callback(query, context, data.removeprefix("combined_tf:"))
+    elif data == "combined_toggle_enabled":
+        await combined_toggle_enabled_callback(query, context)
+    elif data == "combined_toggle_rule":
+        await combined_toggle_rule_callback(query, context)
+    elif data == "combined_bind_here":
+        await combined_bind_here_callback(query, context)
+    elif data == "combined_refresh":
+        await combined_menu_callback(query, context)
     else:
         await query.answer("Невідома кнопка")
 
@@ -627,6 +655,133 @@ async def indicator_value_callback(query, context: ContextTypes.DEFAULT_TYPE, da
     await reply_to_query(query, text, parse_mode=ParseMode.HTML)
 
 
+async def combined_menu_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[no-untyped-def]
+    runtime = get_runtime(context)
+    chat_id = await combined_query_chat_id(query, context)
+    if chat_id is None:
+        return
+
+    config = await get_or_create_combined_config(runtime, chat_id)
+    await query.answer("Оновлено")
+    await safe_edit_message_text(
+        query,
+        build_combined_menu_text(chat_id, config),
+        reply_markup=build_combined_keyboard(config, runtime.settings.timeframes),
+    )
+
+
+async def combined_timeframe_callback(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    timeframe: str,
+) -> None:  # type: ignore[no-untyped-def]
+    runtime = get_runtime(context)
+    chat_id = await combined_query_chat_id(query, context)
+    if chat_id is None:
+        return
+    if timeframe not in runtime.settings.timeframes:
+        await query.answer("Невідомий таймфрейм", show_alert=True)
+        return
+
+    config = await get_or_create_combined_config(runtime, chat_id)
+
+    def mutate(state: BotState) -> None:
+        state.chat_id = chat_id
+        state.combined_configs[str(chat_id)] = config
+        current = set(state.combined_configs[str(chat_id)].timeframes)
+        if timeframe in current:
+            current.remove(timeframe)
+        else:
+            current.add(timeframe)
+        state.combined_configs[str(chat_id)].timeframes = [
+            item for item in runtime.settings.timeframes if item in current
+        ]
+
+    state = await runtime.store.update(mutate)
+    next_config = state.combined_configs[str(chat_id)]
+    await query.answer(f"{timeframe_label(timeframe)} оновлено")
+    await safe_edit_message_text(
+        query,
+        build_combined_menu_text(chat_id, next_config),
+        reply_markup=build_combined_keyboard(next_config, runtime.settings.timeframes),
+    )
+
+
+async def combined_toggle_enabled_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[no-untyped-def]
+    runtime = get_runtime(context)
+    chat_id = await combined_query_chat_id(query, context)
+    if chat_id is None:
+        return
+    config = await get_or_create_combined_config(runtime, chat_id)
+
+    def mutate(state: BotState) -> None:
+        state.chat_id = chat_id
+        state.combined_configs[str(chat_id)] = config
+        state.combined_configs[str(chat_id)].enabled = not state.combined_configs[str(chat_id)].enabled
+
+    state = await runtime.store.update(mutate)
+    next_config = state.combined_configs[str(chat_id)]
+    await query.answer("Combined увімкнено" if next_config.enabled else "Combined вимкнено")
+    await safe_edit_message_text(
+        query,
+        build_combined_menu_text(chat_id, next_config),
+        reply_markup=build_combined_keyboard(next_config, runtime.settings.timeframes),
+    )
+
+
+async def combined_toggle_rule_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[no-untyped-def]
+    runtime = get_runtime(context)
+    chat_id = await combined_query_chat_id(query, context)
+    if chat_id is None:
+        return
+    config = await get_or_create_combined_config(runtime, chat_id)
+
+    def mutate(state: BotState) -> None:
+        state.chat_id = chat_id
+        state.combined_configs[str(chat_id)] = config
+        current = state.combined_configs[str(chat_id)].rule
+        state.combined_configs[str(chat_id)].rule = (
+            "majority_match" if current == "all_match" else "all_match"
+        )
+
+    state = await runtime.store.update(mutate)
+    next_config = state.combined_configs[str(chat_id)]
+    await query.answer(f"Правило: {next_config.rule}")
+    await safe_edit_message_text(
+        query,
+        build_combined_menu_text(chat_id, next_config),
+        reply_markup=build_combined_keyboard(next_config, runtime.settings.timeframes),
+    )
+
+
+async def combined_bind_here_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:  # type: ignore[no-untyped-def]
+    runtime = get_runtime(context)
+    chat_id = await combined_query_chat_id(query, context)
+    if chat_id is None:
+        return
+    message = query.message
+    if not message or message.message_thread_id is None:
+        await query.answer("Натисни це всередині потрібної гілки", show_alert=True)
+        return
+
+    config = await get_or_create_combined_config(runtime, chat_id)
+    thread_id = message.message_thread_id
+
+    def mutate(state: BotState) -> None:
+        state.chat_id = chat_id
+        state.combined_configs[str(chat_id)] = config
+        state.combined_configs[str(chat_id)].thread_id = thread_id
+
+    state = await runtime.store.update(mutate)
+    next_config = state.combined_configs[str(chat_id)]
+    await query.answer("Гілку прив'язано")
+    await safe_edit_message_text(
+        query,
+        build_combined_menu_text(chat_id, next_config),
+        reply_markup=build_combined_keyboard(next_config, runtime.settings.timeframes),
+    )
+
+
 def build_main_keyboard(state: BotState, timeframes: list[str]) -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
@@ -658,12 +813,88 @@ def build_main_keyboard(state: BotState, timeframes: list[str]) -> InlineKeyboar
                 InlineKeyboardButton("➖ Забрати пару", callback_data="action:remove_menu"),
             ],
             [
+                InlineKeyboardButton("🔀 Combined", callback_data="combined_menu"),
+            ],
+            [
                 InlineKeyboardButton("🔗 Прив'язати гілку", callback_data="action:bind_menu"),
                 InlineKeyboardButton("🔄 Оновити", callback_data="menu:refresh"),
             ],
         ]
     )
     return InlineKeyboardMarkup(buttons)
+
+
+def build_combined_keyboard(config: CombinedConfig, timeframes: list[str]) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    selected = set(config.timeframes)
+    row: list[InlineKeyboardButton] = []
+
+    for timeframe in timeframes:
+        marker = "✅" if timeframe in selected else "⬜"
+        row.append(
+            InlineKeyboardButton(
+                f"{marker} {timeframe_label(timeframe)}",
+                callback_data=f"combined_tf:{timeframe}",
+            )
+        )
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    enabled_label = "🟢 Combined ON" if config.enabled else "🔴 Combined OFF"
+    rule_label = "Rule: всі" if config.rule == "all_match" else "Rule: більшість"
+    buttons.extend(
+        [
+            [
+                InlineKeyboardButton(enabled_label, callback_data="combined_toggle_enabled"),
+                InlineKeyboardButton(rule_label, callback_data="combined_toggle_rule"),
+            ],
+            [
+                InlineKeyboardButton("📍 Ця гілка для combined", callback_data="combined_bind_here"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Оновити", callback_data="combined_refresh"),
+                InlineKeyboardButton("⬅️ Головне меню", callback_data="menu:refresh"),
+            ],
+        ]
+    )
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_combined_menu_text(chat_id: int | str, config: CombinedConfig) -> str:
+    selected = ", ".join(timeframe_label(item) for item in config.timeframes) or "нічого не обрано"
+    thread = config.thread_id if config.thread_id is not None else "головний чат"
+    rule = "всі обрані мають збігтися" if config.rule == "all_match" else "достатньо більшості без конфлікту"
+    return (
+        "Combined timeframe menu\n\n"
+        "Натискай таймфрейми нижче, щоб об'єднати їх в один combined сигнал.\n\n"
+        f"Chat: {chat_id}\n"
+        f"Status: {'ON' if config.enabled else 'OFF'}\n"
+        f"Selected: {selected}\n"
+        f"Rule: {config.rule} ({rule})\n"
+        f"Topic: {thread}\n\n"
+        "Приклад: обери 15хв + 1г, і бот надішле combined LONG/SHORT тільки коли умова збігу виконана."
+    )
+
+
+def timeframe_label(timeframe: str) -> str:
+    labels = {
+        "1m": "1хв",
+        "3m": "3хв",
+        "5m": "5хв",
+        "15m": "15хв",
+        "30m": "30хв",
+        "1h": "1г",
+        "2h": "2г",
+        "4h": "4г",
+        "6h": "6г",
+        "8h": "8г",
+        "12h": "12г",
+        "1d": "1д",
+    }
+    return labels.get(timeframe, timeframe)
 
 
 def build_remove_keyboard(state: BotState) -> InlineKeyboardMarkup:
@@ -1246,6 +1477,38 @@ def format_combined_message(evaluation: CombinedEvaluation, config: CombinedConf
         f"Time: <code>{now}</code>\n\n"
         f"Timeframe details:\n<code>{html.escape(chr(10).join(details))}</code>"
     )
+
+
+async def combined_query_chat_id(query, context: ContextTypes.DEFAULT_TYPE) -> int | str | None:  # type: ignore[no-untyped-def]
+    if not query.message:
+        await query.answer("Немає повідомлення для меню", show_alert=True)
+        return None
+    if not await ensure_query_admin(query, context):
+        return None
+    return query.message.chat.id
+
+
+async def ensure_query_admin(query, context: ContextTypes.DEFAULT_TYPE) -> bool:  # type: ignore[no-untyped-def]
+    message = query.message
+    chat = message.chat if message else None
+    user = query.from_user
+    if not chat or not user:
+        await query.answer("Не можу перевірити права", show_alert=True)
+        return False
+
+    if chat.type == "private":
+        return True
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        status = str(member.status).lower()
+        if "administrator" in status or "creator" in status or "owner" in status:
+            return True
+    except Exception:
+        logger.exception("Failed to verify admin status for chat %s user %s", chat.id, user.id)
+
+    await query.answer("Тільки адміністратори можуть міняти combined mode", show_alert=True)
+    return False
 
 
 async def ensure_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
