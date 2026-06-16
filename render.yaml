@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: telegram-signal-k2
+    runtime: python
+    buildCommand: pip install -e .
+    startCommand: python -m telegram_signal_k2
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_RUN_MODE
+        value: polling
+      - key: SYMBOLS
+        value: BTCUSDT,ETHUSDT,SOLUSDT,HYPEUSDT
+      - key: TIMEFRAMES
+        value: 1m,3m,5m,15m,30m,1h,4h
+      - key: STATE_FILE
+        value: data/state.json
+      - key: CHARTS_ENABLED
+        value: "true"
+

@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Signal K2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/Telegram-Signal-K2
+ExecStart=/opt/Telegram-Signal-K2/.venv/bin/python -m telegram_signal_k2
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
