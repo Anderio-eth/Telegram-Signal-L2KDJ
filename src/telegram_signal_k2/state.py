@@ -50,6 +50,7 @@ class BotState:
     signals_enabled: bool = True
     last_alerts: dict[str, int] = field(default_factory=dict)
     latest_confirmed_signals: dict[str, dict[str, Any]] = field(default_factory=dict)
+    topic_names: dict[str, str] = field(default_factory=dict)
     combined_configs: dict[str, CombinedConfig] = field(default_factory=dict)
     combined_last_alerts: dict[str, int] = field(default_factory=dict)
 
@@ -65,6 +66,9 @@ class BotState:
             latest_confirmed_signals={
                 str(key): dict(value)
                 for key, value in payload.get("latest_confirmed_signals", {}).items()
+            },
+            topic_names={
+                str(key): str(value) for key, value in payload.get("topic_names", {}).items()
             },
             combined_configs={
                 str(key): CombinedConfig.from_payload(value)
@@ -84,6 +88,7 @@ class BotState:
             "signals_enabled": self.signals_enabled,
             "last_alerts": self.last_alerts,
             "latest_confirmed_signals": self.latest_confirmed_signals,
+            "topic_names": self.topic_names,
             "combined_configs": {
                 str(key): value.to_payload() for key, value in self.combined_configs.items()
             },

@@ -131,7 +131,7 @@ class Settings:
             "symbols": symbols,
             "timeframes": timeframes,
             "topic_threads": parse_topic_threads(os.getenv("TOPIC_THREADS")),
-            "poll_seconds": int(os.getenv("POLL_SECONDS", "20")),
+            "poll_seconds": int(os.getenv("POLL_SECONDS", "5")),
             "kline_limit": int(os.getenv("KLINE_LIMIT", "160")),
             "kdj_n1": int(os.getenv("L2_KDJ_N1", "18")),
             "kdj_m1": int(os.getenv("L2_KDJ_M1", "4")),

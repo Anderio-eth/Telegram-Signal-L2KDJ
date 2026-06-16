@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 import aiohttp
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -71,6 +71,14 @@ SIGNAL_MARKERS = {
     SignalKind.SHORT: "🟥",
 }
 
+COMBINED_TOPIC_TITLES = {
+    "combined",
+    "combinedsignals",
+    "combinedsignal",
+    "обєднанісигнали",
+    "обєднані",
+}
+
 
 @dataclass
 class BotRuntime:
@@ -127,6 +135,7 @@ def create_application(settings: Settings) -> Application:
 
     application.add_handler(CommandHandler(["start", "menu"], menu_command))
     application.add_handler(CommandHandler("bind", bind_command))
+    application.add_handler(CommandHandler("autobind", autobind_command))
     application.add_handler(CommandHandler("topics", topics_command))
     application.add_handler(CommandHandler("add", add_command))
     application.add_handler(CommandHandler("remove", remove_command))
@@ -142,6 +151,12 @@ def create_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("combined_bind", combined_bind_command))
     application.add_handler(CommandHandler("combined_menu", combined_menu_command))
     application.add_handler(CallbackQueryHandler(callback_router))
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.FORUM_TOPIC_CREATED | filters.StatusUpdate.FORUM_TOPIC_EDITED,
+            topic_status_handler,
+        )
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pending_text_handler))
     application.add_error_handler(error_handler)
     return application
@@ -150,6 +165,7 @@ def create_application(settings: Settings) -> Application:
 async def post_init(application: Application) -> None:
     runtime: BotRuntime = application.bot_data["runtime"]
     await runtime.store.load()
+    await autobind_known_topics(runtime)
     await application.bot.set_my_commands(
         [
             BotCommand("menu", "панель кнопок"),
@@ -158,6 +174,7 @@ async def post_init(application: Application) -> None:
             BotCommand("add", "додати пару, наприклад /add SOL"),
             BotCommand("remove", "прибрати пару, наприклад /remove SOL"),
             BotCommand("bind", "прив'язати гілку, наприклад /bind 5m"),
+            BotCommand("autobind", "автоприв'язка гілки за її назвою"),
             BotCommand("indicator", "поточний L2 KDJ, наприклад /indicator SOL 5m"),
             BotCommand("combined_on", "увімкнути combined timeframe mode"),
             BotCommand("combined_off", "вимкнути combined timeframe mode"),
@@ -203,6 +220,10 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     await runtime.store.update(lambda state: setattr(state, "chat_id", chat.id))
+    if is_start_command(message.text or "") and message.message_thread_id is not None:
+        if await maybe_reply_topic_start_hint(runtime, message, chat.id):
+            return
+
     state = await runtime.store.get()
     await message.reply_text(MENU_TEXT, reply_markup=build_main_keyboard(state, runtime.settings.timeframes))
 
@@ -233,6 +254,49 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     await bind_topic(runtime, chat.id, timeframe, thread_id)
     await message.reply_text(f"Готово: {timeframe} прив'язано до цієї гілки.")
+
+
+async def autobind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    runtime = get_runtime(context)
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or not await ensure_group_admin(update, context):
+        return
+
+    if message.message_thread_id is None:
+        await autobind_known_topics(runtime)
+        state = await runtime.store.get()
+        await message.reply_text(build_topics_text(state, runtime.settings.timeframes))
+        return
+
+    title = " ".join(context.args).strip()
+    if not title:
+        state = await runtime.store.get()
+        title = known_topic_title(state, chat.id, message.message_thread_id) or ""
+
+    if not title:
+        await message.reply_text(
+            "Telegram не віддає боту назви старих гілок напряму. "
+            "Щоб автоприв'язка спрацювала, перейменуй цю гілку без зміни назви "
+            "або напиши назву після команди, наприклад: /autobind 5хв."
+        )
+        return
+
+    result = await auto_bind_topic_by_title(runtime, chat.id, message.message_thread_id, title)
+    if result == "combined":
+        config = await get_or_create_combined_config(runtime, chat.id)
+        await message.reply_text(
+            combined_start_text(),
+            reply_markup=build_combined_keyboard(config, runtime.settings.timeframes),
+        )
+    elif result:
+        await message.reply_text(timeframe_start_text(result))
+    else:
+        await message.reply_text(
+            f"Не впізнав назву гілки: {html.escape(title)}. "
+            f"Назви її як таймфрейм, наприклад 5хв або 5m, "
+            "або як Combined Signals."
+        )
 
 
 async def topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -452,11 +516,36 @@ async def combined_menu_command(update: Update, context: ContextTypes.DEFAULT_TY
     if not message or not chat or not await ensure_group_admin(update, context):
         return
 
+    if not await ensure_combined_topic(runtime, message, chat.id):
+        return
+
     config = await get_or_create_combined_config(runtime, chat.id)
     await message.reply_text(
         build_combined_menu_text(chat.id, config),
         reply_markup=build_combined_keyboard(config, runtime.settings.timeframes),
     )
+
+
+async def topic_status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    runtime = get_runtime(context)
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or message.message_thread_id is None:
+        return
+
+    title = topic_title_from_message(message)
+    if not title:
+        return
+
+    result = await auto_bind_topic_by_title(runtime, chat.id, message.message_thread_id, title)
+    if result == "combined":
+        config = await get_or_create_combined_config(runtime, chat.id)
+        await message.reply_text(
+            combined_start_text(),
+            reply_markup=build_combined_keyboard(config, runtime.settings.timeframes),
+        )
+    elif result:
+        await message.reply_text(timeframe_start_text(result))
 
 
 async def pending_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -809,9 +898,6 @@ def build_main_keyboard(state: BotState, timeframes: list[str]) -> InlineKeyboar
                 InlineKeyboardButton("➖ Забрати пару", callback_data="action:remove_menu"),
             ],
             [
-                InlineKeyboardButton("🔀 Combined", callback_data="combined_menu"),
-            ],
-            [
                 InlineKeyboardButton("🔗 Прив'язати гілку", callback_data="action:bind_menu"),
                 InlineKeyboardButton("🔄 Оновити", callback_data="menu:refresh"),
             ],
@@ -899,6 +985,97 @@ def timeframe_label(timeframe: str) -> str:
     return labels.get(timeframe, timeframe)
 
 
+def normalize_topic_title(title: str) -> str:
+    return "".join(char for char in title.casefold() if char.isalnum())
+
+
+def timeframe_from_topic_title(title: str, timeframes: list[str]) -> str | None:
+    normalized = normalize_topic_title(title)
+    for timeframe in timeframes:
+        aliases = timeframe_title_aliases(timeframe)
+        if normalized in {normalize_topic_title(alias) for alias in aliases}:
+            return timeframe
+    return None
+
+
+def timeframe_title_aliases(timeframe: str) -> list[str]:
+    aliases = [timeframe, timeframe_label(timeframe)]
+    if timeframe.endswith("m"):
+        value = timeframe[:-1]
+        aliases.extend(
+            [
+                f"{value}m",
+                f"{value}min",
+                f"{value}minute",
+                f"{value}хв",
+                f"{value}хвилин",
+                f"{value}мин",
+            ]
+        )
+    elif timeframe.endswith("h"):
+        value = timeframe[:-1]
+        aliases.extend(
+            [
+                f"{value}h",
+                f"{value}hour",
+                f"{value}г",
+                f"{value}год",
+                f"{value}година",
+                f"{value}години",
+                f"{value}ч",
+                f"{value}час",
+            ]
+        )
+    elif timeframe.endswith("d"):
+        value = timeframe[:-1]
+        aliases.extend([f"{value}d", f"{value}д", f"{value}день"])
+    return aliases
+
+
+def is_combined_topic_title(title: str) -> bool:
+    return normalize_topic_title(title) in COMBINED_TOPIC_TITLES
+
+
+def topic_title_from_message(message: Message) -> str | None:
+    created = getattr(message, "forum_topic_created", None)
+    if created and getattr(created, "name", None):
+        return str(created.name)
+    edited = getattr(message, "forum_topic_edited", None)
+    if edited and getattr(edited, "name", None):
+        return str(edited.name)
+    return None
+
+
+def topic_key(chat_id: int | str, thread_id: int) -> str:
+    return f"{chat_id}:{thread_id}"
+
+
+def parse_topic_key(key: str) -> tuple[str, int] | None:
+    if ":" not in key:
+        return None
+    chat_id, thread_id = key.rsplit(":", 1)
+    try:
+        return chat_id, int(thread_id)
+    except ValueError:
+        return None
+
+
+def known_topic_title(state: BotState, chat_id: int | str, thread_id: int) -> str | None:
+    return state.topic_names.get(topic_key(chat_id, thread_id))
+
+
+def timeframe_for_thread(state: BotState, thread_id: int) -> str | None:
+    for timeframe, stored_thread_id in state.topic_threads.items():
+        if stored_thread_id == thread_id:
+            return timeframe
+    return None
+
+
+def is_start_command(text: str) -> bool:
+    command = text.strip().split(maxsplit=1)[0].split("@", 1)[0]
+    return command == "/start"
+
+
 def build_remove_keyboard(state: BotState) -> InlineKeyboardMarkup:
     if not state.available_symbols:
         return InlineKeyboardMarkup([[InlineKeyboardButton("Немає пар", callback_data="menu:refresh")]])
@@ -958,13 +1135,18 @@ async def monitor_loop(application: Application) -> None:
                 state = await runtime.store.get()
                 if state.signals_enabled and state.chat_id:
                     now = time.monotonic()
+                    due_timeframes = []
                     for timeframe in runtime.settings.timeframes:
                         if now < next_due.get(timeframe, 0.0):
                             continue
-                        next_due[timeframe] = now + max(15, runtime.settings.poll_seconds)
-                        await scan_timeframe(application, client, timeframe)
+                        next_due[timeframe] = now + max(1, runtime.settings.poll_seconds)
+                        due_timeframes.append(timeframe)
+                    if due_timeframes:
+                        await asyncio.gather(
+                            *(scan_timeframe(application, client, timeframe) for timeframe in due_timeframes)
+                        )
                     if now >= next_combined_due:
-                        next_combined_due = now + max(30, runtime.settings.poll_seconds)
+                        next_combined_due = now + max(1, runtime.settings.poll_seconds)
                         await scan_combined_configs(application, client)
                 elif not state.chat_id:
                     logger.debug("No chat_id yet; waiting for /start")
@@ -974,7 +1156,7 @@ async def monitor_loop(application: Application) -> None:
                 logger.exception("Monitor loop iteration failed")
 
             elapsed = time.monotonic() - started_at
-            await asyncio.sleep(max(1.0, runtime.settings.poll_seconds - elapsed))
+            await asyncio.sleep(max(0.5, runtime.settings.poll_seconds - elapsed))
 
 
 async def scan_timeframe(
@@ -988,7 +1170,7 @@ async def scan_timeframe(
     if not symbols:
         return
 
-    for symbol in symbols:
+    async def scan_symbol(symbol: str) -> None:
         try:
             raw_klines = await client.klines(symbol, timeframe, limit=runtime.settings.kline_limit)
             klines = closed_klines(raw_klines)
@@ -1002,7 +1184,8 @@ async def scan_timeframe(
                         await mark_signal_sent(runtime, timeframe, symbol, signal)
         except Exception:
             logger.exception("Failed to scan %s %s", symbol, timeframe)
-        await asyncio.sleep(0.2)
+
+    await asyncio.gather(*(scan_symbol(symbol) for symbol in symbols))
 
 
 async def scan_combined_configs(application: Application, _client: BinanceFuturesClient) -> None:
@@ -1388,6 +1571,130 @@ async def bind_topic(runtime: BotRuntime, chat_id: int | str, timeframe: str, th
     await runtime.store.update(mutate)
 
 
+async def auto_bind_topic_by_title(
+    runtime: BotRuntime,
+    chat_id: int | str,
+    thread_id: int,
+    title: str,
+) -> str | None:
+    timeframe = timeframe_from_topic_title(title, runtime.settings.timeframes)
+    is_combined = is_combined_topic_title(title)
+    config = await get_or_create_combined_config(runtime, chat_id) if is_combined else None
+
+    def mutate(state: BotState) -> None:
+        state.chat_id = chat_id
+        state.topic_names[topic_key(chat_id, thread_id)] = title
+        if timeframe:
+            state.topic_threads[timeframe] = thread_id
+        if is_combined and config is not None:
+            state.combined_configs[str(chat_id)] = config
+            state.combined_configs[str(chat_id)].thread_id = thread_id
+
+    await runtime.store.update(mutate)
+    if timeframe:
+        return timeframe
+    if is_combined:
+        return "combined"
+    return None
+
+
+async def autobind_known_topics(runtime: BotRuntime) -> None:
+    state = await runtime.store.get()
+    known_topics = list(state.topic_names.items())
+    for key, title in known_topics:
+        parsed = parse_topic_key(key)
+        if not parsed:
+            continue
+        chat_id, thread_id = parsed
+        await auto_bind_topic_by_title(runtime, chat_id, thread_id, title)
+
+
+async def maybe_reply_topic_start_hint(
+    runtime: BotRuntime,
+    message: Message,
+    chat_id: int | str,
+) -> bool:
+    thread_id = message.message_thread_id
+    if thread_id is None:
+        return False
+
+    state = await runtime.store.get()
+    title = known_topic_title(state, chat_id, thread_id)
+    if title:
+        await auto_bind_topic_by_title(runtime, chat_id, thread_id, title)
+        state = await runtime.store.get()
+
+    config = state.combined_configs.get(str(chat_id))
+    if config and config.thread_id == thread_id:
+        await message.reply_text(
+            combined_start_text(),
+            reply_markup=build_combined_keyboard(config, runtime.settings.timeframes),
+        )
+        return True
+
+    timeframe = timeframe_for_thread(state, thread_id)
+    if timeframe:
+        await message.reply_text(timeframe_start_text(timeframe))
+        return True
+
+    await message.reply_text(
+        "Я бачу цю гілку, але ще не знаю її назву. "
+        "Якщо це гілка таймфрейму, перейменуй її на 5хв/5m і я прив'яжу автоматично, "
+        "або напиши тут /bind 5m. Для Combined створи/перейменуй гілку на Combined Signals."
+    )
+    return True
+
+
+async def ensure_combined_topic(
+    runtime: BotRuntime,
+    message: Message,
+    chat_id: int | str,
+    query=None,  # type: ignore[no-untyped-def]
+) -> bool:
+    thread_id = message.message_thread_id
+    state = await runtime.store.get()
+    config = state.combined_configs.get(str(chat_id))
+    if thread_id is not None and config and config.thread_id == thread_id:
+        return True
+
+    title = known_topic_title(state, chat_id, thread_id) if thread_id is not None else None
+    if thread_id is not None and title and is_combined_topic_title(title):
+        await auto_bind_topic_by_title(runtime, chat_id, thread_id, title)
+        return True
+
+    text = (
+        "Combined меню доступне тільки в гілці Combined Signals. "
+        "Створи або перейменуй гілку на Combined Signals, відкрий її і напиши /combined_menu."
+    )
+    if query is not None:
+        await query.answer(text, show_alert=True)
+    else:
+        await message.reply_text(text)
+    return False
+
+
+def timeframe_start_text(timeframe: str) -> str:
+    label = timeframe_label(timeframe)
+    return (
+        f"Готово: ця гілка прив'язана як {label} ({timeframe}).\n\n"
+        "Що далі:\n"
+        "- сигнали цього таймфрейму будуть приходити сюди автоматично;\n"
+        "- монети вмикаються/вимикаються через /menu у головній гілці;\n"
+        f"- поточний індикатор можна перевірити командою /indicator SOL {timeframe}."
+    )
+
+
+def combined_start_text() -> str:
+    return (
+        "Це гілка Combined Signals.\n\n"
+        "Що далі:\n"
+        "- обери таймфрейми кнопками нижче;\n"
+        "- натисни Combined ON;\n"
+        "- правило all_match дасть 3/4, коли зібрані всі TF крім найбільшого, "
+        "і фінал 4/4 після підтвердження найбільшого TF."
+    )
+
+
 def build_status_text(state: BotState, runtime: BotRuntime) -> str:
     enabled = ", ".join(display_symbol(symbol) for symbol in state.enabled_symbols) or "немає"
     topics_ready = sum(1 for timeframe in runtime.settings.timeframes if timeframe in state.topic_threads)
@@ -1408,8 +1715,15 @@ def build_topics_text(state: BotState, timeframes: list[str]) -> str:
     lines = ["Прив'язані гілки:"]
     for timeframe in timeframes:
         thread_id = state.topic_threads.get(timeframe)
+        title = None
+        if thread_id is not None and state.chat_id is not None:
+            title = known_topic_title(state, state.chat_id, thread_id)
         status = str(thread_id) if thread_id is not None else "не прив'язано"
+        if title:
+            status = f"{status} ({title})"
         lines.append(f"- {timeframe}: {status}")
+    lines.append("")
+    lines.append("Автоприв'язка працює для назв типу 1хв/1m, 2г/2h і Combined Signals.")
     return "\n".join(lines)
 
 
@@ -1485,6 +1799,9 @@ async def combined_query_chat_id(query, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.answer("Немає повідомлення для меню", show_alert=True)
         return None
     if not await ensure_query_admin(query, context):
+        return None
+    runtime = get_runtime(context)
+    if not await ensure_combined_topic(runtime, query.message, query.message.chat.id, query=query):
         return None
     return query.message.chat.id
 
