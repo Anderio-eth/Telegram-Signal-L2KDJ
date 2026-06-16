@@ -6,7 +6,6 @@ import io
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from decimal import Decimal
 
 import aiohttp
@@ -63,16 +62,12 @@ TIMEFRAME_SECONDS = {
 MENU_TEXT = "Панель керування сигналами. Обери монети або дію нижче:"
 
 SIGNAL_TITLES = {
-    SignalKind.PREPARE_LONG: "СКОРО ЛОНГ",
     SignalKind.LONG: "ЛОНГ",
-    SignalKind.PREPARE_SHORT: "СКОРО ШОРТ",
     SignalKind.SHORT: "ШОРТ",
 }
 
 SIGNAL_MARKERS = {
-    SignalKind.PREPARE_LONG: "🟩",
     SignalKind.LONG: "🟩",
-    SignalKind.PREPARE_SHORT: "🟥",
     SignalKind.SHORT: "🟥",
 }
 
@@ -102,8 +97,6 @@ def create_application(settings: Settings) -> Application:
         kdj_m2=settings.kdj_m2,
         buy_alert_limit=settings.buy_alert_limit,
         sell_alert_limit=settings.sell_alert_limit,
-        prepare_long_floor=settings.prepare_long_floor,
-        prepare_short_ceiling=settings.prepare_short_ceiling,
         indicator_scale_min=settings.indicator_scale_min,
         indicator_scale_max=settings.indicator_scale_max,
         volume_ma_period=settings.volume_ma_period,
@@ -168,7 +161,7 @@ async def post_init(application: Application) -> None:
             BotCommand("indicator", "поточний L2 KDJ, наприклад /indicator SOL 5m"),
             BotCommand("combined_on", "увімкнути combined timeframe mode"),
             BotCommand("combined_off", "вимкнути combined timeframe mode"),
-            BotCommand("combined_set", "таймфрейми, наприклад /combined_set 15m 1h"),
+            BotCommand("combined_set", "таймфрейми, наприклад /combined_set 1m 3m 5m 15m"),
             BotCommand("combined_status", "стан combined mode"),
             BotCommand("combined_rule", "правило all_match або majority_match"),
             BotCommand("combined_bind", "прив'язати поточну гілку для combined"),
@@ -364,7 +357,7 @@ async def combined_set_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     requested = [item.strip() for item in context.args if item.strip()]
     if not requested:
-        await message.reply_text("Формат: /combined_set 15m 1h 4h")
+        await message.reply_text("Формат: /combined_set 1m 3m 5m 15m")
         return
 
     invalid = [timeframe for timeframe in requested if timeframe not in runtime.settings.timeframes]
@@ -373,6 +366,7 @@ async def combined_set_command(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Невідомі таймфрейми: {', '.join(invalid)}. Доступні: {', '.join(runtime.settings.timeframes)}"
         )
         return
+    requested = [timeframe for timeframe in runtime.settings.timeframes if timeframe in set(requested)]
 
     config = await get_or_create_combined_config(runtime, chat.id)
 
@@ -522,6 +516,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await combined_bind_here_callback(query, context)
     elif data == "combined_refresh":
         await combined_menu_callback(query, context)
+    elif data == "combined_signal_status":
+        await query.answer("Це статус таймфреймів у combined сигналі")
     else:
         await query.answer("Невідома кнопка")
 
@@ -866,16 +862,22 @@ def build_combined_keyboard(config: CombinedConfig, timeframes: list[str]) -> In
 def build_combined_menu_text(chat_id: int | str, config: CombinedConfig) -> str:
     selected = ", ".join(timeframe_label(item) for item in config.timeframes) or "нічого не обрано"
     thread = config.thread_id if config.thread_id is not None else "головний чат"
-    rule = "всі обрані мають збігтися" if config.rule == "all_match" else "достатньо більшості без конфлікту"
+    rule = (
+        "усі крім найбільшого TF дають підготовку, усі TF дають фінал"
+        if config.rule == "all_match"
+        else "достатньо більшості без протилежного сигналу"
+    )
     return (
         "Combined timeframe menu\n\n"
-        "Натискай таймфрейми нижче, щоб об'єднати їх в один combined сигнал.\n\n"
+        "Натискай таймфрейми нижче, щоб об'єднати їх в один combined сигнал.\n"
+        "Для all_match бот спершу дає прогрес, коли зібрані всі TF крім найбільшого, "
+        "а фінал надсилає після підтвердження найбільшого TF.\n\n"
         f"Chat: {chat_id}\n"
         f"Status: {'ON' if config.enabled else 'OFF'}\n"
         f"Selected: {selected}\n"
         f"Rule: {config.rule} ({rule})\n"
         f"Topic: {thread}\n\n"
-        "Приклад: обери 15хв + 1г, і бот надішле combined LONG/SHORT тільки коли умова збігу виконана."
+        "Приклад: 1хв + 3хв + 5хв + 15хв -> 3/4 зібрано, потім ЛОНГ/ШОРТ 4/4."
     )
 
 
@@ -992,16 +994,18 @@ async def scan_timeframe(
             klines = closed_klines(raw_klines)
             points = calculate_kdj(klines, runtime.rules)
             signal = detect_signal(points, runtime.rules)
-            if signal and not await is_signal_on_cooldown(runtime, timeframe, symbol, signal):
-                sent = await send_signal(application, timeframe, symbol, signal, klines)
-                if sent:
-                    await mark_signal_sent(runtime, timeframe, symbol, signal)
+            if signal:
+                await record_latest_confirmed_signal(runtime, timeframe, symbol, signal)
+                if not await is_signal_on_cooldown(runtime, timeframe, symbol, signal):
+                    sent = await send_signal(application, timeframe, symbol, signal, klines)
+                    if sent:
+                        await mark_signal_sent(runtime, timeframe, symbol, signal)
         except Exception:
             logger.exception("Failed to scan %s %s", symbol, timeframe)
         await asyncio.sleep(0.2)
 
 
-async def scan_combined_configs(application: Application, client: BinanceFuturesClient) -> None:
+async def scan_combined_configs(application: Application, _client: BinanceFuturesClient) -> None:
     runtime: BotRuntime = application.bot_data["runtime"]
     state = await runtime.store.get()
     enabled_configs = {
@@ -1018,60 +1022,9 @@ async def scan_combined_configs(application: Application, client: BinanceFutures
 
         for symbol in symbols:
             timeframe_signals: dict[str, TimeframeSignal] = {}
-            signal_objects: dict[str, Signal] = {}
-            kline_cache: dict[str, list[Kline]] = {}
-
             for timeframe in config.timeframes:
-                try:
-                    raw_klines = await client.klines(
-                        symbol,
-                        timeframe,
-                        limit=runtime.settings.kline_limit,
-                    )
-                    klines = closed_klines(raw_klines)
-                    kline_cache[timeframe] = klines
-                    points = calculate_kdj(klines, runtime.rules)
-                    if not points:
-                        logger.warning(
-                            "Combined %s %s skipped: no indicator points for timeframe %s",
-                            chat_id,
-                            symbol,
-                            timeframe,
-                        )
-                        continue
-
-                    signal = detect_signal(points, runtime.rules)
-                    current = points[-1]
-                    direction = CombinedDirection.NEUTRAL
-                    reason = "neutral"
-                    if signal and signal.kind == SignalKind.LONG:
-                        direction = CombinedDirection.LONG
-                        reason = signal.reason
-                        signal_objects[timeframe] = signal
-                    elif signal and signal.kind == SignalKind.SHORT:
-                        direction = CombinedDirection.SHORT
-                        reason = signal.reason
-                        signal_objects[timeframe] = signal
-                    elif signal:
-                        reason = f"prepare signal ignored: {signal.kind.value}"
-
-                    timeframe_signals[timeframe] = TimeframeSignal(
-                        timeframe=timeframe,
-                        direction=direction,
-                        indicator_value=current.j,
-                        price=format_decimal(current.close),
-                        close_time=current.close_time,
-                        reason=reason,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Combined %s %s skipped: failed to fetch/evaluate %s",
-                        chat_id,
-                        symbol,
-                        timeframe,
-                    )
-                    continue
-                await asyncio.sleep(0.2)
+                stored = state.latest_confirmed_signals.get(latest_signal_key(symbol, timeframe))
+                timeframe_signals[timeframe] = combined_timeframe_signal_from_payload(timeframe, stored)
 
             evaluation = evaluate_combined_signal(
                 symbol=symbol,
@@ -1096,8 +1049,6 @@ async def scan_combined_configs(application: Application, client: BinanceFutures
                 chat_id,
                 config,
                 evaluation,
-                signal_objects,
-                kline_cache,
             )
             if sent:
                 await mark_combined_sent(runtime, chat_id, config, evaluation)
@@ -1108,37 +1059,80 @@ async def send_combined_signal(
     chat_id: str,
     config: CombinedConfig,
     evaluation: CombinedEvaluation,
-    signal_objects: dict[str, Signal],
-    kline_cache: dict[str, list[Kline]],
 ) -> bool:
-    matched_timeframe = evaluation.matched_timeframes[0] if evaluation.matched_timeframes else None
-    signal = signal_objects.get(matched_timeframe or "")
-    klines = kline_cache.get(matched_timeframe or "", [])
-    caption = format_combined_message(evaluation, config)
-
-    if signal and matched_timeframe:
-        return await send_signal_with_chart(
-            application=application,
-            chat_id=int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id,
-            message_thread_id=config.thread_id,
-            symbol=evaluation.symbol,
-            timeframe=matched_timeframe,
-            signal=signal,
-            klines=klines,
-            caption=caption,
-        )
-
     await application.bot.send_message(
         chat_id=int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id,
         message_thread_id=config.thread_id,
-        text=caption,
+        text=format_combined_message(evaluation, config),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Open chart", url=tradingview_url(evaluation.symbol))]]
-        ),
+        reply_markup=build_combined_signal_keyboard(evaluation, config),
     )
     return True
+
+
+async def record_latest_confirmed_signal(
+    runtime: BotRuntime,
+    timeframe: str,
+    symbol: str,
+    signal: Signal,
+) -> None:
+    direction = "LONG" if signal.kind == SignalKind.LONG else "SHORT"
+    payload = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "direction": direction,
+        "close_time": signal.point.close_time,
+        "price": format_decimal(signal.point.close),
+        "j": signal.point.j,
+    }
+    key = latest_signal_key(symbol, timeframe)
+
+    def mutate(state: BotState) -> None:
+        state.latest_confirmed_signals[key] = payload
+
+    await runtime.store.update(mutate)
+
+
+def latest_signal_key(symbol: str, timeframe: str) -> str:
+    return f"{symbol}:{timeframe}"
+
+
+def combined_timeframe_signal_from_payload(
+    timeframe: str,
+    payload: dict[str, object] | None,
+) -> TimeframeSignal:
+    if not payload:
+        return TimeframeSignal(timeframe, CombinedDirection.NEUTRAL, reason="no confirmed signal yet")
+
+    try:
+        direction = CombinedDirection(str(payload.get("direction", CombinedDirection.NEUTRAL.value)))
+    except ValueError:
+        direction = CombinedDirection.NEUTRAL
+
+    indicator_value = None
+    if payload.get("j") is not None:
+        try:
+            indicator_value = float(payload["j"])
+        except (TypeError, ValueError):
+            indicator_value = None
+
+    close_time = None
+    if payload.get("close_time") is not None:
+        try:
+            close_time = int(payload["close_time"])
+        except (TypeError, ValueError):
+            close_time = None
+
+    price = str(payload["price"]) if payload.get("price") is not None else None
+    return TimeframeSignal(
+        timeframe=timeframe,
+        direction=direction,
+        indicator_value=indicator_value,
+        price=price,
+        close_time=close_time,
+        reason="latest confirmed",
+    )
 
 
 def combined_symbols(symbols: list[str], config: CombinedConfig) -> list[str]:
@@ -1196,8 +1190,7 @@ async def is_combined_on_cooldown(
 ) -> bool:
     state = await runtime.store.get()
     key = combined_alert_key(chat_id, config, evaluation)
-    last_sent_at = state.combined_last_alerts.get(key, 0)
-    return int(time.time()) - last_sent_at < max(1, config.cooldown_seconds)
+    return key in state.combined_last_alerts
 
 
 async def mark_combined_sent(
@@ -1217,7 +1210,18 @@ async def mark_combined_sent(
 
 def combined_alert_key(chat_id: str, config: CombinedConfig, evaluation: CombinedEvaluation) -> str:
     timeframes = ",".join(config.timeframes)
-    return f"{chat_id}:{evaluation.symbol}:{evaluation.direction.value}:{config.rule}:{timeframes}"
+    signature_parts = []
+    for timeframe in config.timeframes:
+        item = evaluation.details.get(timeframe)
+        if item is None:
+            signature_parts.append(f"{timeframe}:missing:0")
+        else:
+            signature_parts.append(f"{timeframe}:{item.direction.value}:{item.close_time or 0}")
+    signature = ",".join(signature_parts)
+    return (
+        f"{chat_id}:{evaluation.symbol}:{evaluation.direction.value}:{evaluation.stage}:"
+        f"{config.rule}:{timeframes}:{signature}"
+    )
 
 
 async def send_signal(
@@ -1308,22 +1312,8 @@ def format_signal_message(timeframe: str, symbol: str, signal: Signal) -> str:
     title = SIGNAL_TITLES[signal.kind]
     marker = SIGNAL_MARKERS[signal.kind]
     symbol_display = display_symbol(symbol)
-    volume_note = "сильний" if signal.strong_volume else "нормальний" if signal.volume_ok else "нижче середнього"
-    direction_word = "по" if signal.kind in {SignalKind.PREPARE_LONG, SignalKind.PREPARE_SHORT} else ""
-    headline = f"{marker} {title} {direction_word} {symbol_display}".replace("  ", " ").strip()
-
-    point = signal.point
-    return (
-        f"<b>{html.escape(headline)}</b>\n"
-        f"TF: <b>{html.escape(timeframe)}</b>\n"
-        f"Причина: <code>{html.escape(signal.reason)}</code>\n"
-        f"Close: <code>{format_decimal(point.close)}</code>\n"
-        f"L2 KDJ: K=<code>{point.k:.2f}</code>, D=<code>{point.d:.2f}</code>, "
-        f"J=<code>{point.j:.2f}</code>\n"
-        f"Whale Pump: <code>{point.whale_pump:.4f}</code>\n"
-        f"Обсяг: <code>{format_compact_usdt(point.quote_volume)}</code> USDT "
-        f"(<code>x{point.volume_ratio:.2f}</code> до MA, {html.escape(volume_note)})"
-    )
+    headline = f"{marker} {title} {symbol_display}"
+    return f"<b>{html.escape(headline)}</b>"
 
 
 async def fetch_indicator_text(runtime: BotRuntime, symbol: str, timeframe: str) -> str:
@@ -1366,9 +1356,9 @@ def indicator_gauge(value: float, minimum: float, maximum: float, width: int = 2
 
 def indicator_zone(value: float, rules: SignalRules) -> str:
     if value <= rules.buy_alert_limit:
-        return "зона підготовки LONG"
+        return "нижня зона LONG"
     if value >= rules.sell_alert_limit:
-        return "зона підготовки SHORT"
+        return "верхня зона SHORT"
     return "нейтральна зона"
 
 
@@ -1443,7 +1433,7 @@ def format_combined_status(chat_id: int | str, config: CombinedConfig) -> str:
         f"Enabled: {'yes' if config.enabled else 'no'}\n"
         f"Timeframes: {', '.join(config.timeframes) if config.timeframes else 'not set'}\n"
         f"Rule: {config.rule}\n"
-        f"Cooldown: {config.cooldown_seconds} sec\n"
+        "Repeat guard: exact same combined state is sent once\n"
         f"Topic thread: {config.thread_id if config.thread_id is not None else 'main chat'}\n"
         f"Whitelist: {', '.join(config.symbols_whitelist) if config.symbols_whitelist else 'none'}\n"
         f"Blacklist: {', '.join(config.symbols_blacklist) if config.symbols_blacklist else 'none'}"
@@ -1451,32 +1441,43 @@ def format_combined_status(chat_id: int | str, config: CombinedConfig) -> str:
 
 
 def format_combined_message(evaluation: CombinedEvaluation, config: CombinedConfig) -> str:
-    now = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M UTC")
-    details = []
-    price = "-"
-    for timeframe in config.timeframes:
-        item = evaluation.details.get(timeframe)
-        if not item:
-            details.append(f"{timeframe}: missing")
-            continue
-        if item.price and price == "-":
-            price = item.price
-        indicator = f"{item.indicator_value:.2f}" if item.indicator_value is not None else "n/a"
-        details.append(
-            f"{timeframe}: {item.direction.value}, J={indicator}, reason={item.reason or '-'}"
+    marker = "🟩" if evaluation.direction == CombinedDirection.LONG else "🟥"
+    direction = "ЛОНГ" if evaluation.direction == CombinedDirection.LONG else "ШОРТ"
+    count = len(evaluation.matched_timeframes)
+    total = evaluation.total_count or len(config.timeframes)
+    symbol = html.escape(display_symbol(evaluation.symbol))
+
+    if evaluation.stage == "partial":
+        pending = ", ".join(timeframe_label(item) for item in evaluation.pending_timeframes)
+        pending_text = html.escape(pending or timeframe_label(config.timeframes[-1]))
+        return (
+            f"<b>{marker} {direction} {symbol}</b>\n"
+            f"<b>{count}/{total} зібрано</b>\n"
+            f"Готуйтесь до наступного підтвердження на <b>{pending_text}</b>!"
         )
 
-    marker = "🟩" if evaluation.direction == CombinedDirection.LONG else "🟥"
     return (
-        f"<b>🚨 {marker} COMBINED SIGNAL</b>\n\n"
-        f"Symbol: <b>{html.escape(evaluation.symbol)}</b>\n"
-        f"Direction: <b>{evaluation.direction.value}</b>\n"
-        f"Rule: <code>{html.escape(config.rule)}</code>\n"
-        f"Confirmed timeframes: <b>{html.escape(', '.join(evaluation.matched_timeframes))}</b>\n"
-        f"Price: <code>{html.escape(price)}</code>\n"
-        f"Time: <code>{now}</code>\n\n"
-        f"Timeframe details:\n<code>{html.escape(chr(10).join(details))}</code>"
+        f"<b>{marker} {direction} {symbol}</b>\n"
+        f"<b>{count}/{total} зібрано</b>"
     )
+
+
+def build_combined_signal_keyboard(
+    evaluation: CombinedEvaluation,
+    config: CombinedConfig,
+) -> InlineKeyboardMarkup:
+    marker = "🟩" if evaluation.direction == CombinedDirection.LONG else "🟥"
+    row = []
+    for timeframe in config.timeframes:
+        item = evaluation.details.get(timeframe)
+        status = marker if item and item.direction == evaluation.direction else "⬜"
+        row.append(
+            InlineKeyboardButton(
+                f"{status} {timeframe_label(timeframe)}",
+                callback_data="combined_signal_status",
+            )
+        )
+    return InlineKeyboardMarkup([row])
 
 
 async def combined_query_chat_id(query, context: ContextTypes.DEFAULT_TYPE) -> int | str | None:  # type: ignore[no-untyped-def]

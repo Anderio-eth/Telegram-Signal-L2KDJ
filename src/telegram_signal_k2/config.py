@@ -78,8 +78,6 @@ class Settings:
     kdj_m2: int
     buy_alert_limit: float
     sell_alert_limit: float
-    prepare_long_floor: float
-    prepare_short_ceiling: float
     indicator_scale_min: float
     indicator_scale_max: float
     volume_ma_period: int
@@ -110,7 +108,16 @@ class Settings:
         if not symbols:
             symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-        timeframes = _split_csv(os.getenv("TIMEFRAMES")) or ["1m", "3m", "5m", "15m", "30m"]
+        timeframes = _split_csv(os.getenv("TIMEFRAMES")) or [
+            "1m",
+            "3m",
+            "5m",
+            "15m",
+            "30m",
+            "1h",
+            "2h",
+            "4h",
+        ]
 
         kwargs: dict[str, Any] = {
             "telegram_bot_token": token,
@@ -131,8 +138,6 @@ class Settings:
             "kdj_m2": int(os.getenv("L2_KDJ_M2", "4")),
             "buy_alert_limit": float(os.getenv("BUY_ALERT_LIMIT", "0")),
             "sell_alert_limit": float(os.getenv("SELL_ALERT_LIMIT", "100")),
-            "prepare_long_floor": float(os.getenv("PREPARE_LONG_FLOOR", "-10")),
-            "prepare_short_ceiling": float(os.getenv("PREPARE_SHORT_CEILING", "110")),
             "indicator_scale_min": float(os.getenv("INDICATOR_SCALE_MIN", "-10")),
             "indicator_scale_max": float(os.getenv("INDICATOR_SCALE_MAX", "110")),
             "volume_ma_period": int(os.getenv("VOLUME_MA_PERIOD", "20")),
@@ -146,7 +151,7 @@ class Settings:
             "chart_width": float(os.getenv("CHART_WIDTH", "12")),
             "chart_height": float(os.getenv("CHART_HEIGHT", "7")),
             "combined_default_timeframes": _split_csv(os.getenv("COMBINED_DEFAULT_TIMEFRAMES"))
-            or ["15m", "1h"],
+            or ["1m", "3m", "5m", "15m"],
             "combined_default_rule": os.getenv("COMBINED_DEFAULT_RULE", "all_match").strip(),
             "combined_default_cooldown_seconds": int(
                 os.getenv("COMBINED_DEFAULT_COOLDOWN_SECONDS", "3600")

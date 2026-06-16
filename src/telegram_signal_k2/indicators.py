@@ -8,9 +8,7 @@ from telegram_signal_k2.binance import Kline
 
 
 class SignalKind(str, Enum):
-    PREPARE_LONG = "prepare_long"
     LONG = "long"
-    PREPARE_SHORT = "prepare_short"
     SHORT = "short"
 
 
@@ -38,7 +36,7 @@ class Signal:
 
     @property
     def is_confirmed(self) -> bool:
-        return self.kind in {SignalKind.LONG, SignalKind.SHORT}
+        return True
 
 
 @dataclass(frozen=True)
@@ -49,8 +47,6 @@ class SignalRules:
     kdj_m2: int = 4
     buy_alert_limit: float = 0
     sell_alert_limit: float = 100
-    prepare_long_floor: float = -10
-    prepare_short_ceiling: float = 110
     indicator_scale_min: float = -10
     indicator_scale_max: float = 110
     volume_ma_period: int = 20
@@ -177,30 +173,11 @@ def detect_signal(points: list[KdjPoint], rules: SignalRules) -> Signal | None:
 
     crossed_buy = previous.j <= rules.buy_alert_limit and current.j > rules.buy_alert_limit
     crossed_sell = previous.j >= rules.sell_alert_limit and current.j < rules.sell_alert_limit
-    crossed_j_under_k = previous.j >= previous.k and current.j < current.k and current.j > 50
-    turning_up = current.j > previous.j and current.k >= previous.k
-    turning_down = current.j < previous.j and current.k <= previous.k
-
     if crossed_buy and (volume_ok or not rules.require_volume_for_confirmed):
-        return Signal(SignalKind.LONG, current, previous, volume_ok, strong_volume, "J перетнув 0 вгору")
+        return Signal(SignalKind.LONG, current, previous, volume_ok, strong_volume, "J crossed above 0")
 
     if crossed_sell and (volume_ok or not rules.require_volume_for_confirmed):
-        return Signal(SignalKind.SHORT, current, previous, volume_ok, strong_volume, "J перетнув 100 вниз")
-
-    near_long = rules.prepare_long_floor <= current.j <= rules.buy_alert_limit
-    whale_prepare = current.whale_pump > 0 and current.j <= rules.buy_alert_limit + 5
-    if turning_up and (near_long or whale_prepare):
-        reason = "J розвертається біля 0"
-        if current.whale_pump > 0:
-            reason += ", Whale Pump > 0"
-        return Signal(SignalKind.PREPARE_LONG, current, previous, volume_ok, strong_volume, reason)
-
-    near_short = rules.sell_alert_limit <= current.j <= rules.prepare_short_ceiling
-    if (turning_down and near_short) or crossed_j_under_k:
-        reason = "J розвертається біля 100"
-        if crossed_j_under_k:
-            reason = "J перетнув K вниз вище 50"
-        return Signal(SignalKind.PREPARE_SHORT, current, previous, volume_ok, strong_volume, reason)
+        return Signal(SignalKind.SHORT, current, previous, volume_ok, strong_volume, "J crossed below 100")
 
     return None
 

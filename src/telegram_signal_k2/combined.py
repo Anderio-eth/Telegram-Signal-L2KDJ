@@ -27,10 +27,16 @@ class CombinedEvaluation:
     matched_timeframes: list[str]
     rejected_reason: str | None
     details: dict[str, TimeframeSignal] = field(default_factory=dict)
+    stage: str = "none"
+    total_count: int = 0
+    pending_timeframes: list[str] = field(default_factory=list)
 
     @property
     def is_signal(self) -> bool:
-        return self.direction in {CombinedDirection.LONG, CombinedDirection.SHORT}
+        return (
+            self.direction in {CombinedDirection.LONG, CombinedDirection.SHORT}
+            and self.stage in {"partial", "full"}
+        )
 
 
 def evaluate_combined_signal(
@@ -48,63 +54,76 @@ def evaluate_combined_signal(
             matched_timeframes=[],
             rejected_reason=f"Unknown combined rule: {rule}",
             details=timeframe_signals,
+            total_count=len(required_timeframes),
         )
 
-    if not required_timeframes:
+    if len(required_timeframes) < 2:
         return CombinedEvaluation(
             symbol=symbol,
             direction=CombinedDirection.NEUTRAL,
             matched_timeframes=[],
-            rejected_reason="No required timeframes configured",
+            rejected_reason="At least two timeframes are required",
             details=timeframe_signals,
+            total_count=len(required_timeframes),
         )
 
-    missing = [timeframe for timeframe in required_timeframes if timeframe not in timeframe_signals]
-    if missing:
+    normalized_signals = {
+        timeframe: timeframe_signals.get(
+            timeframe,
+            TimeframeSignal(timeframe, CombinedDirection.NEUTRAL, reason="missing"),
+        )
+        for timeframe in required_timeframes
+    }
+
+    full = _full_match(symbol, normalized_signals, required_timeframes, CombinedDirection.LONG)
+    if full:
+        return full
+    full = _full_match(symbol, normalized_signals, required_timeframes, CombinedDirection.SHORT)
+    if full:
+        return full
+
+    if normalized_rule == "all_match":
+        partial = _all_match_progress(
+            symbol,
+            normalized_signals,
+            required_timeframes,
+            CombinedDirection.LONG,
+        )
+        if partial:
+            return partial
+        partial = _all_match_progress(
+            symbol,
+            normalized_signals,
+            required_timeframes,
+            CombinedDirection.SHORT,
+        )
+        if partial:
+            return partial
         return CombinedEvaluation(
             symbol=symbol,
             direction=CombinedDirection.NEUTRAL,
             matched_timeframes=[],
-            rejected_reason=f"Missing timeframe data: {', '.join(missing)}",
-            details=timeframe_signals,
+            rejected_reason="Required timeframes do not have all-but-last progress",
+            details=normalized_signals,
+            total_count=len(required_timeframes),
         )
 
-    long_matches = [
-        timeframe
-        for timeframe in required_timeframes
-        if timeframe_signals[timeframe].direction == CombinedDirection.LONG
+    partials = [
+        _majority_progress(symbol, normalized_signals, required_timeframes, CombinedDirection.LONG),
+        _majority_progress(symbol, normalized_signals, required_timeframes, CombinedDirection.SHORT),
     ]
-    short_matches = [
-        timeframe
-        for timeframe in required_timeframes
-        if timeframe_signals[timeframe].direction == CombinedDirection.SHORT
-    ]
+    partials = [item for item in partials if item is not None]
+    if partials:
+        return max(partials, key=lambda item: len(item.matched_timeframes))
+
+    reason = "No majority match"
+    long_matches = _matched_timeframes(normalized_signals, required_timeframes, CombinedDirection.LONG)
+    short_matches = _matched_timeframes(normalized_signals, required_timeframes, CombinedDirection.SHORT)
     neutral_matches = [
         timeframe
         for timeframe in required_timeframes
-        if timeframe_signals[timeframe].direction == CombinedDirection.NEUTRAL
+        if normalized_signals[timeframe].direction == CombinedDirection.NEUTRAL
     ]
-
-    if normalized_rule == "all_match":
-        if len(long_matches) == len(required_timeframes):
-            return CombinedEvaluation(symbol, CombinedDirection.LONG, long_matches, None, timeframe_signals)
-        if len(short_matches) == len(required_timeframes):
-            return CombinedEvaluation(symbol, CombinedDirection.SHORT, short_matches, None, timeframe_signals)
-        return CombinedEvaluation(
-            symbol=symbol,
-            direction=CombinedDirection.NEUTRAL,
-            matched_timeframes=[],
-            rejected_reason="Required timeframes do not all match",
-            details=timeframe_signals,
-        )
-
-    required_count = len(required_timeframes) // 2 + 1
-    if len(long_matches) >= required_count and not short_matches:
-        return CombinedEvaluation(symbol, CombinedDirection.LONG, long_matches, None, timeframe_signals)
-    if len(short_matches) >= required_count and not long_matches:
-        return CombinedEvaluation(symbol, CombinedDirection.SHORT, short_matches, None, timeframe_signals)
-
-    reason = "No majority match"
     if long_matches and short_matches:
         reason = "Conflicting LONG and SHORT confirmations"
     elif neutral_matches:
@@ -115,5 +134,108 @@ def evaluate_combined_signal(
         direction=CombinedDirection.NEUTRAL,
         matched_timeframes=[],
         rejected_reason=reason,
-        details=timeframe_signals,
+        details=normalized_signals,
+        total_count=len(required_timeframes),
     )
+
+
+def _full_match(
+    symbol: str,
+    timeframe_signals: dict[str, TimeframeSignal],
+    required_timeframes: list[str],
+    direction: CombinedDirection,
+) -> CombinedEvaluation | None:
+    matches = _matched_timeframes(timeframe_signals, required_timeframes, direction)
+    if len(matches) != len(required_timeframes):
+        return None
+    return CombinedEvaluation(
+        symbol=symbol,
+        direction=direction,
+        matched_timeframes=matches,
+        rejected_reason=None,
+        details=timeframe_signals,
+        stage="full",
+        total_count=len(required_timeframes),
+        pending_timeframes=[],
+    )
+
+
+def _all_match_progress(
+    symbol: str,
+    timeframe_signals: dict[str, TimeframeSignal],
+    required_timeframes: list[str],
+    direction: CombinedDirection,
+) -> CombinedEvaluation | None:
+    leading_timeframes = required_timeframes[:-1]
+    final_timeframe = required_timeframes[-1]
+    matches = _matched_timeframes(timeframe_signals, required_timeframes, direction)
+    conflicts = _matched_timeframes(
+        timeframe_signals,
+        required_timeframes,
+        _opposite_direction(direction),
+    )
+
+    if all(timeframe in matches for timeframe in leading_timeframes) and final_timeframe not in conflicts:
+        return CombinedEvaluation(
+            symbol=symbol,
+            direction=direction,
+            matched_timeframes=[timeframe for timeframe in required_timeframes if timeframe in matches],
+            rejected_reason=None,
+            details=timeframe_signals,
+            stage="partial",
+            total_count=len(required_timeframes),
+            pending_timeframes=[final_timeframe],
+        )
+    return None
+
+
+def _majority_progress(
+    symbol: str,
+    timeframe_signals: dict[str, TimeframeSignal],
+    required_timeframes: list[str],
+    direction: CombinedDirection,
+) -> CombinedEvaluation | None:
+    matches = _matched_timeframes(timeframe_signals, required_timeframes, direction)
+    conflicts = _matched_timeframes(
+        timeframe_signals,
+        required_timeframes,
+        _opposite_direction(direction),
+    )
+    required_count = len(required_timeframes) // 2 + 1
+    if len(matches) < required_count or conflicts:
+        return None
+
+    pending = [timeframe for timeframe in required_timeframes if timeframe not in matches]
+    if not pending:
+        return None
+
+    return CombinedEvaluation(
+        symbol=symbol,
+        direction=direction,
+        matched_timeframes=matches,
+        rejected_reason=None,
+        details=timeframe_signals,
+        stage="partial",
+        total_count=len(required_timeframes),
+        pending_timeframes=pending,
+    )
+
+
+def _matched_timeframes(
+    timeframe_signals: dict[str, TimeframeSignal],
+    required_timeframes: list[str],
+    direction: CombinedDirection,
+) -> list[str]:
+    return [
+        timeframe
+        for timeframe in required_timeframes
+        if timeframe_signals[timeframe].direction == direction
+    ]
+
+
+def _opposite_direction(direction: CombinedDirection) -> CombinedDirection:
+    if direction == CombinedDirection.LONG:
+        return CombinedDirection.SHORT
+    if direction == CombinedDirection.SHORT:
+        return CombinedDirection.LONG
+    return CombinedDirection.NEUTRAL

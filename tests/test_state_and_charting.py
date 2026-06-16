@@ -15,6 +15,16 @@ class StateTests(unittest.TestCase):
             available_symbols=["BTCUSDT"],
             enabled_symbols=["BTCUSDT"],
             topic_threads={"15m": 123},
+            latest_confirmed_signals={
+                "BTCUSDT:15m": {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "direction": "LONG",
+                    "close_time": 1_700_000_000_000,
+                    "price": "100",
+                    "j": 12.5,
+                }
+            },
             combined_configs={
                 "-1001": CombinedConfig(
                     enabled=True,
@@ -33,6 +43,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual(restored.combined_configs["-1001"].timeframes, ["15m", "1h"])
         self.assertEqual(restored.combined_configs["-1001"].thread_id, 777)
         self.assertEqual(restored.combined_last_alerts["key"], 12345)
+        self.assertEqual(restored.latest_confirmed_signals["BTCUSDT:15m"]["direction"], "LONG")
 
 
 class ChartingTests(unittest.TestCase):

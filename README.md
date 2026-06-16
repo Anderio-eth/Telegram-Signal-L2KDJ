@@ -76,7 +76,7 @@ Recommended env variables:
 ```text
 TELEGRAM_RUN_MODE=polling
 SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,HYPEUSDT
-TIMEFRAMES=1m,3m,5m,15m,30m,1h,4h
+TIMEFRAMES=1m,3m,5m,15m,30m,1h,2h,4h
 STATE_FILE=data/state.json
 CHARTS_ENABLED=true
 ```
@@ -367,6 +367,7 @@ WEBHOOK_SECRET_TOKEN=some-secret
 /bind 15m
 /bind 30m
 /bind 1h
+/bind 2h
 /bind 4h
 ```
 
@@ -381,7 +382,7 @@ WEBHOOK_SECRET_TOKEN=some-secret
 - `/signals_on` / `/signals_off` - увімкнути або вимкнути сигнали.
 - `/combined_on` - увімкнути combined mode для поточної групи.
 - `/combined_off` - вимкнути combined mode.
-- `/combined_set 15m 1h 4h` - задати таймфрейми.
+- `/combined_set 1m 3m 5m 15m` - задати таймфрейми.
 - `/combined_menu` - кнопки для вибору combined таймфреймів.
 - `/combined_rule all_match` - правило `all_match` або `majority_match`.
 - `/combined_bind` - прив'язати поточну Telegram-гілку для combined сигналів.
@@ -404,16 +405,22 @@ Combined-команди в групі доступні тільки адміні
 
 ## Combined Timeframe Mode
 
-Приклад:
+Приклад для окремої гілки `Combined Signals`:
 
 ```text
-/combined_set 15m 1h
+/combined_set 1m 3m 5m 15m
 /combined_rule all_match
 /combined_bind
 /combined_on
 ```
 
-Після цього бот надсилає combined signal тільки коли обрані таймфрейми збігаються.
+Після цього бот дивиться на останні підтверджені LONG/SHORT на вибраних таймфреймах.
+Для `all_match` він надсилає два типи combined повідомлень:
+
+- `3/4 зібрано` - усі вибрані таймфрейми, крім найбільшого, вже дали однаковий LONG або SHORT.
+- `ЛОНГ 4/4` або `ШОРТ 4/4` - найбільший таймфрейм теж підтвердив той самий напрям.
+
+У повідомленні буде один ряд кнопок з вибраними таймфреймами. Для LONG зібрані TF позначаються `🟩`, для SHORT - `🟥`, а ще не підтверджений TF - `⬜`.
 
 Зручний варіант через кнопки:
 
@@ -421,7 +428,7 @@ Combined-команди в групі доступні тільки адміні
 /combined_menu
 ```
 
-У меню будуть кнопки `✅/⬜ 1хв`, `✅/⬜ 3хв`, `✅/⬜ 5хв`, `✅/⬜ 15хв`, `✅/⬜ 30хв`, `✅/⬜ 1г`, `✅/⬜ 4г`. Натискай таймфрейми, які треба об'єднати. Також там є кнопки ON/OFF, перемикання правила і прив'язка поточної гілки.
+У меню будуть кнопки `✅/⬜ 1хв`, `✅/⬜ 3хв`, `✅/⬜ 5хв`, `✅/⬜ 15хв`, `✅/⬜ 30хв`, `✅/⬜ 1г`, `✅/⬜ 2г`, `✅/⬜ 4г`. Натискай таймфрейми, які треба об'єднати. Також там є кнопки ON/OFF, перемикання правила і прив'язка поточної гілки.
 
 Якщо хочеш окрему гілку для combined сигналів:
 
@@ -437,8 +444,8 @@ Combined-команди в групі доступні тільки адміні
 
 Правила:
 
-- `all_match`: всі required timeframes мають бути `LONG` або всі `SHORT`.
-- `majority_match`: більшість timeframes збігається і немає протилежного сигналу.
+- `all_match`: прогрес приходить, коли всі TF крім найбільшого збіглися; фінал приходить, коли збіглися всі TF.
+- `majority_match`: прогрес приходить, коли більшість TF збігається і немає протилежного сигналу; фінал приходить, коли збіглися всі TF.
 
 ## Docker Optional
 
