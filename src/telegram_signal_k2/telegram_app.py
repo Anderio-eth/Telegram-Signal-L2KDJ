@@ -146,6 +146,7 @@ def create_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("combined_set", combined_set_command))
     application.add_handler(CommandHandler("combined_status", combined_status_command))
     application.add_handler(CommandHandler("combined_rule", combined_rule_command))
+    application.add_handler(CommandHandler("combined_bind", combined_bind_command))
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pending_text_handler))
     application.add_error_handler(error_handler)
@@ -169,6 +170,7 @@ async def post_init(application: Application) -> None:
             BotCommand("combined_set", "таймфрейми, наприклад /combined_set 15m 1h"),
             BotCommand("combined_status", "стан combined mode"),
             BotCommand("combined_rule", "правило all_match або majority_match"),
+            BotCommand("combined_bind", "прив'язати поточну гілку для combined"),
             BotCommand("signals_on", "увімкнути сигнали"),
             BotCommand("signals_off", "вимкнути сигнали"),
         ]
@@ -406,6 +408,34 @@ async def combined_rule_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     state = await runtime.store.update(mutate)
     await message.reply_text(format_combined_status(chat.id, state.combined_configs[str(chat.id)]))
+
+
+async def combined_bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    runtime = get_runtime(context)
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or not await ensure_group_admin(update, context):
+        return
+
+    if message.message_thread_id is None:
+        await message.reply_text(
+            "Цю команду треба виконати всередині гілки, куди слати combined сигнали."
+        )
+        return
+
+    config = await get_or_create_combined_config(runtime, chat.id)
+    thread_id = message.message_thread_id
+
+    def mutate(state: BotState) -> None:
+        state.chat_id = chat.id
+        state.combined_configs[str(chat.id)] = config
+        state.combined_configs[str(chat.id)].thread_id = thread_id
+
+    state = await runtime.store.update(mutate)
+    await message.reply_text(
+        "Готово: ця гілка прив'язана для combined сигналів.\n\n"
+        + format_combined_status(chat.id, state.combined_configs[str(chat.id)])
+    )
 
 
 async def combined_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -859,7 +889,7 @@ async def send_combined_signal(
         return await send_signal_with_chart(
             application=application,
             chat_id=int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id,
-            message_thread_id=None,
+            message_thread_id=config.thread_id,
             symbol=evaluation.symbol,
             timeframe=matched_timeframe,
             signal=signal,
@@ -869,6 +899,7 @@ async def send_combined_signal(
 
     await application.bot.send_message(
         chat_id=int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id,
+        message_thread_id=config.thread_id,
         text=caption,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
@@ -1182,6 +1213,7 @@ def format_combined_status(chat_id: int | str, config: CombinedConfig) -> str:
         f"Timeframes: {', '.join(config.timeframes) if config.timeframes else 'not set'}\n"
         f"Rule: {config.rule}\n"
         f"Cooldown: {config.cooldown_seconds} sec\n"
+        f"Topic thread: {config.thread_id if config.thread_id is not None else 'main chat'}\n"
         f"Whitelist: {', '.join(config.symbols_whitelist) if config.symbols_whitelist else 'none'}\n"
         f"Blacklist: {', '.join(config.symbols_blacklist) if config.symbols_blacklist else 'none'}"
     )

@@ -383,6 +383,7 @@ WEBHOOK_SECRET_TOKEN=some-secret
 - `/combined_off` - вимкнути combined mode.
 - `/combined_set 15m 1h 4h` - задати таймфрейми.
 - `/combined_rule all_match` - правило `all_match` або `majority_match`.
+- `/combined_bind` - прив'язати поточну Telegram-гілку для combined сигналів.
 - `/combined_status` - показати combined налаштування.
 
 Combined-команди в групі доступні тільки адміністраторам.
@@ -407,10 +408,23 @@ Combined-команди в групі доступні тільки адміні
 ```text
 /combined_set 15m 1h
 /combined_rule all_match
+/combined_bind
 /combined_on
 ```
 
 Після цього бот надсилає combined signal тільки коли обрані таймфрейми збігаються.
+
+Якщо хочеш окрему гілку для combined сигналів:
+
+1. Створи в Telegram гілку, наприклад `Combined`.
+2. Зайди саме в цю гілку.
+3. Напиши:
+
+```text
+/combined_bind
+```
+
+Після цього combined сигнали будуть надсилатися в цю гілку. Якщо `/combined_bind` не виконувати, combined сигнали йдуть у головний чат групи.
 
 Правила:
 
@@ -458,4 +472,3 @@ python -m telegram_signal_k2.healthcheck --json
 ```bash
 telegram-signal-k2-healthcheck --json
 ```
-

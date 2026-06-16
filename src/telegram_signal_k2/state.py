@@ -13,6 +13,7 @@ class CombinedConfig:
     timeframes: list[str] = field(default_factory=list)
     rule: str = "all_match"
     cooldown_seconds: int = 3600
+    thread_id: int | None = None
     symbols_whitelist: list[str] = field(default_factory=list)
     symbols_blacklist: list[str] = field(default_factory=list)
 
@@ -23,6 +24,7 @@ class CombinedConfig:
             timeframes=list(payload.get("timeframes", [])),
             rule=str(payload.get("rule", "all_match")),
             cooldown_seconds=int(payload.get("cooldown_seconds", 3600)),
+            thread_id=int(payload["thread_id"]) if payload.get("thread_id") is not None else None,
             symbols_whitelist=list(payload.get("symbols_whitelist", [])),
             symbols_blacklist=list(payload.get("symbols_blacklist", [])),
         )
@@ -33,6 +35,7 @@ class CombinedConfig:
             "timeframes": self.timeframes,
             "rule": self.rule,
             "cooldown_seconds": self.cooldown_seconds,
+            "thread_id": self.thread_id,
             "symbols_whitelist": self.symbols_whitelist,
             "symbols_blacklist": self.symbols_blacklist,
         }

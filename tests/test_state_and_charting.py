@@ -21,6 +21,7 @@ class StateTests(unittest.TestCase):
                     timeframes=["15m", "1h"],
                     rule="all_match",
                     cooldown_seconds=900,
+                    thread_id=777,
                 )
             },
             combined_last_alerts={"key": 12345},
@@ -30,6 +31,7 @@ class StateTests(unittest.TestCase):
 
         self.assertTrue(restored.combined_configs["-1001"].enabled)
         self.assertEqual(restored.combined_configs["-1001"].timeframes, ["15m", "1h"])
+        self.assertEqual(restored.combined_configs["-1001"].thread_id, 777)
         self.assertEqual(restored.combined_last_alerts["key"], 12345)
 
 
