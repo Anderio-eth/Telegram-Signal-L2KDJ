@@ -53,6 +53,7 @@ class BotState:
     topic_names: dict[str, str] = field(default_factory=dict)
     combined_configs: dict[str, CombinedConfig] = field(default_factory=dict)
     combined_last_alerts: dict[str, int] = field(default_factory=dict)
+    combined_cycles: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "BotState":
@@ -77,6 +78,9 @@ class BotState:
             combined_last_alerts={
                 str(key): int(value) for key, value in payload.get("combined_last_alerts", {}).items()
             },
+            combined_cycles={
+                str(key): dict(value) for key, value in payload.get("combined_cycles", {}).items()
+            },
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -93,6 +97,7 @@ class BotState:
                 str(key): value.to_payload() for key, value in self.combined_configs.items()
             },
             "combined_last_alerts": self.combined_last_alerts,
+            "combined_cycles": self.combined_cycles,
         }
 
 

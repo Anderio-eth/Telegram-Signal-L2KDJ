@@ -36,6 +36,12 @@ class StateTests(unittest.TestCase):
                 )
             },
             combined_last_alerts={"key": 12345},
+            combined_cycles={
+                "-1001:BTCUSDT:all_match:1m,3m,5m": {
+                    "stage": "partial",
+                    "direction": "LONG",
+                }
+            },
         )
 
         restored = BotState.from_payload(state.to_payload())
@@ -46,6 +52,10 @@ class StateTests(unittest.TestCase):
         self.assertEqual(restored.combined_last_alerts["key"], 12345)
         self.assertEqual(restored.latest_confirmed_signals["BTCUSDT:15m"]["direction"], "LONG")
         self.assertEqual(restored.topic_names["-1001:123"], "15хв")
+        self.assertEqual(
+            restored.combined_cycles["-1001:BTCUSDT:all_match:1m,3m,5m"]["stage"],
+            "partial",
+        )
 
 
 class ChartingTests(unittest.TestCase):

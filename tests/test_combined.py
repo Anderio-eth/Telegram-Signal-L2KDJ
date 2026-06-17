@@ -7,6 +7,12 @@ from telegram_signal_k2.combined import (
     TimeframeSignal,
     evaluate_combined_signal,
 )
+from telegram_signal_k2.state import BotState, CombinedConfig
+from telegram_signal_k2.telegram_app import (
+    combined_cycle_key,
+    combined_cycle_payload,
+    evaluate_combined_cycle,
+)
 
 
 class CombinedSignalTests(unittest.TestCase):
@@ -95,6 +101,79 @@ class CombinedSignalTests(unittest.TestCase):
         self.assertEqual(result.direction, CombinedDirection.LONG)
         self.assertEqual(result.stage, "partial")
         self.assertEqual(result.pending_timeframes, ["4h"])
+
+    def test_cycle_requires_partial_before_full_and_resets_after_full(self) -> None:
+        config = CombinedConfig(enabled=True, timeframes=["1m", "3m", "5m"], rule="all_match")
+        state = BotState(
+            chat_id="-1001",
+            available_symbols=["ETHUSDT"],
+            enabled_symbols=["ETHUSDT"],
+            topic_threads={},
+        )
+        signals = {
+            "1m": TimeframeSignal("1m", CombinedDirection.LONG, close_time=100),
+            "3m": TimeframeSignal("3m", CombinedDirection.LONG, close_time=200),
+            "5m": TimeframeSignal("5m", CombinedDirection.LONG, close_time=300),
+        }
+
+        partial = evaluate_combined_cycle(
+            state=state,
+            chat_id="-1001",
+            config=config,
+            symbol="ETHUSDT",
+            timeframe_signals=signals,
+        )
+
+        self.assertEqual(partial.stage, "partial")
+        self.assertEqual(partial.matched_timeframes, ["1m", "3m"])
+
+        key = combined_cycle_key("-1001", config, "ETHUSDT")
+        state.combined_cycles[key] = combined_cycle_payload(config, partial, {})
+
+        same_final = evaluate_combined_cycle(
+            state=state,
+            chat_id="-1001",
+            config=config,
+            symbol="ETHUSDT",
+            timeframe_signals=signals,
+        )
+        self.assertEqual(same_final.stage, "none")
+
+        signals["5m"] = TimeframeSignal("5m", CombinedDirection.LONG, close_time=301)
+        full = evaluate_combined_cycle(
+            state=state,
+            chat_id="-1001",
+            config=config,
+            symbol="ETHUSDT",
+            timeframe_signals=signals,
+        )
+        self.assertEqual(full.stage, "full")
+        self.assertEqual(full.matched_timeframes, ["1m", "3m", "5m"])
+
+        state.combined_cycles[key] = combined_cycle_payload(config, full, state.combined_cycles[key])
+        after_full = evaluate_combined_cycle(
+            state=state,
+            chat_id="-1001",
+            config=config,
+            symbol="ETHUSDT",
+            timeframe_signals=signals,
+        )
+        self.assertEqual(after_full.stage, "none")
+
+        next_cycle_signals = {
+            "1m": TimeframeSignal("1m", CombinedDirection.LONG, close_time=110),
+            "3m": TimeframeSignal("3m", CombinedDirection.LONG, close_time=210),
+            "5m": TimeframeSignal("5m", CombinedDirection.LONG, close_time=301),
+        }
+        next_partial = evaluate_combined_cycle(
+            state=state,
+            chat_id="-1001",
+            config=config,
+            symbol="ETHUSDT",
+            timeframe_signals=next_cycle_signals,
+        )
+        self.assertEqual(next_partial.stage, "partial")
+        self.assertEqual(next_partial.matched_timeframes, ["1m", "3m"])
 
 
 if __name__ == "__main__":

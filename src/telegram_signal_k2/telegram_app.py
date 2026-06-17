@@ -52,6 +52,7 @@ TIMEFRAME_SECONDS = {
     "30m": 1800,
     "1h": 3600,
     "2h": 7200,
+    "3h": 10800,
     "4h": 14400,
     "6h": 21600,
     "8h": 28800,
@@ -976,6 +977,7 @@ def timeframe_label(timeframe: str) -> str:
         "30m": "30хв",
         "1h": "1г",
         "2h": "2г",
+        "3h": "3г",
         "4h": "4г",
         "6h": "6г",
         "8h": "8г",
@@ -1209,11 +1211,12 @@ async def scan_combined_configs(application: Application, _client: BinanceFuture
                 stored = state.latest_confirmed_signals.get(latest_signal_key(symbol, timeframe))
                 timeframe_signals[timeframe] = combined_timeframe_signal_from_payload(timeframe, stored)
 
-            evaluation = evaluate_combined_signal(
+            evaluation = evaluate_combined_cycle(
+                state=state,
+                chat_id=chat_id,
+                config=config,
                 symbol=symbol,
                 timeframe_signals=timeframe_signals,
-                rule=config.rule,
-                required_timeframes=config.timeframes,
             )
             if not evaluation.is_signal:
                 logger.debug(
@@ -1318,6 +1321,133 @@ def combined_timeframe_signal_from_payload(
     )
 
 
+def evaluate_combined_cycle(
+    *,
+    state: BotState,
+    chat_id: str,
+    config: CombinedConfig,
+    symbol: str,
+    timeframe_signals: dict[str, TimeframeSignal],
+) -> CombinedEvaluation:
+    raw = evaluate_combined_signal(
+        symbol=symbol,
+        timeframe_signals=timeframe_signals,
+        rule=config.rule,
+        required_timeframes=config.timeframes,
+    )
+    if len(config.timeframes) < 2:
+        return raw
+
+    cycle = state.combined_cycles.get(combined_cycle_key(chat_id, config, symbol), {})
+
+    if combined_cycle_partial_is_active(cycle, config, timeframe_signals):
+        direction = str(cycle.get("direction", ""))
+        final_timeframe = str(cycle.get("final_timeframe") or config.timeframes[-1])
+        final_item = raw.details.get(final_timeframe)
+        final_close_time = final_item.close_time if final_item else None
+        final_baseline = int(cycle.get("final_close_time_at_partial") or 0)
+        if (
+            raw.stage == "full"
+            and raw.direction.value == direction
+            and final_close_time is not None
+            and final_close_time > final_baseline
+        ):
+            return raw
+
+        return CombinedEvaluation(
+            symbol=symbol,
+            direction=CombinedDirection.NEUTRAL,
+            matched_timeframes=[],
+            rejected_reason="Waiting for the final timeframe after partial combined signal",
+            details=raw.details,
+            total_count=len(config.timeframes),
+        )
+
+    partial_signals = combined_signals_for_next_partial(config, timeframe_signals, cycle)
+    partial = evaluate_combined_signal(
+        symbol=symbol,
+        timeframe_signals=partial_signals,
+        rule=config.rule,
+        required_timeframes=config.timeframes,
+    )
+    if partial.stage == "partial":
+        return partial
+
+    return CombinedEvaluation(
+        symbol=symbol,
+        direction=CombinedDirection.NEUTRAL,
+        matched_timeframes=[],
+        rejected_reason=partial.rejected_reason or "Waiting for a new partial combined signal",
+        details=partial.details,
+        total_count=len(config.timeframes),
+    )
+
+
+def combined_cycle_partial_is_active(
+    cycle: dict[str, object],
+    config: CombinedConfig,
+    timeframe_signals: dict[str, TimeframeSignal],
+) -> bool:
+    if cycle.get("stage") != "partial":
+        return False
+
+    try:
+        direction = CombinedDirection(str(cycle.get("direction", "")))
+    except ValueError:
+        return False
+
+    matched_close_times = cycle.get("matched_close_times", {})
+    if not isinstance(matched_close_times, dict):
+        matched_close_times = {}
+
+    for timeframe in config.timeframes[:-1]:
+        item = timeframe_signals.get(timeframe)
+        if item is None or item.direction != direction:
+            return False
+        baseline = int(matched_close_times.get(timeframe) or 0)
+        if baseline and (item.close_time is None or item.close_time < baseline):
+            return False
+    return True
+
+
+def combined_signals_for_next_partial(
+    config: CombinedConfig,
+    timeframe_signals: dict[str, TimeframeSignal],
+    cycle: dict[str, object],
+) -> dict[str, TimeframeSignal]:
+    final_timeframe = config.timeframes[-1]
+    last_full_close_times = cycle.get("last_full_close_times", {})
+    if not isinstance(last_full_close_times, dict):
+        last_full_close_times = {}
+
+    result: dict[str, TimeframeSignal] = {}
+    for timeframe in config.timeframes:
+        item = timeframe_signals.get(timeframe)
+        if item is None:
+            result[timeframe] = TimeframeSignal(timeframe, CombinedDirection.NEUTRAL, reason="missing")
+            continue
+
+        baseline = int(last_full_close_times.get(timeframe) or 0)
+        is_stale = bool(baseline) and (item.close_time is None or item.close_time <= baseline)
+        if timeframe == final_timeframe or is_stale:
+            result[timeframe] = TimeframeSignal(
+                timeframe=timeframe,
+                direction=CombinedDirection.NEUTRAL,
+                indicator_value=item.indicator_value,
+                price=item.price,
+                close_time=item.close_time,
+                reason="waiting for next combined cycle",
+            )
+        else:
+            result[timeframe] = item
+    return result
+
+
+def combined_cycle_key(chat_id: str, config: CombinedConfig, symbol: str) -> str:
+    timeframes = ",".join(config.timeframes)
+    return f"{chat_id}:{symbol}:{config.rule}:{timeframes}"
+
+
 def combined_symbols(symbols: list[str], config: CombinedConfig) -> list[str]:
     result = list(symbols)
     if config.symbols_whitelist:
@@ -1383,12 +1513,57 @@ async def mark_combined_sent(
     evaluation: CombinedEvaluation,
 ) -> None:
     key = combined_alert_key(chat_id, config, evaluation)
+    cycle_key = combined_cycle_key(chat_id, config, evaluation.symbol)
     now = int(time.time())
 
     def mutate(state: BotState) -> None:
         state.combined_last_alerts[key] = now
+        previous_cycle = state.combined_cycles.get(cycle_key, {})
+        state.combined_cycles[cycle_key] = combined_cycle_payload(
+            config,
+            evaluation,
+            previous_cycle,
+        )
 
     await runtime.store.update(mutate)
+
+
+def combined_cycle_payload(
+    config: CombinedConfig,
+    evaluation: CombinedEvaluation,
+    previous_cycle: dict[str, object],
+) -> dict[str, object]:
+    if evaluation.stage == "partial":
+        final_timeframe = config.timeframes[-1]
+        final_item = evaluation.details.get(final_timeframe)
+        return {
+            "stage": "partial",
+            "direction": evaluation.direction.value,
+            "matched_timeframes": list(evaluation.matched_timeframes),
+            "matched_close_times": {
+                timeframe: evaluation.details[timeframe].close_time or 0
+                for timeframe in evaluation.matched_timeframes
+                if timeframe in evaluation.details
+            },
+            "final_timeframe": final_timeframe,
+            "final_close_time_at_partial": final_item.close_time if final_item else 0,
+            "last_full_close_times": previous_cycle.get("last_full_close_times", {})
+            if isinstance(previous_cycle, dict)
+            else {},
+        }
+
+    if evaluation.stage == "full":
+        return {
+            "stage": "idle",
+            "direction": evaluation.direction.value,
+            "last_full_close_times": {
+                timeframe: item.close_time or 0
+                for timeframe, item in evaluation.details.items()
+                if timeframe in config.timeframes
+            },
+        }
+
+    return {"stage": "idle"}
 
 
 def combined_alert_key(chat_id: str, config: CombinedConfig, evaluation: CombinedEvaluation) -> str:
@@ -1723,7 +1898,7 @@ def build_topics_text(state: BotState, timeframes: list[str]) -> str:
             status = f"{status} ({title})"
         lines.append(f"- {timeframe}: {status}")
     lines.append("")
-    lines.append("Автоприв'язка працює для назв типу 1хв/1m, 2г/2h і Combined Signals.")
+    lines.append("Автоприв'язка працює для назв типу 1хв/1m, 2г/2h, 3г/3h і Combined Signals.")
     return "\n".join(lines)
 
 
