@@ -97,7 +97,18 @@ class CopyBot:
                 ASK_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_key)],
                 ASK_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_secret)],
             },
-            fallbacks=[CommandHandler("cancel", self._cancel_add)],
+            fallbacks=[
+                CommandHandler("cancel", self._cancel_add),
+                CommandHandler("start", self._restart_from_conversation),
+                # Any other button pressed mid-flow abandons the flow and does what was asked.
+                # Without this the conversation is a trap: its states only accept text, so every
+                # button silently falls through to a handler with no branch for it and the bot
+                # appears dead until someone happens to type /cancel.
+                CallbackQueryHandler(self._abandon_and_dispatch),
+            ],
+            # Pressing "Add Master" again restarts the flow instead of being ignored because a
+            # previous attempt was never finished.
+            allow_reentry=True,
             per_message=False,
         )
 
@@ -181,6 +192,7 @@ class CopyBot:
         query = update.callback_query
         await query.answer()
         action = query.data or ""
+        LOGGER.info("button %r from %s", action, owner_id)
         service = await self._registry.get(owner_id)
 
         if action == "menu":
@@ -234,6 +246,11 @@ class CopyBot:
             # Scoped delete: a callback id from someone else's keyboard simply matches no row.
             await self._store.remove_account(account_id, owner_id)
             await self._show_accounts(update, owner_id)
+        else:
+            # Reached only if a keyboard offers something this method does not handle. Silence
+            # here reads to the user as a dead bot, so it is logged and acknowledged instead.
+            LOGGER.warning("unhandled button %r from %s", action, owner_id)
+            await self._show_menu(update, owner_id)
 
     def _chat_for(self, owner_id: int) -> int:
         """Where to message this owner.
@@ -318,11 +335,15 @@ class CopyBot:
     async def _begin_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if await self._guard(update) is None:
             return ConversationHandler.END
+        # Telegram spins the button until the callback is answered; forgetting this is
+        # indistinguishable from the bot being broken, even when the flow behind it works.
+        await update.callback_query.answer()
         kind = MASTER if update.callback_query.data == "add_master" else FOLLOWER
         context.user_data["kind"] = kind
         prompt = await update.callback_query.edit_message_text(
-            f"Adding {kind.title()} account.\n\nSend the MEXC <b>API Key</b>:\n\n/cancel to abort.",
+            f"Adding {kind.title()} account.\n\nSend the MEXC <b>API Key</b> as a message:",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data="menu")]]),
         )
         # Tracked so the whole exchange can be swept away once the account is connected: these
         # prompts are scaffolding, and what they were collecting now lives in the menu instead.
@@ -341,7 +362,9 @@ class CopyBot:
             except Exception:  # noqa: BLE001 — deletion is best-effort, not a reason to abort
                 pass
         prompt = await update.effective_chat.send_message(
-            "Now send the <b>Secret Key</b>:", parse_mode=ParseMode.HTML
+            "Now send the <b>Secret Key</b>:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data="menu")]]),
         )
         context.user_data.setdefault("cleanup", []).append(prompt.message_id)
         return ASK_SECRET
@@ -411,6 +434,20 @@ class CopyBot:
 
         context.user_data.clear()
         await self._show_menu_message(owner_id)
+        return ConversationHandler.END
+
+    async def _abandon_and_dispatch(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """A button pressed while the add flow is waiting for a key: drop the flow, honour the
+        button. The half-entered credentials are discarded rather than carried into the next
+        attempt, where they would be paired with a secret meant for a different key."""
+        context.user_data.clear()
+        await self._on_button(update, context)
+        return ConversationHandler.END
+
+    async def _restart_from_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """/start while mid-flow. Same reasoning as above: it is how someone gets unstuck."""
+        context.user_data.clear()
+        await self._cmd_start(update, context)
         return ConversationHandler.END
 
     async def _cancel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
