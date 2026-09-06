@@ -130,12 +130,33 @@ class CopyBot:
         service = await self._registry.get(owner_id)
         master = await self._store.get_master(owner_id)
         followers = await self._store.list_accounts(owner_id, FOLLOWER)
+
+        # The master's balance is read live rather than cached: a stale number on the screen you
+        # check before pressing START is worse than none. A failure here degrades the line to an
+        # error rather than the whole menu — you still need the buttons when MEXC is down.
+        balance: tuple[float, float] | None = None
+        error: str | None = None
+        if master:
+            credentials = await self._store.get_credentials(master.id, owner_id)
+            if credentials:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        balance = await MexcRestClient(*credentials, session=session).get_usdt_balance()
+                except MexcError as err:
+                    error = err.message
+                except Exception:  # noqa: BLE001 — a network blip must not hide the menu
+                    error = "balance unavailable"
+            else:
+                error = "credentials could not be read"
+
         return messages.main_menu(
             running=service.running,
             master=master,
-            follower_count=len(followers),
+            followers=followers,
             max_followers=self._settings.max_followers,
             master_connected=service.master_connected,
+            master_balance=balance,
+            master_error=error,
         )
 
     async def _show_menu(self, update: Update, owner_id: int) -> None:
@@ -299,10 +320,13 @@ class CopyBot:
             return ConversationHandler.END
         kind = MASTER if update.callback_query.data == "add_master" else FOLLOWER
         context.user_data["kind"] = kind
-        await update.callback_query.edit_message_text(
+        prompt = await update.callback_query.edit_message_text(
             f"Adding {kind.title()} account.\n\nSend the MEXC <b>API Key</b>:\n\n/cancel to abort.",
             parse_mode=ParseMode.HTML,
         )
+        # Tracked so the whole exchange can be swept away once the account is connected: these
+        # prompts are scaffolding, and what they were collecting now lives in the menu instead.
+        context.user_data["cleanup"] = [prompt.message_id] if hasattr(prompt, "message_id") else []
         return ASK_KEY
 
     async def _got_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -316,7 +340,10 @@ class CopyBot:
                 await update.message.delete()
             except Exception:  # noqa: BLE001 — deletion is best-effort, not a reason to abort
                 pass
-        await update.effective_chat.send_message("Now send the <b>Secret Key</b>:", parse_mode=ParseMode.HTML)
+        prompt = await update.effective_chat.send_message(
+            "Now send the <b>Secret Key</b>:", parse_mode=ParseMode.HTML
+        )
+        context.user_data.setdefault("cleanup", []).append(prompt.message_id)
         return ASK_SECRET
 
     async def _got_secret(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -371,22 +398,37 @@ class CopyBot:
             context.user_data.clear()
             return ConversationHandler.END
 
-        await status.edit_text(
-            f"✅ <b>{label} added</b>\n\n"
-            f"Status: Connected\n"
-            f"Balance: {messages.money(equity)} (available {messages.money(available)})\n"
-            f"Position mode: {'hedge' if mode == 1 else 'one-way'}"
-            f"{warning}",
-            parse_mode=ParseMode.HTML,
-        )
+        # The account is connected, so the add-flow messages have served their purpose. Everything
+        # they showed (balance, mode) is now on the menu, which stays put instead of scrolling off.
+        cleanup = list(context.user_data.get("cleanup", []))
+        cleanup.append(status.message_id)
+        if warning:
+            # A position-mode mismatch would silently mirror the wrong direction, so that one
+            # message survives the sweep rather than being replaced by a tidy menu.
+            await status.edit_text(f"✅ <b>{label} added</b>{warning}", parse_mode=ParseMode.HTML)
+            cleanup.remove(status.message_id)
+        await self._delete_messages(update.effective_chat.id, cleanup)
+
         context.user_data.clear()
         await self._show_menu_message(owner_id)
         return ConversationHandler.END
 
     async def _cancel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        await self._delete_messages(update.effective_chat.id, context.user_data.get("cleanup", []))
         context.user_data.clear()
         await update.message.reply_text("Cancelled.")
         return ConversationHandler.END
+
+    async def _delete_messages(self, chat_id: int, message_ids: list[int]) -> None:
+        """Best-effort tidy-up. Telegram refuses to delete messages older than 48h and returns an
+        error for one already gone; neither is worth failing an otherwise successful add over."""
+        if not self._app:
+            return
+        for message_id in message_ids:
+            try:
+                await self._app.bot.delete_message(chat_id, message_id)
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("could not delete message %s", message_id)
 
     # ── outbound ────────────────────────────────────────────────────────────────────────────
     # The registry asks for a callback per owner, so a service physically cannot report into a

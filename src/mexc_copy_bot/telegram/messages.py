@@ -39,9 +39,30 @@ def money(value: float) -> str:
     return f"${value:.4f}"
 
 
+def mode_name(mode: int | None) -> str:
+    if mode == 1:
+        return "hedge"
+    if mode == 2:
+        return "one-way"
+    return "unknown"
+
+
 def main_menu(
-    *, running: bool, master: Account | None, follower_count: int, max_followers: int, master_connected: bool
+    *,
+    running: bool,
+    master: Account | None,
+    followers: list[Account],
+    max_followers: int,
+    master_connected: bool,
+    master_balance: tuple[float, float] | None = None,
+    master_error: str | None = None,
 ) -> str:
+    """The main screen.
+
+    Carries the master's details inline — balance, mode, key hint — rather than leaving them in
+    the one-off "account added" message that scrolls away: this is the screen you look at before
+    pressing START, and it should answer "is the right account connected and funded" on its own.
+    """
     if not master:
         status = "⚪️ NO MASTER"
     elif running and master_connected:
@@ -51,13 +72,26 @@ def main_menu(
     else:
         status = "🔴 STOPPED"
 
-    master_line = f"👤 Master: {master.label} (…{master.api_key_hint})" if master else "👤 Master: not set"
-    return (
-        "🤖 <b>MEXC COPY BOT</b>\n\n"
-        f"Status: {status}\n\n"
-        f"{master_line}\n"
-        f"👥 Followers: {follower_count}/{max_followers}"
-    )
+    lines = ["🤖 <b>MEXC COPY BOT</b>", "", f"Status: {status}", ""]
+
+    if not master:
+        lines.append("👤 <b>Master:</b> not set")
+    else:
+        lines.append(f"👤 <b>Master</b> — …{master.api_key_hint}")
+        if master_balance:
+            equity, available = master_balance
+            lines.append(f"     Balance: {money(equity)} (available {money(available)})")
+        elif master_error:
+            lines.append(f"     ❌ {master_error}")
+        lines.append(f"     Mode: {mode_name(master.position_mode)}")
+
+    lines.append("")
+    lines.append(f"👥 <b>Followers:</b> {len(followers)}/{max_followers}")
+    for follower in followers:
+        mark = "" if follower.active else " (paused)"
+        lines.append(f"     • {follower.label} — …{follower.api_key_hint}{mark}")
+
+    return "\n".join(lines)
 
 
 def event_report(event: MasterEvent, results: list[FollowerResult], notional: float | None) -> str:
