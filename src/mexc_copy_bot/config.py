@@ -34,10 +34,20 @@ def _float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _user_ids(name: str) -> frozenset[int]:
+    """Comma-separated Telegram user ids. Empty is refused rather than defaulted to "anyone":
+    this bot can move real money on ten accounts, so an unset whitelist must fail closed."""
+    raw = _require(name)
+    ids = {int(part.strip()) for part in raw.split(",") if part.strip()}
+    if not ids:
+        raise RuntimeError(f"{name} must contain at least one Telegram user id")
+    return frozenset(ids)
+
+
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
-    allowed_user_id: int
+    allowed_user_ids: frozenset[int]
     database_url: str
     encryption_key: str
 
@@ -55,8 +65,9 @@ class Settings:
         load_dotenv()
         return cls(
             bot_token=_require("COPY_BOT_TOKEN"),
-            # A single-owner bot: anyone else who finds it gets refused rather than shown the menu.
-            allowed_user_id=int(_require("COPY_BOT_ALLOWED_USER_ID")),
+            # Whitelist, not a single owner: the team shares these accounts. Anyone not listed is
+            # refused outright rather than shown the menu. Comma-separated ids.
+            allowed_user_ids=_user_ids("COPY_BOT_ALLOWED_USER_ID"),
             database_url=_require("COPY_BOT_DATABASE_URL"),
             encryption_key=_require("COPY_BOT_ENCRYPTION_KEY"),
             max_followers=_int("COPY_BOT_MAX_FOLLOWERS", 9),

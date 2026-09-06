@@ -4,8 +4,9 @@ Contains no trading logic (spec §3, §34): every button calls into CopyService 
 boundary is what keeps a Telegram outage from affecting copying, and lets the trading path be
 reasoned about without reading UI code.
 
-Access is a hard whitelist of one user id. Anyone else gets a refusal — this bot can move real
-money on ten accounts, so an unknown chat must never reach a keyboard.
+Access is a hard whitelist of Telegram user ids (COPY_BOT_ALLOWED_USER_ID, comma-separated).
+Anyone not on it gets a refusal — this bot can move real money on ten accounts, so an unknown chat
+must never reach a keyboard. Everyone on the list has full control, including Emergency Stop.
 """
 
 from __future__ import annotations
@@ -100,7 +101,7 @@ class CopyBot:
 
     def _authorized(self, update: Update) -> bool:
         user = update.effective_user
-        return bool(user and user.id == self._settings.allowed_user_id)
+        return bool(user and user.id in self._settings.allowed_user_ids)
 
     async def _guard(self, update: Update) -> bool:
         if self._authorized(update):
