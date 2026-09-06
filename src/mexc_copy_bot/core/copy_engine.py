@@ -53,6 +53,14 @@ class FollowerResult:
     action: Action
     vol: float
     error: str | None = None
+    # Realised PnL for a close, straight from the exchange. None means "not known" — an open, or
+    # a close whose settlement could not be read — and must never be shown as a zero.
+    realized_pnl: float | None = None
+
+
+# How long to keep asking the exchange what a just-closed position settled at. Settlement is not
+# instant, and reporting "unknown" on a close that simply had not settled yet would be noise.
+PNL_POLL_DELAYS = (0.0, 0.5, 1.0, 2.0)
 
 
 def _is_permanent(err: MexcError) -> bool:
@@ -122,11 +130,13 @@ class CopyEngine:
         for attempt in range(self._retry_attempts):
             attempts = attempt + 1
             try:
-                await self._apply(client, event, follower, vol, external_oid)
-                await self._store.finish_task(task_id, status="SUCCESS", attempts=attempts, error=None)
+                realized = await self._apply(client, event, follower, vol, external_oid)
+                await self._store.finish_task(
+                    task_id, status="SUCCESS", attempts=attempts, error=None, realized_pnl=realized
+                )
                 await self._store.set_account_error(follower.id, None)
                 await self._record_expected_position(event, follower, vol)
-                return FollowerResult(follower, True, event.action, vol, None)
+                return FollowerResult(follower, True, event.action, vol, None, realized)
             except MexcError as err:
                 last_error = err.message or str(err)
                 if _is_permanent(err):
@@ -144,13 +154,22 @@ class CopyEngine:
 
     async def _apply(
         self, client: MexcRestClient, event: MasterEvent, follower: Account, vol: float, external_oid: str
-    ) -> None:
+    ) -> float | None:
+        """Returns realised PnL when this was a close and the exchange reported it."""
         if event.action is Action.CLOSE:
             # See the module docstring: close_all is the only reliable way out of a hedge-mode
             # position. It closes both sides of the symbol, which is correct here — the master
             # holding nothing means the follower should hold nothing.
+            #
+            # The ids are read first because that is the only reliable way to attribute the
+            # settlement afterwards: history is per symbol, and matching on "most recent" would
+            # pick up an unrelated earlier close on the same symbol.
+            try:
+                open_ids = [p.position_id for p in await client.get_open_positions(event.symbol) if p.hold_vol > 0]
+            except MexcError:
+                open_ids = []
             await client.close_all(event.symbol)
-            return
+            return await self._realized_pnl(client, event.symbol, open_ids)
 
         if event.action is Action.DECREASE:
             # A partial reduction has the same hazard as a close: an opposite-side order would
@@ -163,6 +182,7 @@ class CopyEngine:
             )
 
         # OPEN and INCREASE are both "add this many contracts on this side".
+        # (No realised PnL to report for these; the return below is the whole method's result.)
         side = SIDE_OPEN_LONG if event.position_type == 1 else SIDE_OPEN_SHORT
         if event.leverage:
             # Leverage must be right BEFORE the order, or the position opens with the account's
@@ -187,6 +207,38 @@ class CopyEngine:
             open_type=event.open_type,
             external_oid=external_oid,
         )
+
+    async def _realized_pnl(
+        self, client: MexcRestClient, symbol: str, position_ids: list[int]
+    ) -> float | None:
+        """Sum what the just-closed positions actually settled at.
+
+        Returns None unless every position is accounted for. A partial sum presented as "the PnL"
+        is worse than no number at all — it looks authoritative while quietly omitting a leg,
+        which in hedge mode is exactly the leg that went the other way.
+        """
+        if not position_ids:
+            return None
+
+        outstanding = set(position_ids)
+        total = 0.0
+        for delay in PNL_POLL_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                closed = await client.get_closed_positions(symbol)
+            except (MexcError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+                LOGGER.info("could not read settlement for %s: %s", symbol, err)
+                continue
+            for position in closed:
+                if position.position_id in outstanding:
+                    total += position.realised
+                    outstanding.discard(position.position_id)
+            if not outstanding:
+                return total
+
+        LOGGER.info("settlement incomplete for %s: %s still unsettled", symbol, sorted(outstanding))
+        return None
 
     async def _record_expected_position(self, event: MasterEvent, follower: Account, vol: float) -> None:
         """Track what this follower's position should now be, for reconciliation to check."""

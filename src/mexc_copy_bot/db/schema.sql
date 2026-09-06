@@ -30,6 +30,10 @@ BEGIN
         END IF;
     END IF;
 
+    IF to_regclass('public.copy_tasks') IS NOT NULL THEN
+        ALTER TABLE copy_tasks ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION;
+    END IF;
+
     IF to_regclass('public.copy_master_events') IS NOT NULL THEN
         ALTER TABLE copy_master_events ADD COLUMN IF NOT EXISTS owner_id BIGINT NOT NULL DEFAULT 0;
         -- dedupe_key was globally unique, which would let one owner's event suppress another's
@@ -145,6 +149,9 @@ CREATE TABLE IF NOT EXISTS copy_tasks (
     status         TEXT        NOT NULL DEFAULT 'PENDING',
     attempts       INTEGER     NOT NULL DEFAULT 0,
     error          TEXT,
+    -- Realised PnL for a CLOSE, as the exchange settled it. NULL for opens, and for a close whose
+    -- settlement could not be read back — which must stay distinguishable from a genuine zero.
+    realized_pnl   DOUBLE PRECISION,
     -- Sent to MEXC as externalOid: the venue rejects a duplicate, so a retry after a network
     -- timeout that actually succeeded cannot place a second order.
     external_oid   TEXT        NOT NULL UNIQUE,

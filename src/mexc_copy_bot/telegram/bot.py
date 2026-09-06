@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -45,6 +46,12 @@ LOGGER = logging.getLogger(__name__)
 
 # Conversation states for adding an account.
 ASK_KEY, ASK_SECRET = range(2)
+
+# How long a balance reading stays good enough to reuse. Tapping around the menu should not fire
+# ten exchange calls per screen; five seconds is under the time it takes to read the menu, so what
+# you see is still effectively live, while a burst of taps costs one round of calls instead of one
+# per tap.
+BALANCE_TTL_SECONDS = 5.0
 
 
 def _menu_keyboard(running: bool) -> InlineKeyboardMarkup:
@@ -85,6 +92,9 @@ class CopyBot:
         # chat per owner, learned from their last interaction — reports must never land in the
         # other brother's chat.
         self._chat_ids: dict[int, int] = {}
+        # owner id -> (fetched at, balances). Per owner, so one person's cached numbers can never
+        # be served to the other.
+        self._balance_cache: dict[int, tuple[float, dict[int, messages.Balance]]] = {}
 
         registry.configure_callbacks(on_report=self._report_for, on_notice=self._notice_for)
 
@@ -167,6 +177,15 @@ class CopyBot:
         if not accounts:
             return {}
 
+        cached_at, cached = self._balance_cache.get(owner_id, (0.0, {}))
+        # Reused only when it covers every account being shown: a follower added moments ago must
+        # not sit there blank until the cache expires.
+        if (
+            time.monotonic() - cached_at < BALANCE_TTL_SECONDS
+            and all(account.id in cached for account in accounts)
+        ):
+            return cached
+
         credentials_by_id = await self._store.get_credentials_for(owner_id)
 
         async with aiohttp.ClientSession() as session:
@@ -185,7 +204,14 @@ class CopyBot:
 
             results = await asyncio.gather(*(fetch(a) for a in accounts))
 
-        return dict(zip((a.id for a in accounts), results))
+        balances = dict(zip((a.id for a in accounts), results))
+        self._balance_cache[owner_id] = (time.monotonic(), balances)
+        return balances
+
+    def _invalidate_balances(self, owner_id: int) -> None:
+        """After adding or removing an account, showing the previous line-up for five seconds
+        would look like the change had not taken."""
+        self._balance_cache.pop(owner_id, None)
 
     async def _show_menu(self, update: Update, owner_id: int) -> None:
         service = await self._registry.get(owner_id)
@@ -262,6 +288,7 @@ class CopyBot:
             account_id = int(action.split(":", 1)[1])
             # Scoped delete: a callback id from someone else's keyboard simply matches no row.
             await self._store.remove_account(account_id, owner_id)
+            self._invalidate_balances(owner_id)
             await self._show_accounts(update, owner_id)
         else:
             # Reached only if a keyboard offers something this method does not handle. Silence
@@ -437,6 +464,8 @@ class CopyBot:
             await status.edit_text(f"❌ Could not save: {err}")
             context.user_data.clear()
             return ConversationHandler.END
+
+        self._invalidate_balances(owner_id)
 
         # The account is connected, so the add-flow messages have served their purpose. Everything
         # they showed (balance, mode) is now on the menu, which stays put instead of scrolling off.

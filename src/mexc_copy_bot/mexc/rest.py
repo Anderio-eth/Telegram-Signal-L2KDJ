@@ -71,6 +71,22 @@ class Position:
 
 
 @dataclass(frozen=True)
+class ClosedPosition:
+    """One finished position, as the exchange settled it.
+
+    `realised` is MEXC's own realised PnL for the position — taken rather than recomputed from
+    entry and exit prices, because the venue's number is the one that moved the balance.
+    """
+
+    position_id: int
+    symbol: str
+    position_type: int
+    realised: float
+    close_vol: float
+    update_time: int
+
+
+@dataclass(frozen=True)
 class ContractSpec:
     symbol: str
     contract_size: float
@@ -151,6 +167,35 @@ class MexcRestClient:
                     state=int(row.get("state", 0) or 0),
                 )
             )
+        return out
+
+    async def get_closed_positions(self, symbol: str | None = None, *, page_size: int = 50) -> list[ClosedPosition]:
+        """Recently closed positions, newest first.
+
+        Used after a close to report what the position actually made. Settlement is not always
+        instant, so callers poll this rather than reading it once.
+        """
+        params: dict[str, Any] = {"page_num": 1, "page_size": page_size}
+        if symbol:
+            params["symbol"] = symbol
+        rows = await self._request("GET", "/private/position/list/history_positions", params=params) or []
+        out: list[ClosedPosition] = []
+        for row in rows:
+            try:
+                out.append(
+                    ClosedPosition(
+                        position_id=int(row.get("positionId") or 0),
+                        symbol=str(row.get("symbol") or ""),
+                        position_type=int(row.get("positionType") or 0),
+                        realised=float(row.get("realised") or 0.0),
+                        close_vol=float(row.get("closeVol") or 0.0),
+                        update_time=int(row.get("updateTime") or 0),
+                    )
+                )
+            except (TypeError, ValueError):
+                # A row we cannot parse is skipped rather than failing the whole lookup: this is
+                # reporting, and a malformed entry must not break the close it is describing.
+                LOGGER.debug("unparseable closed position row: %s", row)
         return out
 
     async def get_position_mode(self) -> int:

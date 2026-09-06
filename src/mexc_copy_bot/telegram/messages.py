@@ -38,7 +38,12 @@ def money(value: float) -> str:
         return f"${value:,.0f}"
     if value >= 1:
         return f"${value:,.2f}"
-    return f"${value:.4f}"
+    # Under a dollar, cents are not enough resolution for a PnL on a small position, but padding
+    # every figure to four places turns "half a dollar" into $0.5000. Keep the digits that carry
+    # information and drop the rest, never going below the two everyone expects on money.
+    digits = f"{value:.4f}".rstrip("0")
+    whole, _, frac = digits.partition(".")
+    return f"${whole}.{(frac + '00')[:max(2, len(frac))]}"
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,11 @@ class Balance:
         if self.equity is None:
             return "…"
         return f"{money(self.equity)} (available {money(self.available or 0.0)})"
+
+
+def signed_money(value: float) -> str:
+    """PnL with an explicit sign, so a loss can never be misread as a gain at a glance."""
+    return f"{'+' if value >= 0 else '−'}{money(abs(value))}"
 
 
 def mode_name(mode: int | None) -> str:
@@ -145,12 +155,30 @@ def event_report(event: MasterEvent, results: list[FollowerResult], notional: fl
         if result.ok:
             ok += 1
             detail = "CLOSED" if event.action is Action.CLOSE else f"{result.action.value}"
-            lines.append(f"✅ {result.account.label} — {detail}")
+            line = f"✅ {result.account.label} — {detail}"
+            if event.action is Action.CLOSE:
+                # An unknown settlement says so rather than printing a zero, which would read as
+                # "this trade broke even".
+                line += (
+                    f"  {signed_money(result.realized_pnl)}"
+                    if result.realized_pnl is not None
+                    else "  (PnL pending)"
+                )
+            lines.append(line)
         else:
             lines.append(f"❌ {result.account.label} — {result.error or 'failed'}")
 
     lines.append("")
     lines.append(f"Success: {ok}/{len(results)}")
+
+    if event.action is Action.CLOSE:
+        known = [r.realized_pnl for r in results if r.ok and r.realized_pnl is not None]
+        if known:
+            reported = len(known)
+            closed = sum(1 for r in results if r.ok)
+            suffix = "" if reported == closed else f"  (of {reported}/{closed} reported)"
+            lines.append(f"<b>Total PnL: {signed_money(sum(known))}</b>{suffix}")
+
     return "\n".join(lines)
 
 
@@ -184,8 +212,15 @@ def history(events: list[dict]) -> str:
     lines = ["📜 <b>HISTORY</b>", ""]
     for e in events:
         when = e["observed_at"].strftime("%d.%m %H:%M")
-        lines.append(
+        line = (
             f"{when}  <b>{e['symbol']}</b> {side_name(e['position_type'])} {e['action']}"
             f"  ✅{e['ok']} ❌{e['failed']}"
         )
+        # Only closes settle into a PnL; pnl_count guards against showing a sum that covers only
+        # some of the accounts as though it covered them all.
+        if e.get("pnl") is not None and e.get("pnl_count"):
+            line += f"  {signed_money(float(e['pnl']))}"
+            if e["pnl_count"] < e["ok"]:
+                line += f" ({e['pnl_count']}/{e['ok']})"
+        lines.append(line)
     return "\n".join(lines)

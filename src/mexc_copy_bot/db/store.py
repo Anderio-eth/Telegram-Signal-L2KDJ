@@ -340,14 +340,24 @@ class Store:
                 external_oid,
             )
 
-    async def finish_task(self, task_id: int, *, status: str, attempts: int, error: str | None) -> None:
+    async def finish_task(
+        self,
+        task_id: int,
+        *,
+        status: str,
+        attempts: int,
+        error: str | None,
+        realized_pnl: float | None = None,
+    ) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "UPDATE copy_tasks SET status = $2, attempts = $3, error = $4, updated_at = now() WHERE id = $1",
+                "UPDATE copy_tasks SET status = $2, attempts = $3, error = $4, realized_pnl = $5,"
+                " updated_at = now() WHERE id = $1",
                 task_id,
                 status,
                 attempts,
                 error,
+                realized_pnl,
             )
 
     async def recent_events(self, owner_id: int, limit: int = 10) -> list[dict[str, Any]]:
@@ -357,7 +367,11 @@ class Store:
                 SELECT e.id, e.symbol, e.action, e.position_type, e.master_vol, e.delta_vol,
                        e.leverage, e.observed_at,
                        count(t.id) FILTER (WHERE t.status = 'SUCCESS') AS ok,
-                       count(t.id) FILTER (WHERE t.status = 'FAILED')  AS failed
+                       count(t.id) FILTER (WHERE t.status = 'FAILED')  AS failed,
+                       sum(t.realized_pnl) AS pnl,
+                       -- How many closes actually reported a number, so the history can say
+                       -- "partial" instead of presenting an incomplete sum as the total.
+                       count(t.realized_pnl) AS pnl_count
                 FROM copy_master_events e
                 LEFT JOIN copy_tasks t ON t.event_id = e.id
                 WHERE e.owner_id = $1
