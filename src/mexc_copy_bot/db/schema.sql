@@ -3,11 +3,65 @@
 -- Tables are prefixed `copy_` because this database is shared with another project; the prefix is
 -- what keeps the two from ever colliding on a name like "accounts" or "positions".
 --
+-- Multi-tenant by Telegram user id: two brothers run their own master and their own followers in
+-- the same bot, and must never see or touch each other's accounts. `owner_id` is on every table
+-- that holds anything account-specific, and every query filters by it — the isolation is in the
+-- data model rather than in UI checks that can be forgotten.
+--
 -- Applied idempotently at startup (see db/store.py), so a redeploy is safe and there is no
 -- separate migration step to forget.
 
+-- ── Upgrade in place, before anything below needs the new columns ───────────────────────────
+-- Everything after this point is written for the multi-tenant shape, including indexes on
+-- `owner_id`, so a database created by an older build has to be brought forward first. Each step
+-- is conditional, so this is a no-op on a fresh database and on an already-migrated one.
+DO $$
+DECLARE
+    con record;
+BEGIN
+    IF to_regclass('public.copy_accounts') IS NOT NULL THEN
+        -- Pre-existing rows go to owner 0, which belongs to nobody: they stay invisible in the
+        -- bot rather than silently becoming someone's accounts.
+        ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS owner_id BIGINT NOT NULL DEFAULT 0;
+        -- The single-master index used to be global; it has to become per-owner.
+        IF EXISTS (SELECT 1 FROM pg_indexes
+                   WHERE indexname = 'copy_accounts_single_master' AND indexdef LIKE '%(kind)%') THEN
+            DROP INDEX copy_accounts_single_master;
+        END IF;
+    END IF;
+
+    IF to_regclass('public.copy_master_events') IS NOT NULL THEN
+        ALTER TABLE copy_master_events ADD COLUMN IF NOT EXISTS owner_id BIGINT NOT NULL DEFAULT 0;
+        -- dedupe_key was globally unique, which would let one owner's event suppress another's
+        -- identical one. Found by column rather than by name: Postgres named the old constraint
+        -- itself, and guessing that name wrong leaves the bug silently in place.
+        FOR con IN
+            SELECT c.conname
+            FROM pg_constraint c
+            JOIN pg_class rel ON rel.oid = c.conrelid
+            WHERE rel.relname = 'copy_master_events'
+              AND c.contype = 'u'
+              AND (SELECT array_agg(a.attname::text)
+                   FROM unnest(c.conkey) AS k
+                   JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k) = ARRAY['dedupe_key']
+        LOOP
+            EXECUTE format('ALTER TABLE copy_master_events DROP CONSTRAINT %I', con.conname);
+        END LOOP;
+    END IF;
+
+    -- copy_state was one global row keyed on id = 1; it is now one row per owner. Dropping it is
+    -- safe: it holds nothing but a START/STOP flag, and losing it means "stopped".
+    IF to_regclass('public.copy_state') IS NOT NULL
+       AND EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'copy_state' AND column_name = 'id') THEN
+        DROP TABLE copy_state;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS copy_accounts (
     id                BIGSERIAL PRIMARY KEY,
+    -- Telegram user id of the owner. Accounts are private to them.
+    owner_id          BIGINT      NOT NULL,
     label             TEXT        NOT NULL,
     -- 'MASTER' or 'FOLLOWER'. Exactly one master is enforced by the partial index below.
     kind              TEXT        NOT NULL CHECK (kind IN ('MASTER', 'FOLLOWER')),
@@ -28,9 +82,11 @@ CREATE TABLE IF NOT EXISTS copy_accounts (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- One master, enforced by the database rather than by application checks that can race.
+-- One master PER OWNER, enforced by the database rather than by application checks that can race.
 CREATE UNIQUE INDEX IF NOT EXISTS copy_accounts_single_master
-    ON copy_accounts ((kind)) WHERE kind = 'MASTER';
+    ON copy_accounts (owner_id) WHERE kind = 'MASTER';
+
+CREATE INDEX IF NOT EXISTS copy_accounts_owner ON copy_accounts (owner_id);
 
 -- What we believe each account's position is. The exchange remains the source of truth;
 -- reconciliation compares this against reality and reports drift.
@@ -52,7 +108,10 @@ CREATE TABLE IF NOT EXISTS copy_positions (
 -- open a second position on every follower.
 CREATE TABLE IF NOT EXISTS copy_master_events (
     id             BIGSERIAL   PRIMARY KEY,
-    dedupe_key     TEXT        NOT NULL UNIQUE,
+    owner_id       BIGINT      NOT NULL,
+    -- Unique per owner, not globally: two masters can legitimately produce the same position
+    -- version for the same symbol, and one owner's event must never suppress the other's.
+    dedupe_key     TEXT        NOT NULL,
     symbol         TEXT        NOT NULL,
     position_type  INTEGER     NOT NULL,
     -- OPEN | INCREASE | DECREASE | CLOSE
@@ -67,7 +126,8 @@ CREATE TABLE IF NOT EXISTS copy_master_events (
     raw            JSONB
 );
 
-CREATE INDEX IF NOT EXISTS copy_master_events_time ON copy_master_events (observed_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS copy_master_events_dedupe ON copy_master_events (owner_id, dedupe_key);
+CREATE INDEX IF NOT EXISTS copy_master_events_time ON copy_master_events (owner_id, observed_at DESC);
 
 -- One row per (event, follower). The unique constraint is the second idempotency guard: even if
 -- an event were somehow processed twice, a follower cannot receive the same instruction twice.
@@ -96,11 +156,11 @@ CREATE TABLE IF NOT EXISTS copy_tasks (
 CREATE INDEX IF NOT EXISTS copy_tasks_event ON copy_tasks (event_id);
 CREATE INDEX IF NOT EXISTS copy_tasks_recent ON copy_tasks (created_at DESC);
 
--- Single-row control state, so START/STOP survives a restart (spec §31).
+-- Run state per owner, so START/STOP survives a restart (spec §31) and one owner stopping does
+-- not stop the other's copying.
 CREATE TABLE IF NOT EXISTS copy_state (
-    id           INTEGER     PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    owner_id     BIGINT      PRIMARY KEY,
     running      BOOLEAN     NOT NULL DEFAULT FALSE,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-INSERT INTO copy_state (id, running) VALUES (1, FALSE) ON CONFLICT (id) DO NOTHING;

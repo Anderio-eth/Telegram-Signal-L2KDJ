@@ -6,6 +6,11 @@ handlers call start()/stop()/status() and never touch MEXC or the database direc
 Restart safety (spec §31): run state is persisted, and on boot the master's real positions become
 the baseline before monitoring resumes — otherwise the first push after a restart would look like
 the master had just opened everything from scratch, and every follower would copy it again.
+
+One instance per owner (see core/registry.py). Each has its own master socket, its own
+followers and its own run state, so one person starting, stopping or emergency-closing never
+reaches into somebody else's accounts. `owner_id` is passed to every store call rather than
+filtered afterwards.
 """
 
 from __future__ import annotations
@@ -43,12 +48,14 @@ class CopyService:
     def __init__(
         self,
         store: Store,
+        owner_id: int,
         *,
         retry_attempts: int = 3,
         reconcile_seconds: int = 60,
         ws_reconnect_max_seconds: float = 30.0,
     ) -> None:
         self._store = store
+        self._owner_id = owner_id
         self._retry_attempts = retry_attempts
         self._reconcile_seconds = reconcile_seconds
         self._ws_reconnect_max = ws_reconnect_max_seconds
@@ -65,6 +72,10 @@ class CopyService:
         self.on_report: ReportCallback | None = None
         self.on_notice: NoticeCallback | None = None
 
+    @property
+    def owner_id(self) -> int:
+        return self._owner_id
+
     # ── lifecycle ───────────────────────────────────────────────────────────────────────────
     @property
     def running(self) -> bool:
@@ -78,11 +89,11 @@ class CopyService:
         if self._ws:
             return "Already running."
 
-        master = await self._store.get_master()
+        master = await self._store.get_master(self._owner_id)
         if not master:
             return "No master account configured."
 
-        credentials = await self._store.get_credentials(master.id)
+        credentials = await self._store.get_credentials(master.id, self._owner_id)
         if not credentials:
             return "Master credentials could not be read."
 
@@ -98,7 +109,7 @@ class CopyService:
         )
         self._ws.start()
         self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
-        await self._store.set_running(True)
+        await self._store.set_running(self._owner_id, True)
         return "Copy trading started."
 
     async def stop(self) -> str:
@@ -114,17 +125,22 @@ class CopyService:
         if self._session:
             await self._session.close()
             self._session = None
-        await self._store.set_running(False)
+        await self._store.set_running(self._owner_id, False)
         return "Copy trading stopped. Open positions were left as they are."
 
     async def emergency_close_all(self) -> list[tuple[Account, str]]:
-        """Close every position on every follower. Only ever called after explicit confirmation."""
+        """Close every position on this owner's followers, after explicit confirmation.
+
+        Scoped to the caller's own accounts: an emergency stop is drastic enough that reaching
+        another owner's positions with it would be unforgivable, so the account list it walks
+        is filtered in SQL, not here.
+        """
         outcomes: list[tuple[Account, str]] = []
         session = self._session or aiohttp.ClientSession()
         own_session = self._session is None
         try:
-            for follower in await self._store.list_accounts(FOLLOWER):
-                credentials = await self._store.get_credentials(follower.id)
+            for follower in await self._store.list_accounts(self._owner_id, FOLLOWER):
+                credentials = await self._store.get_credentials(follower.id, self._owner_id)
                 if not credentials:
                     outcomes.append((follower, "credentials missing"))
                     continue
@@ -152,10 +168,10 @@ class CopyService:
         Called at connect and after every reconnect. Without this, the first push following a
         gap would be diffed against a stale size and copied as a phantom change.
         """
-        master = await self._store.get_master()
+        master = await self._store.get_master(self._owner_id)
         if not master or not self._session:
             return
-        credentials = await self._store.get_credentials(master.id)
+        credentials = await self._store.get_credentials(master.id, self._owner_id)
         if not credentials:
             return
         client = MexcRestClient(*credentials, session=self._session)
@@ -194,6 +210,7 @@ class CopyService:
 
     async def _dispatch(self, event: MasterEvent, raw: dict) -> None:
         event_id = await self._store.record_event(
+            owner_id=self._owner_id,
             dedupe_key=event.dedupe_key,
             symbol=event.symbol,
             position_type=event.position_type,
@@ -208,7 +225,7 @@ class CopyService:
             LOGGER.info("duplicate master event ignored: %s", event.dedupe_key)
             return
 
-        followers = [a for a in await self._store.list_accounts(FOLLOWER) if a.active]
+        followers = [a for a in await self._store.list_accounts(self._owner_id, FOLLOWER) if a.active]
         if not followers:
             LOGGER.info("no active followers for event %s", event_id)
             return
@@ -247,8 +264,8 @@ class CopyService:
         if not self._session:
             return []
         drifts: list[Drift] = []
-        for follower in await self._store.list_accounts(FOLLOWER):
-            credentials = await self._store.get_credentials(follower.id)
+        for follower in await self._store.list_accounts(self._owner_id, FOLLOWER):
+            credentials = await self._store.get_credentials(follower.id, self._owner_id)
             if not credentials:
                 continue
             client = MexcRestClient(*credentials, session=self._session)

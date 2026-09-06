@@ -6,6 +6,11 @@ bot shares a 512MB instance with the signal bot, so the queries are written out.
 Credentials are encrypted before they reach this layer and decrypted only where an API call needs
 them — nothing here ever returns a plaintext secret by accident, because the row types simply
 don't carry one.
+
+Every account-scoped method takes `owner_id` (a Telegram user id) and puts it in the WHERE
+clause, including the mutations. That is deliberate: passing an id that belongs to somebody
+else has to come back empty at the SQL level, so a missing check in the Telegram layer cannot
+delete or trade another owner's account.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ FOLLOWER = "FOLLOWER"
 @dataclass(frozen=True)
 class Account:
     id: int
+    owner_id: int
     label: str
     kind: str
     api_key_hint: str
@@ -79,15 +85,24 @@ class Store:
 
     # ── accounts ────────────────────────────────────────────────────────────────────────────
     async def add_account(
-        self, *, label: str, kind: str, api_key: str, api_secret: str, position_mode: int | None
+        self,
+        *,
+        owner_id: int,
+        label: str,
+        kind: str,
+        api_key: str,
+        api_secret: str,
+        position_mode: int | None,
     ) -> int:
         async with self._pool.acquire() as conn:
             return await conn.fetchval(
                 """
-                INSERT INTO copy_accounts (label, kind, api_key_enc, api_secret_enc, api_key_hint, position_mode)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO copy_accounts
+                    (owner_id, label, kind, api_key_enc, api_secret_enc, api_key_hint, position_mode)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id
                 """,
+                owner_id,
                 label,
                 kind,
                 self._cipher.encrypt(api_key),
@@ -96,67 +111,103 @@ class Store:
                 position_mode,
             )
 
-    async def list_accounts(self, kind: str | None = None) -> list[Account]:
+    async def list_accounts(self, owner_id: int, kind: str | None = None) -> list[Account]:
         query = """
-            SELECT id, label, kind, api_key_hint, size_multiplier, active, position_mode, last_error
+            SELECT id, owner_id, label, kind, api_key_hint, size_multiplier, active, position_mode,
+                   last_error
             FROM copy_accounts
+            WHERE owner_id = $1
         """
-        args: list[Any] = []
+        args: list[Any] = [owner_id]
         if kind:
-            query += " WHERE kind = $1"
+            query += " AND kind = $2"
             args.append(kind)
         query += " ORDER BY kind DESC, id ASC"
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(query, *args)
         return [Account(**dict(r)) for r in rows]
 
-    async def get_master(self) -> Account | None:
-        accounts = await self.list_accounts(MASTER)
+    async def list_owners(self) -> list[int]:
+        """Owners with at least one account — who the manager must run a copier for."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT DISTINCT owner_id FROM copy_accounts ORDER BY owner_id")
+        return [r["owner_id"] for r in rows]
+
+    async def get_master(self, owner_id: int) -> Account | None:
+        accounts = await self.list_accounts(owner_id, MASTER)
         return accounts[0] if accounts else None
 
-    async def get_credentials(self, account_id: int) -> tuple[str, str] | None:
-        """Decrypted (api_key, secret). The only place plaintext exists, and only in memory."""
+    async def get_credentials(self, account_id: int, owner_id: int) -> tuple[str, str] | None:
+        """Decrypted (api_key, secret). The only place plaintext exists, and only in memory.
+
+        Scoped by owner as well as id: nothing should be able to ask for another owner's keys,
+        so the query simply cannot find them.
+        """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT api_key_enc, api_secret_enc FROM copy_accounts WHERE id = $1", account_id
+                "SELECT api_key_enc, api_secret_enc FROM copy_accounts WHERE id = $1 AND owner_id = $2",
+                account_id,
+                owner_id,
             )
         if not row:
             return None
         return self._cipher.decrypt(row["api_key_enc"]), self._cipher.decrypt(row["api_secret_enc"])
 
-    async def remove_account(self, account_id: int) -> bool:
+    async def remove_account(self, account_id: int, owner_id: int) -> bool:
         async with self._pool.acquire() as conn:
-            result = await conn.execute("DELETE FROM copy_accounts WHERE id = $1", account_id)
+            result = await conn.execute(
+                "DELETE FROM copy_accounts WHERE id = $1 AND owner_id = $2", account_id, owner_id
+            )
         return result.endswith("1")
 
-    async def set_account_active(self, account_id: int, active: bool) -> None:
+    async def set_account_active(self, account_id: int, owner_id: int, active: bool) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "UPDATE copy_accounts SET active = $2, updated_at = now() WHERE id = $1", account_id, active
+                "UPDATE copy_accounts SET active = $3, updated_at = now() WHERE id = $1 AND owner_id = $2",
+                account_id,
+                owner_id,
+                active,
             )
 
     async def set_account_error(self, account_id: int, error: str | None) -> None:
+        # No owner filter: the engine calls this with an id it just read from that owner's own
+        # account list, and it only ever writes a diagnostic string.
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "UPDATE copy_accounts SET last_error = $2, updated_at = now() WHERE id = $1", account_id, error
             )
 
-    async def set_size_multiplier(self, account_id: int, multiplier: float) -> None:
+    async def set_size_multiplier(self, account_id: int, owner_id: int, multiplier: float) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "UPDATE copy_accounts SET size_multiplier = $2, updated_at = now() WHERE id = $1",
+                "UPDATE copy_accounts SET size_multiplier = $3, updated_at = now()"
+                " WHERE id = $1 AND owner_id = $2",
                 account_id,
+                owner_id,
                 multiplier,
             )
 
     # ── run state ───────────────────────────────────────────────────────────────────────────
-    async def is_running(self) -> bool:
+    async def is_running(self, owner_id: int) -> bool:
         async with self._pool.acquire() as conn:
-            return bool(await conn.fetchval("SELECT running FROM copy_state WHERE id = 1"))
+            return bool(await conn.fetchval("SELECT running FROM copy_state WHERE owner_id = $1", owner_id))
 
-    async def set_running(self, running: bool) -> None:
+    async def set_running(self, owner_id: int, running: bool) -> None:
         async with self._pool.acquire() as conn:
-            await conn.execute("UPDATE copy_state SET running = $1, updated_at = now() WHERE id = 1", running)
+            await conn.execute(
+                """
+                INSERT INTO copy_state (owner_id, running) VALUES ($1, $2)
+                ON CONFLICT (owner_id) DO UPDATE SET running = EXCLUDED.running, updated_at = now()
+                """,
+                owner_id,
+                running,
+            )
+
+    async def running_owners(self) -> list[int]:
+        """Owners whose copying was left ON — restored on boot so a redeploy resumes each."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT owner_id FROM copy_state WHERE running ORDER BY owner_id")
+        return [r["owner_id"] for r in rows]
 
     # ── positions (expected state) ──────────────────────────────────────────────────────────
     async def get_positions(self, account_id: int) -> dict[tuple[str, int], PositionRow]:
@@ -201,6 +252,7 @@ class Store:
     async def record_event(
         self,
         *,
+        owner_id: int,
         dedupe_key: str,
         symbol: str,
         position_type: int,
@@ -220,11 +272,13 @@ class Store:
             return await conn.fetchval(
                 """
                 INSERT INTO copy_master_events
-                    (dedupe_key, symbol, position_type, action, master_vol, delta_vol, leverage, open_type, raw)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                ON CONFLICT (dedupe_key) DO NOTHING
+                    (owner_id, dedupe_key, symbol, position_type, action, master_vol, delta_vol,
+                     leverage, open_type, raw)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (owner_id, dedupe_key) DO NOTHING
                 RETURNING id
                 """,
+                owner_id,
                 dedupe_key,
                 symbol,
                 position_type,
@@ -279,7 +333,7 @@ class Store:
                 error,
             )
 
-    async def recent_events(self, limit: int = 10) -> list[dict[str, Any]]:
+    async def recent_events(self, owner_id: int, limit: int = 10) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -289,10 +343,12 @@ class Store:
                        count(t.id) FILTER (WHERE t.status = 'FAILED')  AS failed
                 FROM copy_master_events e
                 LEFT JOIN copy_tasks t ON t.event_id = e.id
+                WHERE e.owner_id = $1
                 GROUP BY e.id
                 ORDER BY e.observed_at DESC
-                LIMIT $1
+                LIMIT $2
                 """,
+                owner_id,
                 limit,
             )
         return [dict(r) for r in rows]

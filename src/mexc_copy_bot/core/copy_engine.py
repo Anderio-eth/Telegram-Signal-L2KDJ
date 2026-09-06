@@ -109,7 +109,7 @@ class CopyEngine:
             LOGGER.info("task already exists for event=%s follower=%s, skipping", event_id, follower.id)
             return FollowerResult(follower, True, event.action, vol, None)
 
-        credentials = await self._store.get_credentials(follower.id)
+        credentials = await self._store.get_credentials(follower.id, follower.owner_id)
         if not credentials:
             await self._store.finish_task(task_id, status="FAILED", attempts=0, error="credentials missing")
             return FollowerResult(follower, False, event.action, vol, "credentials missing")

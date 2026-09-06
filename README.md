@@ -571,12 +571,27 @@ Safety properties, each deliberate:
   Closing everything is a separate, explicitly confirmed Emergency Stop.
 - **Secrets** — API keys are AES-256-GCM encrypted at rest, the key lives only in the environment,
   and the bot deletes the Telegram message containing a key right after reading it.
+- **Separate per person** — every whitelisted Telegram user has their own master, their own
+  followers and their own START/STOP. Nobody sees or can touch anybody else's accounts, and an
+  Emergency Stop only ever closes the caller's own positions.
 
 ## Environment
 
 ```
 COPY_BOT_TOKEN              Telegram token (a different bot from the signal one)
-COPY_BOT_ALLOWED_USER_ID    only this Telegram user may control it
+COPY_BOT_ALLOWED_USER_ID    comma-separated Telegram user ids; each gets their own accounts
 COPY_BOT_DATABASE_URL       Postgres; tables are prefixed copy_ and can share a database
 COPY_BOT_ENCRYPTION_KEY     32-byte hex; losing it makes stored keys unrecoverable
+```
+
+## Several users
+
+The bot is multi-tenant. Each id in `COPY_BOT_ALLOWED_USER_ID` runs an independent copier:
+their own master account, up to nine of their own followers, their own run state, history and
+reports. The isolation is in the queries — every account lookup is filtered by owner in SQL, so
+there is no view, button or callback that can reach across, and one person's Emergency Stop
+cannot close another's positions.
+
+```bash
+python scripts/check_isolation.py   # asserts the isolation properties against the real database
 ```

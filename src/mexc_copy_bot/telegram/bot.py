@@ -6,7 +6,13 @@ reasoned about without reading UI code.
 
 Access is a hard whitelist of Telegram user ids (COPY_BOT_ALLOWED_USER_ID, comma-separated).
 Anyone not on it gets a refusal — this bot can move real money on ten accounts, so an unknown chat
-must never reach a keyboard. Everyone on the list has full control, including Emergency Stop.
+must never reach a keyboard.
+
+Everyone on the whitelist gets their OWN world: their own master, their own followers, their own
+START/STOP and their own Emergency Stop. There is no shared view and no admin — the two brothers
+running this see only what they added themselves. Every handler derives `owner_id` from
+`update.effective_user.id` and passes it down; nothing here can address an account by id alone,
+because the store requires the owner too.
 """
 
 from __future__ import annotations
@@ -29,7 +35,7 @@ from telegram.ext import (
 from ..config import Settings
 from ..core.copy_engine import FollowerResult
 from ..core.events import MasterEvent
-from ..core.service import CopyService
+from ..core.registry import ServiceRegistry
 from ..db.store import FOLLOWER, MASTER, Store
 from ..mexc.rest import MexcError, MexcRestClient, get_contract_specs, get_ticker_price
 from . import messages
@@ -69,15 +75,17 @@ def _accounts_keyboard(has_master: bool, can_add_follower: bool) -> InlineKeyboa
 
 
 class CopyBot:
-    def __init__(self, settings: Settings, store: Store, service: CopyService) -> None:
+    def __init__(self, settings: Settings, store: Store, registry: ServiceRegistry) -> None:
         self._settings = settings
         self._store = store
-        self._service = service
+        self._registry = registry
         self._app: Application | None = None
-        self._chat_id: int | None = None
+        # Where to send each owner's unsolicited messages (trade reports, drift warnings). One
+        # chat per owner, learned from their last interaction — reports must never land in the
+        # other brother's chat.
+        self._chat_ids: dict[int, int] = {}
 
-        service.on_report = self._report_event
-        service.on_notice = self._send_notice
+        registry.configure_callbacks(on_report=self._report_for, on_notice=self._notice_for)
 
     # ── plumbing ────────────────────────────────────────────────────────────────────────────
     def build(self) -> Application:
@@ -103,64 +111,71 @@ class CopyBot:
         user = update.effective_user
         return bool(user and user.id in self._settings.allowed_user_ids)
 
-    async def _guard(self, update: Update) -> bool:
+    async def _guard(self, update: Update) -> int | None:
+        """Returns the owner id to act as, or None when the user is refused."""
         if self._authorized(update):
+            owner_id = update.effective_user.id
             if update.effective_chat:
-                self._chat_id = update.effective_chat.id
-            return True
+                self._chat_ids[owner_id] = update.effective_chat.id
+            return owner_id
         LOGGER.warning("refused telegram user %s", update.effective_user.id if update.effective_user else "?")
         if update.callback_query:
             await update.callback_query.answer("Not authorized", show_alert=True)
         elif update.message:
             await update.message.reply_text("Not authorized.")
-        return False
+        return None
 
     # ── screens ─────────────────────────────────────────────────────────────────────────────
-    async def _menu_text(self) -> str:
-        master = await self._store.get_master()
-        followers = await self._store.list_accounts(FOLLOWER)
+    async def _menu_text(self, owner_id: int) -> str:
+        service = await self._registry.get(owner_id)
+        master = await self._store.get_master(owner_id)
+        followers = await self._store.list_accounts(owner_id, FOLLOWER)
         return messages.main_menu(
-            running=self._service.running,
+            running=service.running,
             master=master,
             follower_count=len(followers),
             max_followers=self._settings.max_followers,
-            master_connected=self._service.master_connected,
+            master_connected=service.master_connected,
         )
 
-    async def _show_menu(self, update: Update) -> None:
-        text = await self._menu_text()
-        keyboard = _menu_keyboard(self._service.running)
+    async def _show_menu(self, update: Update, owner_id: int) -> None:
+        service = await self._registry.get(owner_id)
+        text = await self._menu_text(owner_id)
+        keyboard = _menu_keyboard(service.running)
         if update.callback_query:
             await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         elif update.message:
             await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
 
     async def _cmd_start(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+        owner_id = await self._guard(update)
+        if owner_id is None:
             return
-        await self._show_menu(update)
+        await self._show_menu(update, owner_id)
 
     async def _on_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._guard(update):
+        owner_id = await self._guard(update)
+        if owner_id is None:
             return
         query = update.callback_query
         await query.answer()
         action = query.data or ""
+        service = await self._registry.get(owner_id)
 
         if action == "menu":
-            await self._show_menu(update)
+            await self._show_menu(update, owner_id)
         elif action == "start":
-            await query.edit_message_text(await self._service.start())
-            await self._show_menu_message()
+            await query.edit_message_text(await service.start())
+            await self._show_menu_message(owner_id)
         elif action == "stop":
-            await query.edit_message_text(await self._service.stop())
-            await self._show_menu_message()
+            await query.edit_message_text(await service.stop())
+            await self._show_menu_message(owner_id)
         elif action == "accounts":
-            await self._show_accounts(update)
+            await self._show_accounts(update, owner_id)
         elif action == "positions":
-            await self._show_positions(update)
+            await self._show_positions(update, owner_id)
         elif action == "history":
-            events = await self._store.recent_events(10)
+            events = await self._store.recent_events(owner_id, 10)
             await query.edit_message_text(
                 messages.history(events),
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="menu")]]),
@@ -168,7 +183,7 @@ class CopyBot:
             )
         elif action == "emergency":
             await query.edit_message_text(
-                "⚠️ <b>EMERGENCY STOP</b>\n\nThis stops copying AND closes every position on all "
+                "⚠️ <b>EMERGENCY STOP</b>\n\nThis stops copying AND closes every position on <b>your</b> "
                 "follower accounts. It cannot be undone.",
                 reply_markup=InlineKeyboardMarkup(
                     [
@@ -180,8 +195,8 @@ class CopyBot:
             )
         elif action == "emergency_confirm":
             await query.edit_message_text("Closing all follower positions…")
-            await self._service.stop()
-            outcomes = await self._service.emergency_close_all()
+            await service.stop()
+            outcomes = await service.emergency_close_all()
             lines = ["🛑 <b>EMERGENCY STOP COMPLETE</b>", ""]
             lines += [
                 f"{'✅' if result == 'closed' else '❌'} {account.label} — {result}" for account, result in outcomes
@@ -192,24 +207,37 @@ class CopyBot:
                 parse_mode=ParseMode.HTML,
             )
         elif action == "remove_menu":
-            await self._show_remove_menu(update)
+            await self._show_remove_menu(update, owner_id)
         elif action.startswith("remove:"):
             account_id = int(action.split(":", 1)[1])
-            await self._store.remove_account(account_id)
-            await self._show_accounts(update)
+            # Scoped delete: a callback id from someone else's keyboard simply matches no row.
+            await self._store.remove_account(account_id, owner_id)
+            await self._show_accounts(update, owner_id)
 
-    async def _show_menu_message(self) -> None:
-        if self._app and self._chat_id:
-            await self._app.bot.send_message(
-                self._chat_id,
-                await self._menu_text(),
-                reply_markup=_menu_keyboard(self._service.running),
-                parse_mode=ParseMode.HTML,
-            )
+    def _chat_for(self, owner_id: int) -> int:
+        """Where to message this owner.
 
-    async def _show_accounts(self, update: Update) -> None:
-        master = await self._store.get_master()
-        followers = await self._store.list_accounts(FOLLOWER)
+        Falls back to the owner id itself because a private chat with a bot has chat.id ==
+        user.id. Without the fallback, everything resumed on boot (spec §31) would trade with
+        no report reaching anyone until that person happened to press a button.
+        """
+        return self._chat_ids.get(owner_id, owner_id)
+
+    async def _show_menu_message(self, owner_id: int) -> None:
+        chat_id = self._chat_for(owner_id)
+        if not (self._app and chat_id):
+            return
+        service = await self._registry.get(owner_id)
+        await self._app.bot.send_message(
+            chat_id,
+            await self._menu_text(owner_id),
+            reply_markup=_menu_keyboard(service.running),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _show_accounts(self, update: Update, owner_id: int) -> None:
+        master = await self._store.get_master(owner_id)
+        followers = await self._store.list_accounts(owner_id, FOLLOWER)
         await update.callback_query.edit_message_text(
             messages.accounts_list(master, followers),
             reply_markup=_accounts_keyboard(
@@ -219,8 +247,8 @@ class CopyBot:
             parse_mode=ParseMode.HTML,
         )
 
-    async def _show_remove_menu(self, update: Update) -> None:
-        accounts = await self._store.list_accounts()
+    async def _show_remove_menu(self, update: Update, owner_id: int) -> None:
+        accounts = await self._store.list_accounts(owner_id)
         if not accounts:
             await update.callback_query.edit_message_text(
                 "No accounts.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="accounts")]])
@@ -235,11 +263,11 @@ class CopyBot:
             "Select an account to remove:", reply_markup=InlineKeyboardMarkup(rows)
         )
 
-    async def _show_positions(self, update: Update) -> None:
+    async def _show_positions(self, update: Update, owner_id: int) -> None:
         lines = ["📊 <b>POSITIONS</b>", ""]
         async with aiohttp.ClientSession() as session:
-            for account in await self._store.list_accounts():
-                credentials = await self._store.get_credentials(account.id)
+            for account in await self._store.list_accounts(owner_id):
+                credentials = await self._store.get_credentials(account.id, owner_id)
                 if not credentials:
                     continue
                 client = MexcRestClient(*credentials, session=session)
@@ -267,7 +295,7 @@ class CopyBot:
 
     # ── adding accounts ─────────────────────────────────────────────────────────────────────
     async def _begin_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        if not await self._guard(update):
+        if await self._guard(update) is None:
             return ConversationHandler.END
         kind = MASTER if update.callback_query.data == "add_master" else FOLLOWER
         context.user_data["kind"] = kind
@@ -278,7 +306,7 @@ class CopyBot:
         return ASK_KEY
 
     async def _got_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        if not await self._guard(update):
+        if await self._guard(update) is None:
             return ConversationHandler.END
         context.user_data["api_key"] = update.message.text.strip()
         # Delete the message so the key does not sit in chat history.
@@ -292,7 +320,8 @@ class CopyBot:
         return ASK_SECRET
 
     async def _got_secret(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        if not await self._guard(update):
+        owner_id = await self._guard(update)
+        if owner_id is None:
             return ConversationHandler.END
         secret = update.message.text.strip()
         api_key = context.user_data.get("api_key", "")
@@ -316,7 +345,7 @@ class CopyBot:
                 context.user_data.clear()
                 return ConversationHandler.END
 
-        master = await self._store.get_master()
+        master = await self._store.get_master(owner_id)
         warning = ""
         if kind == FOLLOWER and master and master.position_mode and mode != master.position_mode:
             # Hedge vs one-way changes what a side means; copying across a mismatch mirrors the
@@ -326,12 +355,18 @@ class CopyBot:
                 f"{'hedge' if master.position_mode == 1 else 'one-way'}. Make them match before trading."
             )
 
-        label = f"Master" if kind == MASTER else f"Follower #{len(await self._store.list_accounts(FOLLOWER)) + 1}"
+        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        label = "Master" if kind == MASTER else f"Follower #{len(followers) + 1}"
         try:
             await self._store.add_account(
-                label=label, kind=kind, api_key=api_key, api_secret=secret, position_mode=mode
+                owner_id=owner_id,
+                label=label,
+                kind=kind,
+                api_key=api_key,
+                api_secret=secret,
+                position_mode=mode,
             )
-        except Exception as err:  # noqa: BLE001 — most likely the single-master constraint
+        except Exception as err:  # noqa: BLE001 — most likely the one-master-per-owner constraint
             await status.edit_text(f"❌ Could not save: {err}")
             context.user_data.clear()
             return ConversationHandler.END
@@ -345,7 +380,7 @@ class CopyBot:
             parse_mode=ParseMode.HTML,
         )
         context.user_data.clear()
-        await self._show_menu_message()
+        await self._show_menu_message(owner_id)
         return ConversationHandler.END
 
     async def _cancel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -354,8 +389,25 @@ class CopyBot:
         return ConversationHandler.END
 
     # ── outbound ────────────────────────────────────────────────────────────────────────────
-    async def _report_event(self, event: MasterEvent, results: list[FollowerResult]) -> None:
-        if not (self._app and self._chat_id):
+    # The registry asks for a callback per owner, so a service physically cannot report into a
+    # chat that is not its owner's.
+    def _report_for(self, owner_id: int):
+        async def report(event: MasterEvent, results: list[FollowerResult]) -> None:
+            await self._report_event(owner_id, event, results)
+
+        return report
+
+    def _notice_for(self, owner_id: int):
+        async def notice(text: str) -> None:
+            chat_id = self._chat_for(owner_id)
+            if self._app and chat_id:
+                await self._app.bot.send_message(chat_id, text)
+
+        return notice
+
+    async def _report_event(self, owner_id: int, event: MasterEvent, results: list[FollowerResult]) -> None:
+        chat_id = self._chat_for(owner_id)
+        if not (self._app and chat_id):
             return
         notional = None
         try:
@@ -369,9 +421,5 @@ class CopyBot:
             LOGGER.debug("could not compute notional for %s", event.symbol)
 
         await self._app.bot.send_message(
-            self._chat_id, messages.event_report(event, results, notional), parse_mode=ParseMode.HTML
+            chat_id, messages.event_report(event, results, notional), parse_mode=ParseMode.HTML
         )
-
-    async def _send_notice(self, text: str) -> None:
-        if self._app and self._chat_id:
-            await self._app.bot.send_message(self._chat_id, text)
