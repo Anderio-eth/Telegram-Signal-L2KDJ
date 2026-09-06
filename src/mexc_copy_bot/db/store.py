@@ -153,6 +153,23 @@ class Store:
             return None
         return self._cipher.decrypt(row["api_key_enc"]), self._cipher.decrypt(row["api_secret_enc"])
 
+    async def get_credentials_for(self, owner_id: int) -> dict[int, tuple[str, str]]:
+        """Every one of this owner's accounts, decrypted, in a single round trip.
+
+        The menu needs all ten at once to show balances. Asking per account turned one screen into
+        ten queries against a remote database, which cost more than the exchange calls they were
+        feeding.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, api_key_enc, api_secret_enc FROM copy_accounts WHERE owner_id = $1",
+                owner_id,
+            )
+        return {
+            r["id"]: (self._cipher.decrypt(r["api_key_enc"]), self._cipher.decrypt(r["api_secret_enc"]))
+            for r in rows
+        }
+
     async def remove_account(self, account_id: int, owner_id: int) -> bool:
         async with self._pool.acquire() as conn:
             result = await conn.execute(

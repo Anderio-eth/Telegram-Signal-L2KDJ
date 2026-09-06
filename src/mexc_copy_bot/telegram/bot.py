@@ -17,6 +17,7 @@ because the store requires the owner too.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import aiohttp
@@ -36,7 +37,7 @@ from ..config import Settings
 from ..core.copy_engine import FollowerResult
 from ..core.events import MasterEvent
 from ..core.registry import ServiceRegistry
-from ..db.store import FOLLOWER, MASTER, Store
+from ..db.store import FOLLOWER, MASTER, Account, Store
 from ..mexc.rest import MexcError, MexcRestClient, get_contract_specs, get_ticker_price
 from . import messages
 
@@ -142,33 +143,49 @@ class CopyBot:
         master = await self._store.get_master(owner_id)
         followers = await self._store.list_accounts(owner_id, FOLLOWER)
 
-        # The master's balance is read live rather than cached: a stale number on the screen you
-        # check before pressing START is worse than none. A failure here degrades the line to an
-        # error rather than the whole menu — you still need the buttons when MEXC is down.
-        balance: tuple[float, float] | None = None
-        error: str | None = None
-        if master:
-            credentials = await self._store.get_credentials(master.id, owner_id)
-            if credentials:
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        balance = await MexcRestClient(*credentials, session=session).get_usdt_balance()
-                except MexcError as err:
-                    error = err.message
-                except Exception:  # noqa: BLE001 — a network blip must not hide the menu
-                    error = "balance unavailable"
-            else:
-                error = "credentials could not be read"
-
+        accounts = ([master] if master else []) + followers
         return messages.main_menu(
             running=service.running,
             master=master,
             followers=followers,
             max_followers=self._settings.max_followers,
             master_connected=service.master_connected,
-            master_balance=balance,
-            master_error=error,
+            balances=await self._balances(owner_id, accounts),
         )
+
+    async def _balances(self, owner_id: int, accounts: list[Account]) -> dict[int, messages.Balance]:
+        """Live USDT balance for each account, fetched concurrently.
+
+        Live rather than cached: a stale number on the screen you check before pressing START is
+        worse than none. Concurrently because with a master and nine followers, doing this in
+        sequence would put ten round trips between a button press and the menu appearing — as one
+        batch it costs about the same as the slowest single call.
+
+        Failures are per account: one revoked key shows on its own line, and the rest of the menu
+        still renders. You still need the buttons when MEXC is down.
+        """
+        if not accounts:
+            return {}
+
+        credentials_by_id = await self._store.get_credentials_for(owner_id)
+
+        async with aiohttp.ClientSession() as session:
+            async def fetch(account: Account) -> messages.Balance:
+                credentials = credentials_by_id.get(account.id)
+                if not credentials:
+                    return messages.Balance(error="credentials could not be read")
+                try:
+                    equity, available = await MexcRestClient(*credentials, session=session).get_usdt_balance()
+                    return messages.Balance(equity=equity, available=available)
+                except MexcError as err:
+                    return messages.Balance(error=err.message or "unavailable")
+                except Exception:  # noqa: BLE001 — a network blip must not hide the menu
+                    LOGGER.debug("balance lookup failed for account %s", account.id)
+                    return messages.Balance(error="balance unavailable")
+
+            results = await asyncio.gather(*(fetch(a) for a in accounts))
+
+        return dict(zip((a.id for a in accounts), results))
 
     async def _show_menu(self, update: Update, owner_id: int) -> None:
         service = await self._registry.get(owner_id)

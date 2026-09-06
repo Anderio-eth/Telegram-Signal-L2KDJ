@@ -8,6 +8,8 @@ position rather than a rounded dollar approximation.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from ..core.copy_engine import FollowerResult
 from ..core.events import Action, MasterEvent
 from ..db.store import Account
@@ -39,6 +41,26 @@ def money(value: float) -> str:
     return f"${value:.4f}"
 
 
+@dataclass(frozen=True)
+class Balance:
+    """What one account is worth right now, or why we could not find out.
+
+    An error is carried alongside rather than raised: one follower with a revoked key must not
+    blank out everybody else's numbers on a screen you read before pressing START.
+    """
+
+    equity: float | None = None
+    available: float | None = None
+    error: str | None = None
+
+    def line(self) -> str:
+        if self.error:
+            return f"❌ {self.error}"
+        if self.equity is None:
+            return "…"
+        return f"{money(self.equity)} (available {money(self.available or 0.0)})"
+
+
 def mode_name(mode: int | None) -> str:
     if mode == 1:
         return "hedge"
@@ -54,15 +76,17 @@ def main_menu(
     followers: list[Account],
     max_followers: int,
     master_connected: bool,
-    master_balance: tuple[float, float] | None = None,
-    master_error: str | None = None,
+    balances: dict[int, Balance] | None = None,
 ) -> str:
     """The main screen.
 
-    Carries the master's details inline — balance, mode, key hint — rather than leaving them in
-    the one-off "account added" message that scrolls away: this is the screen you look at before
-    pressing START, and it should answer "is the right account connected and funded" on its own.
+    Carries every account's details inline — balance, mode, key hint — rather than leaving them
+    in the one-off "account added" message that scrolls away: this is the screen you look at
+    before pressing START, and it should answer "is everything connected and funded" on its own.
+    A follower that is out of money fails at the first mirrored trade, and that is worth seeing
+    beforehand rather than in an error report afterwards.
     """
+    balances = balances or {}
     if not master:
         status = "⚪️ NO MASTER"
     elif running and master_connected:
@@ -78,18 +102,23 @@ def main_menu(
         lines.append("👤 <b>Master:</b> not set")
     else:
         lines.append(f"👤 <b>Master</b> — …{master.api_key_hint}")
-        if master_balance:
-            equity, available = master_balance
-            lines.append(f"     Balance: {money(equity)} (available {money(available)})")
-        elif master_error:
-            lines.append(f"     ❌ {master_error}")
+        lines.append(f"     {balances.get(master.id, Balance()).line()}")
         lines.append(f"     Mode: {mode_name(master.position_mode)}")
 
     lines.append("")
     lines.append(f"👥 <b>Followers:</b> {len(followers)}/{max_followers}")
     for follower in followers:
-        mark = "" if follower.active else " (paused)"
+        mark = "" if follower.active else "  (paused)"
         lines.append(f"     • {follower.label} — …{follower.api_key_hint}{mark}")
+        lines.append(f"          {balances.get(follower.id, Balance()).line()}")
+
+    # Only with several followers: repeating one follower's own balance as a "total" underneath
+    # it is noise, and a total that quietly omits the accounts that failed to report would be
+    # worse than none.
+    known = [balances[f.id].equity for f in followers if balances.get(f.id) and balances[f.id].equity is not None]
+    if len(known) > 1:
+        suffix = "" if len(known) == len(followers) else f" (of {len(known)}/{len(followers)} reporting)"
+        lines.append(f"     <b>Total:</b> {money(sum(known))}{suffix}")
 
     return "\n".join(lines)
 
