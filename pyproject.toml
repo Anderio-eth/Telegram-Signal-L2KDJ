@@ -9,9 +9,14 @@ dependencies = [
   "matplotlib>=3.8,<4.0",
   "python-dotenv>=1.0,<2.0",
   "python-telegram-bot>=21.0,<23.0",
+  # mexc_copy_bot only — asyncpg over an ORM to keep resident memory down on a 512MB worker
+  # shared with the signal bot.
+  "asyncpg>=0.29,<0.31",
+  "cryptography>=42.0",
 ]
 
 [project.scripts]
+mexc-copy-bot = "mexc_copy_bot.__main__:main"
 telegram-signal-k2 = "telegram_signal_k2.__main__:main"
 telegram-signal-k2-healthcheck = "telegram_signal_k2.healthcheck:main"
 

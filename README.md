@@ -499,3 +499,84 @@ python -m telegram_signal_k2.healthcheck --json
 ```bash
 telegram-signal-k2-healthcheck --json
 ```
+
+---
+
+# MEXC Copy Trading Bot
+
+Second bot in this repository (`src/mexc_copy_bot/`). Mirrors the trades of one MEXC futures
+account onto up to nine others, controlled from Telegram.
+
+It runs as a **separate process** in the same Render worker as the signal bot — see
+`scripts/run_both.sh`. Python is single-threaded per process, so sharing one would let a
+matplotlib render block an order; as two processes the OS interleaves them and a crash in one
+cannot take down the other.
+
+## Two findings that shaped the implementation
+
+Both were established against a live account, and both contradict the obvious reading of MEXC's
+documentation.
+
+**Orders go to `api.mexc.com`, not `contract.mexc.com`.** The futures docs point at
+`contract.mexc.com`; that host serves reads fine but returns `403 Access Denied` for order
+placement, blocked at the CDN before reaching the API. `api.mexc.com` accepts the identical signed
+request. See the note on `BASE_URL` in `mexc/rest.py`.
+
+**Positions are closed with `close_all`, never with an opposite-side order.** In hedge mode,
+sending `side=3` ("close long") against an open long did not close it — MEXC opened a fresh short
+alongside, at the account's default leverage:
+
+```
+before:  ADA LONG  vol=1 lev=20
+after:   ADA LONG  vol=1 lev=20  +  ADA SHORT vol=1 lev=5
+```
+
+For a copy bot that is the worst possible failure: a "close" instruction would leave every
+follower doubly exposed in both directions.
+
+## Setup
+
+```bash
+cp .env.example .env      # fill in COPY_BOT_* values
+python -c "import secrets; print(secrets.token_hex(32))"   # COPY_BOT_ENCRYPTION_KEY
+python -m mexc_copy_bot
+```
+
+Before adding an account, its key can be checked independently:
+
+```bash
+python scripts/check_mexc_access.py          # read-only
+python scripts/check_mexc_access.py --live   # places and closes one minimum-size order
+```
+
+## How copying works
+
+MEXC's private websocket (`push.personal.position`) reports position **state**, not just orders.
+That matters: a master position built from three separate fills produces three pushes, and copying
+each as an "open" would give followers triple exposure. Every push is diffed against the last known
+size for that `(symbol, side)`, and only the difference is mirrored — covered by
+`tests/test_copy_events.py`.
+
+Safety properties, each deliberate:
+
+- **Idempotency** — every observed change gets a `dedupe_key` (MEXC's position `version` where
+  available). A frame replayed after a reconnect is rejected by a unique index, not by chance.
+- **Independent accounts** — followers execute concurrently; one failing on insufficient balance
+  neither blocks nor rolls back the others.
+- **Retries only where they help** — network errors and timeouts retry with backoff; insufficient
+  balance or an invalid key fail immediately instead of hammering the API.
+- **Resync after reconnect** — the master's real positions become the new baseline, so a gap in
+  the stream is never mistaken for a change to copy.
+- **STOP ≠ close** — stopping halts copying of new actions and leaves open positions alone.
+  Closing everything is a separate, explicitly confirmed Emergency Stop.
+- **Secrets** — API keys are AES-256-GCM encrypted at rest, the key lives only in the environment,
+  and the bot deletes the Telegram message containing a key right after reading it.
+
+## Environment
+
+```
+COPY_BOT_TOKEN              Telegram token (a different bot from the signal one)
+COPY_BOT_ALLOWED_USER_ID    only this Telegram user may control it
+COPY_BOT_DATABASE_URL       Postgres; tables are prefixed copy_ and can share a database
+COPY_BOT_ENCRYPTION_KEY     32-byte hex; losing it makes stored keys unrecoverable
+```

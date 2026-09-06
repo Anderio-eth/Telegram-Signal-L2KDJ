@@ -3,7 +3,8 @@ services:
     name: telegram-signal-k2
     runtime: python
     buildCommand: pip install -e .
-    startCommand: python -m telegram_signal_k2
+    # Both bots in one worker, as two separate processes (see scripts/run_both.sh for why).
+    startCommand: bash scripts/run_both.sh
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -19,3 +20,12 @@ services:
         value: data/state.json
       - key: CHARTS_ENABLED
         value: "true"
+      # ── MEXC copy bot (second process in this worker) ───────────────────────────────────
+      - key: COPY_BOT_TOKEN
+        sync: false
+      - key: COPY_BOT_ALLOWED_USER_ID
+        sync: false
+      - key: COPY_BOT_DATABASE_URL
+        sync: false
+      - key: COPY_BOT_ENCRYPTION_KEY
+        sync: false
