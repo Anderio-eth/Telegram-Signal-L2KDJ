@@ -31,6 +31,12 @@ from .events import Action, MasterEvent, MasterPositionTracker, PositionSnapshot
 
 LOGGER = logging.getLogger(__name__)
 
+# How long START waits for the master socket before answering. The login takes about a second;
+# waiting for it means the menu drawn immediately afterwards shows the true state, instead of a
+# "reconnecting" that was only ever a race and then sits there, because a Telegram message
+# never redraws itself.
+CONNECT_TIMEOUT_SECONDS = 12.0
+
 ReportCallback = Callable[[MasterEvent, list[FollowerResult]], Awaitable[None]]
 NoticeCallback = Callable[[str], Awaitable[None]]
 
@@ -110,7 +116,13 @@ class CopyService:
         self._ws.start()
         self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
         await self._store.set_running(self._owner_id, True)
-        return "Copy trading started."
+
+        if await self._ws.wait_connected(CONNECT_TIMEOUT_SECONDS):
+            return "✅ Copy trading started — master connected."
+        # Not an error: the socket keeps retrying on its own. But reporting a flat "started" while
+        # nothing is listening to the master is the kind of half-truth that gets noticed only
+        # after a missed trade.
+        return "⚠️ Copy trading started, but the master is not connected yet — still retrying."
 
     async def stop(self) -> str:
         """Stop copying NEW actions. Existing follower positions are left untouched (spec §7)."""

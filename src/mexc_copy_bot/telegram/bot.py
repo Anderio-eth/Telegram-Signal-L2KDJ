@@ -64,7 +64,8 @@ def _menu_keyboard(running: bool) -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("📊 Positions", callback_data="positions"),
              InlineKeyboardButton("👥 Accounts", callback_data="accounts")],
-            [InlineKeyboardButton("📜 History", callback_data="history")],
+            [InlineKeyboardButton("📜 History", callback_data="history"),
+             InlineKeyboardButton("🔄 Refresh", callback_data="menu")],
             [control],
             [InlineKeyboardButton("🛑 EMERGENCY STOP", callback_data="emergency")],
         ]

@@ -63,10 +63,23 @@ class MasterWebSocket:
         self._task: asyncio.Task[None] | None = None
         self._running = False
         self._connected = False
+        # Lets a caller wait for the socket to be genuinely up. Without it, start() returns
+        # while the login is still in flight, and anything rendered straight afterwards
+        # reports the master as disconnected — true for about a second, then stuck on screen
+        # because a Telegram message does not redraw itself.
+        self._connected_event = asyncio.Event()
 
     @property
     def connected(self) -> bool:
         return self._connected
+
+    async def wait_connected(self, timeout: float) -> bool:
+        """Block until the socket is logged in. False if it did not make it in time."""
+        try:
+            await asyncio.wait_for(self._connected_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     def start(self) -> None:
         if self._task and not self._task.done():
@@ -82,6 +95,7 @@ class MasterWebSocket:
                 await self._task
             self._task = None
         self._connected = False
+        self._connected_event.clear()
 
     async def _status(self, message: str) -> None:
         LOGGER.info("master ws: %s", message)
@@ -99,6 +113,7 @@ class MasterWebSocket:
                 raise
             except Exception as err:  # noqa: BLE001 — any failure must lead to a reconnect, not a crash
                 self._connected = False
+                self._connected_event.clear()
                 LOGGER.warning("master ws dropped: %s (retry in %.0fs)", err, backoff)
                 await self._status(f"disconnected: {err}")
                 await asyncio.sleep(backoff)
@@ -127,6 +142,7 @@ class MasterWebSocket:
                         raise RuntimeError(f"login rejected: {payload.get('data')}")
 
                 self._connected = True
+                self._connected_event.set()
                 await self._status("connected")
 
                 # A reconnect may have missed changes; re-read reality before trusting deltas.
@@ -141,6 +157,7 @@ class MasterWebSocket:
                     with contextlib.suppress(asyncio.CancelledError):
                         await ping
                     self._connected = False
+                    self._connected_event.clear()
 
     async def _ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         while not ws.closed:
