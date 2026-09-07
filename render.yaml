@@ -13,7 +13,10 @@ services:
       - key: SYMBOLS
         value: BTCUSDT,ETHUSDT,SOLUSDT,HYPEUSDT
       - key: TIMEFRAMES
-        value: 1m,3m,5m,15m,30m,1h,2h,3h,4h
+        # No 3h: Binance rejects it with "Invalid interval" (verified against the live API — 1h,
+        # 2h and 4h all return 200, 3h returns 400). Leaving it in made every scan cycle log a
+        # traceback per symbol for a timeframe that could never be fetched.
+        value: 1m,3m,5m,15m,30m,1h,2h,4h
       - key: POLL_SECONDS
         value: "5"
       - key: STATE_FILE
