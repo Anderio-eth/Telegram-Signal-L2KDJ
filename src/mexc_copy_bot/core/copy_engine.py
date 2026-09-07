@@ -91,15 +91,17 @@ class CopyEngine:
         followers: list[Account],
         *,
         reverse: bool = False,
+        stops: tuple[float | None, float | None] = (None, None),
     ) -> list[FollowerResult]:
         """Apply one master event to every follower, concurrently.
 
         `reverse` flips the side each follower takes, turning the mirror into a hedge.
+        `stops` are the master's (stop loss, take profit) to put on the opening order.
         """
         if not followers:
             return []
         results = await asyncio.gather(
-            *(self._run_follower(event, event_id, follower, reverse) for follower in followers),
+            *(self._run_follower(event, event_id, follower, reverse, stops) for follower in followers),
             return_exceptions=True,
         )
 
@@ -115,7 +117,12 @@ class CopyEngine:
         return out
 
     async def _run_follower(
-        self, event: MasterEvent, event_id: int, follower: Account, reverse: bool = False
+        self,
+        event: MasterEvent,
+        event_id: int,
+        follower: Account,
+        reverse: bool = False,
+        stops: tuple[float | None, float | None] = (None, None),
     ) -> FollowerResult:
         vol = event.delta_vol * follower.size_multiplier
         side = OPPOSITE_SIDE[event.position_type] if reverse else event.position_type
@@ -151,7 +158,7 @@ class CopyEngine:
         for attempt in range(self._retry_attempts):
             attempts = attempt + 1
             try:
-                realized = await self._apply(client, event, follower, vol, external_oid, side)
+                realized = await self._apply(client, event, follower, vol, external_oid, side, stops)
                 await self._store.finish_task(
                     task_id, status="SUCCESS", attempts=attempts, error=None, realized_pnl=realized
                 )
@@ -181,6 +188,7 @@ class CopyEngine:
         vol: float,
         external_oid: str,
         side: int,
+        stops: tuple[float | None, float | None] = (None, None),
     ) -> float | None:
         """Returns realised PnL when this was a close and the exchange reported it."""
         if event.action is Action.CLOSE:
@@ -226,6 +234,7 @@ class CopyEngine:
             except MexcError as err:
                 LOGGER.info("follower %s leverage set failed (continuing): %s", follower.id, err.message)
 
+        stop_loss, take_profit = stops
         await client.submit_order(
             symbol=event.symbol,
             side=order_side,
@@ -233,6 +242,8 @@ class CopyEngine:
             leverage=event.leverage or None,
             open_type=event.open_type,
             external_oid=external_oid,
+            stop_loss_price=stop_loss,
+            take_profit_price=take_profit,
         )
 
     async def _realized_pnl(

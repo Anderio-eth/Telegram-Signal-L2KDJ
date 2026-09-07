@@ -35,6 +35,14 @@ WS_URL = "wss://contract.mexc.com/edge"
 PING_SECONDS = 15.0
 LOGIN_TIMEOUT = 10.0
 
+# MEXC's own docs disagree with what the socket actually sends: the position channel is
+# `push.personal.position`, while the docs name the stop channel `push.stop.order`. Both spellings
+# are accepted rather than betting on either — the same class of documentation error already cost
+# us once, when the documented order host returned 403 and a different one worked.
+STOP_CHANNELS = frozenset(
+    {"push.personal.stop.order", "push.stop.order", "push.personal.plan.order", "push.plan.order"}
+)
+
 
 class MasterWebSocket:
     """Streams the master account's position changes.
@@ -50,6 +58,7 @@ class MasterWebSocket:
         secret: str,
         *,
         on_position: Callable[[dict[str, Any]], Awaitable[None]],
+        on_stop_order: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
         on_resync: Callable[[], Awaitable[None]] | None = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
         reconnect_max_seconds: float = 30.0,
@@ -57,6 +66,7 @@ class MasterWebSocket:
         self._api_key = api_key
         self._secret = secret
         self._on_position = on_position
+        self._on_stop_order = on_stop_order
         self._on_resync = on_resync
         self._on_status = on_status
         self._reconnect_max = reconnect_max_seconds
@@ -68,6 +78,8 @@ class MasterWebSocket:
         # reports the master as disconnected — true for about a second, then stuck on screen
         # because a Telegram message does not redraw itself.
         self._connected_event = asyncio.Event()
+        # Channels seen but not handled, so each is reported once instead of every frame.
+        self._seen_channels: set[str] = set()
 
     @property
     def connected(self) -> bool:
@@ -174,6 +186,11 @@ class MasterWebSocket:
 
             payload = json.loads(msg.data)
             channel = payload.get("channel")
+            if channel in STOP_CHANNELS:
+                if self._on_stop_order:
+                    await self._on_stop_order(channel, payload.get("data") or {})
+                continue
+
             if channel == "push.personal.position":
                 data = payload.get("data") or {}
                 # One slow handler must not stall the socket into a server-side timeout, but the
@@ -182,4 +199,9 @@ class MasterWebSocket:
                 await self._on_position(data)
             elif channel == "rs.error":
                 LOGGER.warning("master ws error frame: %s", payload.get("data"))
+            elif channel and channel not in self._seen_channels:
+                # Logged once per channel: this is how we find out what MEXC really sends, rather
+                # than trusting docs that have already been wrong about this API.
+                self._seen_channels.add(channel)
+                LOGGER.info("master ws: first frame on unhandled channel %r: %s", channel, payload)
         raise RuntimeError("socket closed by server")

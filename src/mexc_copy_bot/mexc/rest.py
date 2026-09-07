@@ -54,6 +54,18 @@ class MexcError(RuntimeError):
         self.endpoint = endpoint
 
 
+def _opt_float(value: Any) -> float | None:
+    """MEXC sends an unset price as null, 0 or "0" depending on the endpoint. All three mean
+    "no stop", and none of them may become a real price of zero."""
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out or None
+
+
 @dataclass(frozen=True)
 class Position:
     position_id: int
@@ -84,6 +96,26 @@ class ClosedPosition:
     realised: float
     close_vol: float
     update_time: int
+
+
+@dataclass(frozen=True)
+class PositionStops:
+    """A position's stop-loss / take-profit, as MEXC holds it.
+
+    MEXC attaches these to the ORDER that opened the position, not to the position itself, which
+    is why `order_id` is what has to be carried around to change them later.
+    """
+
+    order_id: int
+    position_id: int
+    symbol: str
+    position_type: int
+    stop_loss_price: float | None
+    take_profit_price: float | None
+
+    @property
+    def is_set(self) -> bool:
+        return bool(self.stop_loss_price or self.take_profit_price)
 
 
 @dataclass(frozen=True)
@@ -198,6 +230,43 @@ class MexcRestClient:
                 LOGGER.debug("unparseable closed position row: %s", row)
         return out
 
+    async def get_stop_orders(self, symbol: str | None = None) -> list[PositionStops]:
+        """Live stop-loss / take-profit entries. Unfinished ones only — a triggered stop is
+        history, and mirroring it would put a stop on a position that is already gone."""
+        params: dict[str, Any] = {"page_num": 1, "page_size": 100, "is_finished": 0}
+        if symbol:
+            params["symbol"] = symbol
+        rows = await self._request("GET", "/private/stoporder/list/orders", params=params) or []
+        out: list[PositionStops] = []
+        for row in rows:
+            try:
+                out.append(
+                    PositionStops(
+                        order_id=int(row.get("orderId") or row.get("id") or 0),
+                        position_id=int(row.get("positionId") or 0),
+                        symbol=str(row.get("symbol") or ""),
+                        position_type=int(row.get("positionType") or 0),
+                        stop_loss_price=_opt_float(row.get("stopLossPrice")),
+                        take_profit_price=_opt_float(row.get("takeProfitPrice")),
+                    )
+                )
+            except (TypeError, ValueError):
+                LOGGER.debug("unparseable stop order row: %s", row)
+        return out
+
+    async def set_position_stops(
+        self, *, order_id: int, stop_loss_price: float | None, take_profit_price: float | None
+    ) -> Any:
+        """Attach or change the stop-loss / take-profit on the order that opened a position.
+
+        Per MEXC: both empty or zero means "cancel them", which is how a cleared stop on the
+        master gets mirrored as a cleared stop rather than being left in place.
+        """
+        body: dict[str, Any] = {"orderId": order_id}
+        body["stopLossPrice"] = stop_loss_price or 0
+        body["takeProfitPrice"] = take_profit_price or 0
+        return await self._request("POST", "/private/stoporder/change_price", body=body)
+
     async def get_position_mode(self) -> int:
         """1 = hedge, 2 = one-way. Master and follower must match, or sides get misread."""
         return int(await self._request("GET", "/private/position/position_mode"))
@@ -227,6 +296,8 @@ class MexcRestClient:
         order_type: int = ORDER_TYPE_MARKET,
         external_oid: str | None = None,
         price: float | None = None,
+        stop_loss_price: float | None = None,
+        take_profit_price: float | None = None,
     ) -> Any:
         """Place an order. `vol` is in CONTRACTS.
 
@@ -240,6 +311,14 @@ class MexcRestClient:
             body["externalOid"] = external_oid
         if price is not None:
             body["price"] = price
+        # Stops go on with the order rather than afterwards. MEXC hangs a position's stop-loss and
+        # take-profit off the order that opened it, so there is no entry to modify until one
+        # exists — attaching them here is the only moment a follower can be given the master's
+        # levels without a position first sitting unprotected.
+        if stop_loss_price:
+            body["stopLossPrice"] = stop_loss_price
+        if take_profit_price:
+            body["takeProfitPrice"] = take_profit_price
         return await self._request("POST", "/private/order/submit", body=body)
 
     async def close_all(self, symbol: str | None = None) -> Any:
