@@ -6,6 +6,11 @@ Two rules drive the whole design:
     recorded on its own; one account out of balance must never cancel, roll back or delay the
     other eight. Nothing here raises past a single account's boundary.
 
+  · A follower's side is decided here, not inherited. In REVERSE mode the chosen account takes
+    the opposite side of the master — an automatic hedge — and everything downstream (the order
+    side, the leverage call, the expected-position row) has to use that side rather than the
+    master's, or reconciliation will chase a position that was never opened.
+
   · Closing goes through close_all, never through an opposite-side order. Verified on a live
     hedge-mode account: submitting side=3 ("close long") against an open long did not close it —
     MEXC opened a fresh short alongside, at the account's default leverage. For a copy bot that
@@ -45,6 +50,9 @@ PERMANENT_ERROR_TEXT = ("insufficient", "balance", "invalid", "not exist", "perm
 
 RETRY_DELAYS = (0.2, 0.5, 1.0)
 
+# MEXC's position types: 1 long, 2 short. Reversing is just swapping the two.
+OPPOSITE_SIDE = {1: 2, 2: 1}
+
 
 @dataclass
 class FollowerResult:
@@ -76,12 +84,22 @@ class CopyEngine:
         self._session = session
         self._retry_attempts = max(1, retry_attempts)
 
-    async def execute(self, event: MasterEvent, event_id: int, followers: list[Account]) -> list[FollowerResult]:
-        """Apply one master event to every follower, concurrently."""
+    async def execute(
+        self,
+        event: MasterEvent,
+        event_id: int,
+        followers: list[Account],
+        *,
+        reverse: bool = False,
+    ) -> list[FollowerResult]:
+        """Apply one master event to every follower, concurrently.
+
+        `reverse` flips the side each follower takes, turning the mirror into a hedge.
+        """
         if not followers:
             return []
         results = await asyncio.gather(
-            *(self._run_follower(event, event_id, follower) for follower in followers),
+            *(self._run_follower(event, event_id, follower, reverse) for follower in followers),
             return_exceptions=True,
         )
 
@@ -96,8 +114,11 @@ class CopyEngine:
                 out.append(FollowerResult(follower, False, event.action, 0.0, str(result)[:200]))
         return out
 
-    async def _run_follower(self, event: MasterEvent, event_id: int, follower: Account) -> FollowerResult:
+    async def _run_follower(
+        self, event: MasterEvent, event_id: int, follower: Account, reverse: bool = False
+    ) -> FollowerResult:
         vol = event.delta_vol * follower.size_multiplier
+        side = OPPOSITE_SIDE[event.position_type] if reverse else event.position_type
         external_oid = f"cp{event_id}-{follower.id}-{uuid.uuid4().hex[:8]}"
 
         task_id = await self._store.create_task(
@@ -105,7 +126,7 @@ class CopyEngine:
             account_id=follower.id,
             action=event.action.value,
             symbol=event.symbol,
-            position_type=event.position_type,
+            position_type=side,
             vol=vol,
             leverage=event.leverage,
             open_type=event.open_type,
@@ -130,12 +151,12 @@ class CopyEngine:
         for attempt in range(self._retry_attempts):
             attempts = attempt + 1
             try:
-                realized = await self._apply(client, event, follower, vol, external_oid)
+                realized = await self._apply(client, event, follower, vol, external_oid, side)
                 await self._store.finish_task(
                     task_id, status="SUCCESS", attempts=attempts, error=None, realized_pnl=realized
                 )
                 await self._store.set_account_error(follower.id, None)
-                await self._record_expected_position(event, follower, vol)
+                await self._record_expected_position(event, follower, vol, side)
                 return FollowerResult(follower, True, event.action, vol, None, realized)
             except MexcError as err:
                 last_error = err.message or str(err)
@@ -153,7 +174,13 @@ class CopyEngine:
         return FollowerResult(follower, False, event.action, vol, last_error)
 
     async def _apply(
-        self, client: MexcRestClient, event: MasterEvent, follower: Account, vol: float, external_oid: str
+        self,
+        client: MexcRestClient,
+        event: MasterEvent,
+        follower: Account,
+        vol: float,
+        external_oid: str,
+        side: int,
     ) -> float | None:
         """Returns realised PnL when this was a close and the exchange reported it."""
         if event.action is Action.CLOSE:
@@ -183,7 +210,7 @@ class CopyEngine:
 
         # OPEN and INCREASE are both "add this many contracts on this side".
         # (No realised PnL to report for these; the return below is the whole method's result.)
-        side = SIDE_OPEN_LONG if event.position_type == 1 else SIDE_OPEN_SHORT
+        order_side = SIDE_OPEN_LONG if side == 1 else SIDE_OPEN_SHORT
         if event.leverage:
             # Leverage must be right BEFORE the order, or the position opens with the account's
             # previous setting (spec §13). Failing to set it is not fatal on its own — MEXC
@@ -194,14 +221,14 @@ class CopyEngine:
                     leverage=event.leverage,
                     open_type=event.open_type,
                     symbol=event.symbol,
-                    position_type=event.position_type,
+                    position_type=side,
                 )
             except MexcError as err:
                 LOGGER.info("follower %s leverage set failed (continuing): %s", follower.id, err.message)
 
         await client.submit_order(
             symbol=event.symbol,
-            side=side,
+            side=order_side,
             vol=vol,
             leverage=event.leverage or None,
             open_type=event.open_type,
@@ -240,20 +267,25 @@ class CopyEngine:
         LOGGER.info("settlement incomplete for %s: %s still unsettled", symbol, sorted(outstanding))
         return None
 
-    async def _record_expected_position(self, event: MasterEvent, follower: Account, vol: float) -> None:
-        """Track what this follower's position should now be, for reconciliation to check."""
+    async def _record_expected_position(
+        self, event: MasterEvent, follower: Account, vol: float, side: int
+    ) -> None:
+        """Track what this follower's position should now be, for reconciliation to check.
+
+        Keyed on the side the follower actually took, which in REVERSE mode is not the master's.
+        """
         if event.action is Action.CLOSE:
-            await self._store.delete_position(follower.id, event.symbol, event.position_type)
+            await self._store.delete_position(follower.id, event.symbol, side)
             return
 
         existing = await self._store.get_positions(follower.id)
-        current = existing.get((event.symbol, event.position_type))
+        current = existing.get((event.symbol, side))
         new_vol = (current.hold_vol if current else 0.0) + vol
         await self._store.upsert_position(
             PositionRow(
                 account_id=follower.id,
                 symbol=event.symbol,
-                position_type=event.position_type,
+                position_type=side,
                 hold_vol=new_vol,
                 leverage=event.leverage,
                 open_type=event.open_type,

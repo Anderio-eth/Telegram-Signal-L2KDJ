@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 from ..core.copy_engine import FollowerResult
 from ..core.events import Action, MasterEvent
-from ..db.store import Account
+from ..db.store import MODE_REVERSE, Account
 
 ACTION_ICON = {
     Action.OPEN: "📈",
@@ -87,6 +87,8 @@ def main_menu(
     max_followers: int,
     master_connected: bool,
     balances: dict[int, Balance] | None = None,
+    mode: str = "COPY",
+    reverse_account: Account | None = None,
 ) -> str:
     """The main screen.
 
@@ -106,7 +108,14 @@ def main_menu(
     else:
         status = "🔴 STOPPED"
 
-    lines = ["🤖 <b>MEXC COPY BOT</b>", "", f"Status: {status}", ""]
+    lines = ["🤖 <b>MEXC COPY BOT</b>", "", f"Status: {status}"]
+
+    if mode == MODE_REVERSE:
+        target = reverse_account.label if reverse_account else "⚠️ no account chosen"
+        lines.append(f"Mode: 🔁 <b>REVERSE</b> → {target}")
+    else:
+        lines.append("Mode: 📋 Copy (all followers)")
+    lines.append("")
 
     if not master:
         lines.append("👤 <b>Master:</b> not set")
@@ -179,6 +188,33 @@ def event_report(event: MasterEvent, results: list[FollowerResult], notional: fl
             suffix = "" if reported == closed else f"  (of {reported}/{closed} reported)"
             lines.append(f"<b>Total PnL: {signed_money(sum(known))}</b>{suffix}")
 
+    return "\n".join(lines)
+
+
+def mode_screen(mode: str, reverse_account: Account | None, followers: list[Account]) -> str:
+    lines = ["⚙️ <b>MODE</b>", ""]
+    if mode == MODE_REVERSE:
+        lines.append("Currently: 🔁 <b>REVERSE</b>")
+        lines.append(
+            f"Hedging on: <b>{reverse_account.label}</b>"
+            if reverse_account
+            else "⚠️ No account chosen — nothing will be mirrored."
+        )
+    else:
+        lines.append("Currently: 📋 <b>COPY</b>")
+        lines.append(f"Mirroring the master onto all {len(followers)} follower(s).")
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━",
+        "",
+        "📋 <b>Copy</b> — every follower opens the <i>same</i> side as the master.",
+        "",
+        "🔁 <b>Reverse</b> — one chosen account opens the <i>opposite</i> side: master goes "
+        "LONG, it goes SHORT. An automatic hedge.",
+        "",
+        "Only one mode runs at a time.",
+    ]
     return "\n".join(lines)
 
 

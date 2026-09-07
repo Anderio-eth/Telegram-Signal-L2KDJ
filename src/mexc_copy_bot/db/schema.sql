@@ -34,6 +34,11 @@ BEGIN
         ALTER TABLE copy_tasks ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION;
     END IF;
 
+    IF to_regclass('public.copy_state') IS NOT NULL THEN
+        ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'COPY';
+        ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS reverse_account_id BIGINT;
+    END IF;
+
     IF to_regclass('public.copy_master_events') IS NOT NULL THEN
         ALTER TABLE copy_master_events ADD COLUMN IF NOT EXISTS owner_id BIGINT NOT NULL DEFAULT 0;
         -- dedupe_key was globally unique, which would let one owner's event suppress another's
@@ -168,6 +173,14 @@ CREATE INDEX IF NOT EXISTS copy_tasks_recent ON copy_tasks (created_at DESC);
 CREATE TABLE IF NOT EXISTS copy_state (
     owner_id     BIGINT      PRIMARY KEY,
     running      BOOLEAN     NOT NULL DEFAULT FALSE,
+    -- 'COPY'    — every active follower mirrors the master on the same side.
+    -- 'REVERSE' — exactly one chosen account takes the OPPOSITE side, an automatic hedge.
+    -- One column rather than two flags: the modes are mutually exclusive by construction, so
+    -- there is no state in which both could be on.
+    mode         TEXT        NOT NULL DEFAULT 'COPY' CHECK (mode IN ('COPY', 'REVERSE')),
+    -- Which follower takes the opposite side in REVERSE mode. Cleared if that account is
+    -- deleted, which leaves the mode unconfigured rather than silently retargeting someone else.
+    reverse_account_id BIGINT REFERENCES copy_accounts(id) ON DELETE SET NULL,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

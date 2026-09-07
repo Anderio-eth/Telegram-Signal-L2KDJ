@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 import aiohttp
 
-from ..db.store import FOLLOWER, Account, Store
+from ..db.store import FOLLOWER, MODE_REVERSE, Account, Store
 from ..mexc.rest import MexcError, MexcRestClient
 from ..mexc.websocket import MasterWebSocket
 from .copy_engine import CopyEngine, FollowerResult
@@ -237,14 +237,31 @@ class CopyService:
             LOGGER.info("duplicate master event ignored: %s", event.dedupe_key)
             return
 
-        followers = [a for a in await self._store.list_accounts(self._owner_id, FOLLOWER) if a.active]
+        active = [a for a in await self._store.list_accounts(self._owner_id, FOLLOWER) if a.active]
+        mode, reverse_account_id = await self._store.get_mode(self._owner_id)
+        reverse = mode == MODE_REVERSE
+
+        if reverse:
+            # Exactly one account hedges the master. If it was deleted or deactivated, do nothing
+            # and say so: quietly falling back to copying every follower would open positions on
+            # the same side as the master, the precise opposite of what was asked for.
+            followers = [a for a in active if a.id == reverse_account_id]
+            if not followers:
+                LOGGER.warning("reverse mode has no usable account for owner %s", self._owner_id)
+                await self._notice(
+                    "⚠️ Reverse mode is on but its account is missing or paused — nothing was mirrored."
+                )
+                return
+        else:
+            followers = active
+
         if not followers:
             LOGGER.info("no active followers for event %s", event_id)
             return
 
         assert self._session is not None
         engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts)
-        results = await engine.execute(event, event_id, followers)
+        results = await engine.execute(event, event_id, followers, reverse=reverse)
 
         if self.on_report:
             with contextlib.suppress(Exception):

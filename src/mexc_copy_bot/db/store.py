@@ -32,6 +32,9 @@ SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 MASTER = "MASTER"
 FOLLOWER = "FOLLOWER"
 
+MODE_COPY = "COPY"
+MODE_REVERSE = "REVERSE"
+
 
 @dataclass(frozen=True)
 class Account:
@@ -218,6 +221,32 @@ class Store:
                 """,
                 owner_id,
                 running,
+            )
+
+    async def get_mode(self, owner_id: int) -> tuple[str, int | None]:
+        """(mode, reverse account id). Defaults to plain copying for an owner with no row yet."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT mode, reverse_account_id FROM copy_state WHERE owner_id = $1", owner_id
+            )
+        if not row:
+            return MODE_COPY, None
+        return row["mode"] or MODE_COPY, row["reverse_account_id"]
+
+    async def set_mode(self, owner_id: int, mode: str, reverse_account_id: int | None) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO copy_state (owner_id, mode, reverse_account_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (owner_id) DO UPDATE
+                SET mode = EXCLUDED.mode,
+                    reverse_account_id = EXCLUDED.reverse_account_id,
+                    updated_at = now()
+                """,
+                owner_id,
+                mode,
+                reverse_account_id,
             )
 
     async def running_owners(self) -> list[int]:

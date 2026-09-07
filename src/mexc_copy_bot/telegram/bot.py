@@ -38,7 +38,7 @@ from ..config import Settings
 from ..core.copy_engine import FollowerResult
 from ..core.events import MasterEvent
 from ..core.registry import ServiceRegistry
-from ..db.store import FOLLOWER, MASTER, Account, Store
+from ..db.store import FOLLOWER, MASTER, MODE_COPY, MODE_REVERSE, Account, Store
 from ..mexc.rest import MexcError, MexcRestClient, get_contract_specs, get_ticker_price
 from . import messages
 
@@ -65,7 +65,8 @@ def _menu_keyboard(running: bool) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📊 Positions", callback_data="positions"),
              InlineKeyboardButton("👥 Accounts", callback_data="accounts")],
             [InlineKeyboardButton("📜 History", callback_data="history"),
-             InlineKeyboardButton("🔄 Refresh", callback_data="menu")],
+             InlineKeyboardButton("⚙️ Mode", callback_data="mode")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="menu")],
             [control],
             [InlineKeyboardButton("🛑 EMERGENCY STOP", callback_data="emergency")],
         ]
@@ -153,6 +154,7 @@ class CopyBot:
         service = await self._registry.get(owner_id)
         master = await self._store.get_master(owner_id)
         followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        mode, reverse_id = await self._store.get_mode(owner_id)
 
         accounts = ([master] if master else []) + followers
         return messages.main_menu(
@@ -162,6 +164,8 @@ class CopyBot:
             max_followers=self._settings.max_followers,
             master_connected=service.master_connected,
             balances=await self._balances(owner_id, accounts),
+            mode=mode,
+            reverse_account=next((f for f in followers if f.id == reverse_id), None),
         )
 
     async def _balances(self, owner_id: int, accounts: list[Account]) -> dict[int, messages.Balance]:
@@ -283,6 +287,27 @@ class CopyBot:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="menu")]]),
                 parse_mode=ParseMode.HTML,
             )
+        elif action == "mode":
+            await self._show_mode(update, owner_id)
+        elif action == "mode_copy":
+            if await self._refuse_while_running(update, owner_id):
+                return
+            await self._store.set_mode(owner_id, MODE_COPY, None)
+            await self._show_mode(update, owner_id)
+        elif action == "mode_reverse":
+            if await self._refuse_while_running(update, owner_id):
+                return
+            await self._show_reverse_picker(update, owner_id)
+        elif action.startswith("reverse_pick:"):
+            if await self._refuse_while_running(update, owner_id):
+                return
+            account_id = int(action.split(":", 1)[1])
+            # Verified against this owner's own followers: a stale callback must not be able to
+            # point the hedge at an account that is not theirs, or no longer exists.
+            followers = await self._store.list_accounts(owner_id, FOLLOWER)
+            if any(f.id == account_id for f in followers):
+                await self._store.set_mode(owner_id, MODE_REVERSE, account_id)
+            await self._show_mode(update, owner_id)
         elif action == "remove_menu":
             await self._show_remove_menu(update, owner_id)
         elif action.startswith("remove:"):
@@ -315,6 +340,65 @@ class CopyBot:
             chat_id,
             await self._menu_text(owner_id),
             reply_markup=_menu_keyboard(service.running),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _refuse_while_running(self, update: Update, owner_id: int) -> bool:
+        """Mode changes are refused while copying is on.
+
+        Switching sides mid-flight would leave whatever is already open on the wrong side of the
+        master, with nothing to close it: the expected-position rows are keyed by side, so the old
+        ones would simply be orphaned. Stopping first makes the change deliberate.
+        """
+        service = await self._registry.get(owner_id)
+        if not service.running:
+            return False
+        await update.callback_query.answer(
+            "Stop copying before changing mode — open positions would be left on the wrong side.",
+            show_alert=True,
+        )
+        return True
+
+    async def _show_mode(self, update: Update, owner_id: int) -> None:
+        mode, reverse_id = await self._store.get_mode(owner_id)
+        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        chosen = next((f for f in followers if f.id == reverse_id), None)
+
+        rows = []
+        if mode != MODE_COPY:
+            rows.append([InlineKeyboardButton("📋 Switch to COPY", callback_data="mode_copy")])
+        rows.append(
+            [InlineKeyboardButton(
+                "🔁 Choose hedge account" if mode == MODE_REVERSE else "🔁 Switch to REVERSE",
+                callback_data="mode_reverse",
+            )]
+        )
+        rows.append([InlineKeyboardButton("« Back", callback_data="menu")])
+
+        await update.callback_query.edit_message_text(
+            messages.mode_screen(mode, chosen, followers),
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _show_reverse_picker(self, update: Update, owner_id: int) -> None:
+        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        if not followers:
+            await update.callback_query.edit_message_text(
+                "Reverse mode needs a second account to hedge on. Add a follower first.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="mode")]]),
+            )
+            return
+        rows = [
+            [InlineKeyboardButton(
+                f"🔁 {f.label} (…{f.api_key_hint})", callback_data=f"reverse_pick:{f.id}"
+            )]
+            for f in followers
+        ]
+        rows.append([InlineKeyboardButton("« Back", callback_data="mode")])
+        await update.callback_query.edit_message_text(
+            "Which account should take the <b>opposite</b> side of the master?",
+            reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
         )
 
