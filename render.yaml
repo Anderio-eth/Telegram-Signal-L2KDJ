@@ -6,6 +6,11 @@ services:
     # Both bots in one worker, as two separate processes (see scripts/run_both.sh for why).
     startCommand: bash scripts/run_both.sh
     envVars:
+      # The KDJ signal bot is off: matplotlib and numpy were the bulk of this 512MB worker's
+      # memory, and the copy bot is what the service runs for now. Flip to "true" to bring it
+      # back — nothing about it was removed.
+      - key: SIGNAL_BOT_ENABLED
+        value: "false"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_RUN_MODE

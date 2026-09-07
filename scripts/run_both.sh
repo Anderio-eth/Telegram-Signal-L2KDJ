@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs both bots in one Render worker as SEPARATE processes.
+# Runs this worker's bots as SEPARATE processes.
 #
 # Separate processes, not one combined program, is the whole point: Python executes in a single
 # thread per process, so a matplotlib render in the signal bot would otherwise block order
@@ -8,6 +8,11 @@
 #
 # Each is restarted independently if it exits. The copy bot manages real positions, so it must
 # come back on its own rather than leaving followers unmirrored until someone notices.
+#
+# The KDJ signal bot is OFF by default. It drags in matplotlib and numpy, which are the bulk of
+# this 512MB worker's memory, and the copy bot — which moves real money on ten accounts — is what
+# the service exists for now. Set SIGNAL_BOT_ENABLED=true to bring it back; nothing about it was
+# deleted.
 
 set -uo pipefail
 
@@ -29,14 +34,20 @@ run_forever() {
   done
 }
 
-run_forever "signal-bot" python -m telegram_signal_k2 &
-SIGNAL_PID=$!
+PIDS=()
+
+if [ "${SIGNAL_BOT_ENABLED:-false}" = "true" ]; then
+  run_forever "signal-bot" python -m telegram_signal_k2 &
+  PIDS+=("$!")
+else
+  log "signal-bot disabled (set SIGNAL_BOT_ENABLED=true to run it)"
+fi
 
 run_forever "copy-bot" python -m mexc_copy_bot &
-COPY_PID=$!
+PIDS+=("$!")
 
-# Forward Render's shutdown signal to both, so a redeploy stops them cleanly instead of being
-# killed mid-order.
-trap 'log "shutting down"; kill "$SIGNAL_PID" "$COPY_PID" 2>/dev/null; wait; exit 0' SIGTERM SIGINT
+# Forward Render's shutdown signal, so a redeploy stops things cleanly instead of killing the copy
+# bot mid-order.
+trap 'log "shutting down"; kill "${PIDS[@]}" 2>/dev/null; wait; exit 0' SIGTERM SIGINT
 
 wait
