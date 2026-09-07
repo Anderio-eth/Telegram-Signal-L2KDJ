@@ -20,7 +20,7 @@ import pytest  # noqa: E402
 from mexc_copy_bot.core.copy_engine import OPPOSITE_SIDE, CopyEngine  # noqa: E402
 from mexc_copy_bot.core.events import Action, MasterEvent  # noqa: E402
 from mexc_copy_bot.db.store import FOLLOWER, Account, PositionRow  # noqa: E402
-from mexc_copy_bot.mexc.rest import SIDE_OPEN_LONG, SIDE_OPEN_SHORT  # noqa: E402
+from mexc_copy_bot.mexc.rest import SIDE_OPEN_LONG, SIDE_OPEN_SHORT, Position  # noqa: E402
 
 LONG, SHORT = 1, 2
 
@@ -76,6 +76,10 @@ class FakeClient:
 
     instances: list["FakeClient"] = []
 
+    # Holding something by default: a close against a flat account is now a no-op, so a fake
+    # that always reports no positions would never exercise the close path at all.
+    holds = True
+
     def __init__(self, *_a, **_kw):
         self.orders: list[dict] = []
         self.leverage_calls: list[dict] = []
@@ -93,7 +97,12 @@ class FakeClient:
         self.closed.append(symbol)
 
     async def get_open_positions(self, symbol=None):
-        return []
+        if not FakeClient.holds:
+            return []
+        return [Position(
+            position_id=555, symbol=symbol or "ADA_USDT", position_type=SHORT, open_type=2,
+            hold_vol=10.0, leverage=5, open_avg_price=1.0, state=1,
+        )]
 
     async def get_closed_positions(self, symbol=None, **kw):
         return []
@@ -102,6 +111,7 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def _fake_client(monkeypatch):
     FakeClient.instances.clear()
+    FakeClient.holds = True
     monkeypatch.setattr("mexc_copy_bot.core.copy_engine.MexcRestClient", FakeClient)
 
 
@@ -170,3 +180,14 @@ def test_close_clears_the_hedged_side_not_the_masters():
     # must still clear the row that was actually created.
     assert FakeClient.instances[0].closed == ["ADA_USDT"]
     assert store.deleted == [(1, "ADA_USDT", SHORT)]
+
+
+def test_a_close_against_an_already_flat_account_is_not_an_error():
+    """The follower is where the master is. Reporting that as a failed close produced nine red
+    lines per close on accounts whose open had failed earlier, burying the real cause."""
+    FakeClient.holds = False
+    store, results = asyncio.run(run(Action.CLOSE, LONG, reverse=False))
+    assert results[0].ok
+    assert results[0].error is None
+    assert FakeClient.instances[0].closed == []       # nothing sent to the exchange
+    assert store.deleted == [(1, "ADA_USDT", LONG)]   # bookkeeping still cleared

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import uuid
 from dataclasses import dataclass
 
@@ -32,6 +33,7 @@ from ..mexc.rest import (
     SIDE_OPEN_SHORT,
     MexcError,
     MexcRestClient,
+    get_contract_specs,
 )
 from .events import Action, MasterEvent
 
@@ -46,9 +48,22 @@ PERMANENT_ERROR_CODES = {
     600,   # parameter error
     602,   # signature/authentication failure
 }
-PERMANENT_ERROR_TEXT = ("insufficient", "balance", "invalid", "not exist", "permission", "signature")
+PERMANENT_ERROR_TEXT = ("insufficient", "balance", "invalid", "permission", "signature")
 
+# A close that finds no position has already achieved what it was asked for. Reported as a
+# failure it produced nine red lines per close on accounts whose open had failed earlier —
+# alarming, and hiding the one failure that actually mattered.
+ALREADY_FLAT_TEXT = ("position is nonexistent", "position not exist", "no position")
+
+# A contract MEXC does not allow through the API at all. Retrying cannot help, and the message it
+# returns ("Contract not activated") explains nothing to whoever reads the report.
+BLOCKED_CONTRACT_TEXT = ("not activated", "contract not activated")
+
+# Rate limiting is transient, but not on the timescale of an ordinary blip: retrying in 200ms just
+# spends the next allowance. These waits are long enough for the window to actually roll over.
 RETRY_DELAYS = (0.2, 0.5, 1.0)
+RATE_LIMIT_DELAYS = (1.5, 4.0, 8.0)
+RATE_LIMIT_TEXT = ("too frequent", "rate limit", "too many requests")
 
 # MEXC's position types: 1 long, 2 short. Reversing is just swapping the two.
 OPPOSITE_SIDE = {1: 2, 2: 1}
@@ -71,7 +86,27 @@ class FollowerResult:
 PNL_POLL_DELAYS = (0.0, 0.5, 1.0, 2.0)
 
 
+def _is_already_flat(err: MexcError) -> bool:
+    text = (err.message or "").lower()
+    return any(word in text for word in ALREADY_FLAT_TEXT)
+
+
+def _is_rate_limit(err: MexcError) -> bool:
+    text = (err.message or "").lower()
+    return any(word in text for word in RATE_LIMIT_TEXT)
+
+
+def _is_blocked_contract(err: MexcError) -> bool:
+    text = (err.message or "").lower()
+    return any(word in text for word in BLOCKED_CONTRACT_TEXT)
+
+
 def _is_permanent(err: MexcError) -> bool:
+    if _is_rate_limit(err):
+        # Transient despite reading like a rejection; it just needs a longer wait.
+        return False
+    if _is_blocked_contract(err):
+        return True
     if err.code in PERMANENT_ERROR_CODES:
         return True
     text = (err.message or "").lower()
@@ -100,6 +135,13 @@ class CopyEngine:
         """
         if not followers:
             return []
+
+        blocked = await self._blocked_contract_reason(event)
+        if blocked:
+            # One lookup instead of nine rejected orders, and a message that names the real cause.
+            LOGGER.warning("skipping %s: %s", event.symbol, blocked)
+            return [FollowerResult(f, False, event.action, 0.0, blocked) for f in followers]
+
         results = await asyncio.gather(
             *(self._run_follower(event, event_id, follower, reverse, stops) for follower in followers),
             return_exceptions=True,
@@ -115,6 +157,27 @@ class CopyEngine:
                 LOGGER.exception("follower %s crashed", follower.id, exc_info=result)
                 out.append(FollowerResult(follower, False, event.action, 0.0, str(result)[:200]))
         return out
+
+    async def _blocked_contract_reason(self, event: MasterEvent) -> str | None:
+        """Whether MEXC forbids API orders on this contract, as a message worth showing.
+
+        Checked before ordering, not after: the venue's own rejection is "Contract not activated",
+        which sounds like something the account owner can switch on. They cannot — it is a
+        per-contract flag on MEXC's side, usually on new or thin listings, and the position stays
+        openable in the app while no API can mirror it.
+
+        A close is never blocked: getting out must not depend on being allowed in.
+        """
+        if event.action is Action.CLOSE or self._session is None:
+            return None
+        try:
+            specs = await get_contract_specs(self._session, event.symbol)
+        except Exception:  # noqa: BLE001 — an unavailable check must not stop a trade
+            return None
+        spec = specs.get(event.symbol)
+        if spec and not spec.api_allowed:
+            return f"{event.symbol}: MEXC blocks API trading on this contract"
+        return None
 
     async def _run_follower(
         self,
@@ -155,6 +218,7 @@ class CopyEngine:
 
         attempts = 0
         last_error: str | None = None
+        delays = RETRY_DELAYS
         for attempt in range(self._retry_attempts):
             attempts = attempt + 1
             try:
@@ -167,14 +231,26 @@ class CopyEngine:
                 return FollowerResult(follower, True, event.action, vol, None, realized)
             except MexcError as err:
                 last_error = err.message or str(err)
+                if _is_blocked_contract(err):
+                    # Say what actually happened. "Contract not activated" reads like an account
+                    # setting the user could fix; it is MEXC refusing API orders on this contract.
+                    last_error = f"{event.symbol}: MEXC blocks API trading on this contract"
+                    LOGGER.warning("follower %s: %s", follower.id, last_error)
+                    break
                 if _is_permanent(err):
                     LOGGER.warning("follower %s permanent failure: %s", follower.id, last_error)
                     break
+                rate_limited = _is_rate_limit(err)
+                delays = RATE_LIMIT_DELAYS if rate_limited else RETRY_DELAYS
                 LOGGER.info("follower %s attempt %s failed: %s", follower.id, attempts, last_error)
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 last_error = f"network: {err}"
+                delays = RETRY_DELAYS
             if attempt < self._retry_attempts - 1:
-                await asyncio.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
+                # Jittered so nine followers backing off together do not retry in lockstep and
+                # recreate the burst that rate-limited them in the first place.
+                base = delays[min(attempt, len(delays) - 1)]
+                await asyncio.sleep(base * (1.0 + random.random() * 0.4))
 
         await self._store.finish_task(task_id, status="FAILED", attempts=attempts, error=last_error)
         await self._store.set_account_error(follower.id, last_error)
@@ -203,7 +279,18 @@ class CopyEngine:
                 open_ids = [p.position_id for p in await client.get_open_positions(event.symbol) if p.hold_vol > 0]
             except MexcError:
                 open_ids = []
-            await client.close_all(event.symbol)
+            if not open_ids:
+                # Nothing to close, so the follower is already where the master is. Calling
+                # close_all anyway returns an error that would be reported as a failed close.
+                LOGGER.info("follower %s already flat on %s", follower.id, event.symbol)
+                return None
+            try:
+                await client.close_all(event.symbol)
+            except MexcError as err:
+                if not _is_already_flat(err):
+                    raise
+                LOGGER.info("follower %s: %s was already closed", follower.id, event.symbol)
+                return None
             return await self._realized_pnl(client, event.symbol, open_ids)
 
         if event.action is Action.DECREASE:

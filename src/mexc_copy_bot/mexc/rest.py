@@ -11,6 +11,8 @@ Notional is derived only for display: vol × contractSize × price.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +22,41 @@ import aiohttp
 from .auth import rest_body_string, sign_rest
 
 LOGGER = logging.getLogger(__name__)
+
+
+class _Throttle:
+    """Paces outbound calls so nine followers do not trip MEXC's per-IP limit.
+
+    The limit is per IP, not per account — every follower is the same Render instance as far as
+    MEXC is concerned. Nine accounts each sending a leverage call and an order is eighteen requests
+    in one burst, which is what produced "Requests are too frequent" and lost a whole trade.
+
+    Concurrency is capped and a minimum gap is kept between starts. Ordering is not guaranteed and
+    does not need to be: each follower's own calls are sequential, and the accounts are independent
+    by design.
+    """
+
+    def __init__(self, max_concurrent: int, min_interval: float) -> None:
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._min_interval = min_interval
+        self._lock = asyncio.Lock()
+        self._next_slot = 0.0
+
+    @contextlib.asynccontextmanager
+    async def slot(self):
+        async with self._semaphore:
+            async with self._lock:
+                now = asyncio.get_running_loop().time()
+                wait = max(0.0, self._next_slot - now)
+                self._next_slot = max(now, self._next_slot) + self._min_interval
+            if wait:
+                await asyncio.sleep(wait)
+            yield
+
+
+# Sized well under MEXC's published per-IP allowance: the cost of being a little slower is a
+# fraction of a second per trade, and the cost of being too fast is a trade that never happened.
+THROTTLE = _Throttle(max_concurrent=4, min_interval=0.06)
 
 # api.mexc.com, NOT contract.mexc.com — verified against a live account:
 #   contract.mexc.com  read 200 / order submit 403 "Access Denied" (blocked at the CDN)
@@ -125,6 +162,10 @@ class ContractSpec:
     min_vol: float
     vol_scale: int
     max_leverage: int
+    # MEXC blocks API trading outright on some contracts — typically new or low-liquidity
+    # listings. They are tradable in the app, which is why a master can hold a position the bot
+    # is not permitted to mirror. The venue reports the attempt as "Contract not activated".
+    api_allowed: bool = True
 
     def contracts_for_notional(self, notional_usd: float, price: float) -> float:
         """How many contracts a given dollar exposure is, at this price."""
@@ -154,7 +195,7 @@ class MexcRestClient:
         headers = sign_rest(self._api_key, self._secret, params=params, body=body)
         data = rest_body_string(body) if body is not None else None
 
-        async with self._session.request(
+        async with THROTTLE.slot(), self._session.request(
             method, url, params=params, data=data, headers=headers, timeout=self._timeout
         ) as response:
             text = await response.text()
@@ -357,6 +398,7 @@ async def get_contract_specs(session: aiohttp.ClientSession, symbol: str | None 
             min_vol=float(row.get("minVol", 1) or 1),
             vol_scale=int(row.get("volScale", 0) or 0),
             max_leverage=int(row.get("maxLeverage", 0) or 0),
+            api_allowed=bool(row.get("apiAllowed", True)),
         )
     return specs
 
