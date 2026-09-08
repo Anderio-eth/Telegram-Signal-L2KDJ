@@ -191,7 +191,9 @@ def event_report(event: MasterEvent, results: list[FollowerResult], notional: fl
     return "\n".join(lines)
 
 
-def mode_screen(mode: str, reverse_account: Account | None, followers: list[Account]) -> str:
+def mode_screen(
+    mode: str, reverse_account: Account | None, followers: list[Account], mirror_limits: bool = False
+) -> str:
     lines = ["⚙️ <b>MODE</b>", ""]
     if mode == MODE_REVERSE:
         lines.append("Currently: 🔁 <b>REVERSE</b>")
@@ -214,6 +216,17 @@ def mode_screen(mode: str, reverse_account: Account | None, followers: list[Acco
         "LONG, it goes SHORT. An automatic hedge.",
         "",
         "Only one mode runs at a time.",
+        "",
+        "━━━━━━━━━━━━━━",
+        "",
+        f"📌 <b>Limit orders:</b> {'MIRRORED' if mirror_limits else 'off (market only)'}",
+        "",
+        "On: a limit resting on the master is placed on the followers at the same price, so they "
+        "fill alongside it.",
+        "",
+        "Off: the bot only sees the master's position <i>after</i> the limit has filled, and "
+        "catches up with a market order — paying the spread and the taker fee on both the open "
+        "and the close.",
     ]
     return "\n".join(lines)
 

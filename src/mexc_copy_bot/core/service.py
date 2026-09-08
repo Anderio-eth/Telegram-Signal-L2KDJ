@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import aiohttp
 
@@ -28,6 +28,7 @@ from ..mexc.rest import MexcError, MexcRestClient, PositionStops
 from ..mexc.websocket import MasterWebSocket
 from .copy_engine import CopyEngine, FollowerResult
 from .events import Action, MasterEvent, MasterPositionTracker, PositionSnapshot, parse_position
+from .orders import MasterOrderTracker, OrderAction, parse_order
 
 LOGGER = logging.getLogger(__name__)
 
@@ -69,6 +70,12 @@ class CopyService:
         self._session: aiohttp.ClientSession | None = None
         self._ws: MasterWebSocket | None = None
         self._tracker = MasterPositionTracker()
+        self._order_tracker = MasterOrderTracker()
+        # (symbol, position type) -> volume already mirrored as resting limit orders and now
+        # filled. The position channel reports that same fill a moment later; without
+        # discounting it there, one trade would be copied twice — once as the limit that was
+        # placed ahead of it, and again as a market order chasing the result.
+        self._filled_by_limit: dict[tuple[str, int], float] = {}
         self._reconcile_task: asyncio.Task[None] | None = None
         # Events are handled one at a time. Master actions arrive in order and often in bursts
         # (three orders filling one position); processing them concurrently would race the
@@ -109,6 +116,7 @@ class CopyService:
             api_key,
             secret,
             on_position=self._handle_position,
+            on_order=self._handle_order,
             on_stop_order=self._handle_stop_order,
             on_resync=self._resync_master,
             on_status=self._notice,
@@ -194,6 +202,10 @@ class CopyService:
             LOGGER.warning("master resync failed: %s", err)
             return
 
+        # A reconnect invalidates both: order ids from the previous session cannot be acted on,
+        # and any fill we were about to discount has already been folded into the fresh baseline.
+        self._order_tracker.reset()
+        self._filled_by_limit.clear()
         self._tracker.resync(
             [
                 PositionSnapshot(
@@ -329,6 +341,92 @@ class CopyService:
                 await self._store.set_account_error(follower.id, f"stops: {err.message}")
         return changed
 
+    async def _handle_order(self, data: dict) -> None:
+        """React to the master's own orders, which is the only way a resting limit is visible."""
+        order = parse_order(data)
+        if not order:
+            return
+        LOGGER.info(
+            "master order %s %s %s type=%s state=%s price=%s vol=%s dealt=%s",
+            order.order_id, order.symbol, order.side, order.order_type,
+            order.state, order.price, order.vol, order.deal_vol,
+        )
+
+        if not await self._store.get_mirror_limits(self._owner_id):
+            return
+
+        async with self._lock:
+            event = self._order_tracker.apply(order)
+            if event is None:
+                return
+
+            if event.action is OrderAction.PLACE:
+                await self._place_mirrored(order)
+            elif event.action is OrderAction.CANCEL:
+                await self._cancel_mirrored(order.order_id)
+            elif event.action is OrderAction.FILL:
+                # The followers' own copies are filling at the same price. Remember how much, so
+                # the position update that follows is not mirrored a second time.
+                key = (order.symbol, order.position_type)
+                filled = order.deal_vol or order.vol
+                self._filled_by_limit[key] = self._filled_by_limit.get(key, 0.0) + filled
+                await self._store.clear_mirrored_order(self._owner_id, order.order_id)
+                LOGGER.info("limit fill of %s on %s discounted from the position path", filled, key)
+
+    async def _place_mirrored(self, order) -> None:
+        followers = await self._eligible_followers()
+        if not followers:
+            return
+        mode, _ = await self._store.get_mode(self._owner_id)
+        reverse = mode == MODE_REVERSE
+
+        assert self._session is not None
+        engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts)
+        results = await engine.mirror_resting_order(order, followers, reverse=reverse)
+
+        placed, failed = 0, []
+        for follower, follower_order_id, error in results:
+            if follower_order_id:
+                placed += 1
+                await self._store.record_mirrored_order(
+                    owner_id=self._owner_id, master_order_id=order.order_id,
+                    account_id=follower.id, follower_order_id=follower_order_id,
+                    symbol=order.symbol,
+                )
+            else:
+                failed.append(f"{follower.label}: {error}")
+
+        if self.on_notice:
+            lines = [
+                f"📌 <b>LIMIT MIRRORED</b>",
+                f"{order.symbol} @ {order.price:g}  vol {order.vol:g}",
+                f"placed on {placed}/{len(followers)}",
+            ]
+            lines += [f"❌ {f}" for f in failed]
+            with contextlib.suppress(Exception):
+                await self.on_notice("\n".join(lines))
+
+    async def _cancel_mirrored(self, master_order_id: str) -> None:
+        pairs = await self._store.get_mirrored_orders(self._owner_id, master_order_id)
+        if not pairs:
+            return
+        accounts = {a.id: a for a in await self._store.list_accounts(self._owner_id, FOLLOWER)}
+        todo = [(accounts[aid], oid) for aid, oid in pairs if aid in accounts]
+
+        assert self._session is not None
+        engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts)
+        cancelled = await engine.cancel_mirrored_orders(todo)
+        await self._store.clear_mirrored_order(self._owner_id, master_order_id)
+        LOGGER.info("cancelled %s/%s mirrored copies of %s", cancelled, len(todo), master_order_id)
+
+    async def _eligible_followers(self) -> list[Account]:
+        """Whose accounts an action applies to, honouring the copy/hedge mode."""
+        active = [a for a in await self._store.list_accounts(self._owner_id, FOLLOWER) if a.active]
+        mode, reverse_account_id = await self._store.get_mode(self._owner_id)
+        if mode == MODE_REVERSE:
+            return [a for a in active if a.id == reverse_account_id]
+        return active
+
     async def _handle_position(self, data: dict) -> None:
         snapshot = parse_position(data)
         if not snapshot:
@@ -338,6 +436,25 @@ class CopyService:
             event = self._tracker.apply(snapshot)
             if event is None:
                 return
+
+            # Discount anything a mirrored limit already covered.
+            key = (event.symbol, event.position_type)
+            pending = self._filled_by_limit.get(key, 0.0)
+            if pending > 0:
+                covered = min(pending, event.delta_vol)
+                remaining = pending - covered
+                if remaining > 1e-9:
+                    self._filled_by_limit[key] = remaining
+                else:
+                    self._filled_by_limit.pop(key, None)
+                if event.delta_vol - covered <= 1e-9:
+                    LOGGER.info(
+                        "position change on %s already covered by mirrored limits; not re-copied", key
+                    )
+                    return
+                # Only part of it came from the mirrored limit; copy the rest.
+                event = replace(event, delta_vol=event.delta_vol - covered)
+
             await self._dispatch(event, data)
 
     async def _dispatch(self, event: MasterEvent, raw: dict) -> None:

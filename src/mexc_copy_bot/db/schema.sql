@@ -37,6 +37,7 @@ BEGIN
     IF to_regclass('public.copy_state') IS NOT NULL THEN
         ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'COPY';
         ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS reverse_account_id BIGINT;
+        ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS mirror_limits BOOLEAN NOT NULL DEFAULT FALSE;
     END IF;
 
     IF to_regclass('public.copy_master_events') IS NOT NULL THEN
@@ -138,6 +139,21 @@ CREATE TABLE IF NOT EXISTS copy_master_events (
 CREATE UNIQUE INDEX IF NOT EXISTS copy_master_events_dedupe ON copy_master_events (owner_id, dedupe_key);
 CREATE INDEX IF NOT EXISTS copy_master_events_time ON copy_master_events (owner_id, observed_at DESC);
 
+-- Which follower order was placed to mirror which master order. Needed to cancel the copies
+-- when the master pulls theirs: without it, a cancelled master order leaves nine live orders
+-- resting on the followers with nothing left to fill against.
+CREATE TABLE IF NOT EXISTS copy_mirrored_orders (
+    owner_id         BIGINT NOT NULL,
+    master_order_id  TEXT   NOT NULL,
+    account_id       BIGINT NOT NULL REFERENCES copy_accounts(id) ON DELETE CASCADE,
+    follower_order_id TEXT  NOT NULL,
+    symbol           TEXT   NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (master_order_id, account_id)
+);
+
+CREATE INDEX IF NOT EXISTS copy_mirrored_orders_owner ON copy_mirrored_orders (owner_id, created_at DESC);
+
 -- One row per (event, follower). The unique constraint is the second idempotency guard: even if
 -- an event were somehow processed twice, a follower cannot receive the same instruction twice.
 CREATE TABLE IF NOT EXISTS copy_tasks (
@@ -181,6 +197,10 @@ CREATE TABLE IF NOT EXISTS copy_state (
     -- Which follower takes the opposite side in REVERSE mode. Cleared if that account is
     -- deleted, which leaves the mode unconfigured rather than silently retargeting someone else.
     reverse_account_id BIGINT REFERENCES copy_accounts(id) ON DELETE SET NULL,
+    -- Mirror the master's RESTING limit orders as resting limit orders, instead of waiting for
+    -- them to fill and then chasing with a market order. Off by default: it changes what gets
+    -- sent to nine live accounts, so it is switched on deliberately after a small test.
+    mirror_limits BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

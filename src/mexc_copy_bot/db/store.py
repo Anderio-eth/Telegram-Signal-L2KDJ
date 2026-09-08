@@ -249,6 +249,57 @@ class Store:
                 reverse_account_id,
             )
 
+    async def get_mirror_limits(self, owner_id: int) -> bool:
+        async with self._pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT mirror_limits FROM copy_state WHERE owner_id = $1", owner_id
+            ))
+
+    async def set_mirror_limits(self, owner_id: int, enabled: bool) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO copy_state (owner_id, mirror_limits) VALUES ($1, $2)
+                ON CONFLICT (owner_id) DO UPDATE
+                SET mirror_limits = EXCLUDED.mirror_limits, updated_at = now()
+                """,
+                owner_id,
+                enabled,
+            )
+
+    # ── mirrored resting orders ──────────────────────────────────────────────────
+    async def record_mirrored_order(
+        self, *, owner_id: int, master_order_id: str, account_id: int,
+        follower_order_id: str, symbol: str,
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO copy_mirrored_orders
+                    (owner_id, master_order_id, account_id, follower_order_id, symbol)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (master_order_id, account_id) DO NOTHING
+                """,
+                owner_id, master_order_id, account_id, follower_order_id, symbol,
+            )
+
+    async def get_mirrored_orders(self, owner_id: int, master_order_id: str) -> list[tuple[int, str]]:
+        """(account id, that account's order id) for one master order."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT account_id, follower_order_id FROM copy_mirrored_orders"
+                " WHERE owner_id = $1 AND master_order_id = $2",
+                owner_id, master_order_id,
+            )
+        return [(r["account_id"], r["follower_order_id"]) for r in rows]
+
+    async def clear_mirrored_order(self, owner_id: int, master_order_id: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM copy_mirrored_orders WHERE owner_id = $1 AND master_order_id = $2",
+                owner_id, master_order_id,
+            )
+
     async def running_owners(self) -> list[int]:
         """Owners whose copying was left ON — restored on boot so a redeploy resumes each."""
         async with self._pool.acquire() as conn:

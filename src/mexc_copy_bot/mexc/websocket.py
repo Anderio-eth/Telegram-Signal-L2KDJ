@@ -43,6 +43,10 @@ STOP_CHANNELS = frozenset(
     {"push.personal.stop.order", "push.stop.order", "push.personal.plan.order", "push.plan.order"}
 )
 
+# The master's own orders. This is what makes a resting limit visible: the position channel only
+# speaks once an order has already filled, by which point mirroring can only be a market order.
+ORDER_CHANNELS = frozenset({"push.personal.order", "push.order"})
+
 
 class MasterWebSocket:
     """Streams the master account's position changes.
@@ -58,6 +62,7 @@ class MasterWebSocket:
         secret: str,
         *,
         on_position: Callable[[dict[str, Any]], Awaitable[None]],
+        on_order: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_stop_order: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
         on_resync: Callable[[], Awaitable[None]] | None = None,
         on_status: Callable[[str], Awaitable[None]] | None = None,
@@ -66,6 +71,7 @@ class MasterWebSocket:
         self._api_key = api_key
         self._secret = secret
         self._on_position = on_position
+        self._on_order = on_order
         self._on_stop_order = on_stop_order
         self._on_resync = on_resync
         self._on_status = on_status
@@ -186,6 +192,11 @@ class MasterWebSocket:
 
             payload = json.loads(msg.data)
             channel = payload.get("channel")
+            if channel in ORDER_CHANNELS:
+                if self._on_order:
+                    await self._on_order(payload.get("data") or {})
+                continue
+
             if channel in STOP_CHANNELS:
                 if self._on_stop_order:
                     await self._on_stop_order(channel, payload.get("data") or {})

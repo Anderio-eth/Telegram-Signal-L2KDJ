@@ -72,6 +72,8 @@ SIDE_CLOSE_SHORT = 2
 SIDE_CLOSE_LONG = 3
 SIDE_OPEN_SHORT = 4
 
+ORDER_TYPE_LIMIT = 1
+ORDER_TYPE_POST_ONLY = 2
 ORDER_TYPE_MARKET = 5
 
 OPEN_TYPE_ISOLATED = 1
@@ -360,7 +362,31 @@ class MexcRestClient:
             body["stopLossPrice"] = stop_loss_price
         if take_profit_price:
             body["takeProfitPrice"] = take_profit_price
+        if order_type != ORDER_TYPE_MARKET and price is None:
+            # A limit order without a price is not an order MEXC can place; failing here names the
+            # problem instead of letting the venue reject it with something less specific.
+            raise MexcError(None, "limit order requires a price", endpoint="/private/order/submit")
         return await self._request("POST", "/private/order/submit", body=body)
+
+    async def cancel_orders(self, order_ids: list[str | int]) -> Any:
+        """Cancel specific orders by id.
+
+        Used to pull a follower's resting copy when the master pulls theirs. Cancelling by id
+        rather than cancel-all, because a follower may be holding resting orders from other
+        symbols or from an earlier mirrored trade that is still perfectly valid.
+        """
+        if not order_ids:
+            return None
+        return await self._request(
+            "POST", "/private/order/cancel", body=[int(o) for o in order_ids]
+        )
+
+    async def cancel_all_orders(self, symbol: str | None = None) -> Any:
+        """Every open order, optionally on one symbol. The blunt instrument, for emergencies."""
+        body: dict[str, Any] = {}
+        if symbol:
+            body["symbol"] = symbol
+        return await self._request("POST", "/private/order/cancel_all", body=body)
 
     async def close_all(self, symbol: str | None = None) -> Any:
         """Close every position on a symbol.

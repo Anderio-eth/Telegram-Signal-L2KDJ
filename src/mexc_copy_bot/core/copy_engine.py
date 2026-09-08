@@ -20,6 +20,7 @@ Two rules drive the whole design:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
 import uuid
@@ -29,12 +30,14 @@ import aiohttp
 
 from ..db.store import Account, PositionRow, Store
 from ..mexc.rest import (
+    ORDER_TYPE_LIMIT,
     SIDE_OPEN_LONG,
     SIDE_OPEN_SHORT,
     MexcError,
     MexcRestClient,
     get_contract_specs,
 )
+from .orders import MasterOrder
 from .events import Action, MasterEvent
 
 LOGGER = logging.getLogger(__name__)
@@ -157,6 +160,83 @@ class CopyEngine:
                 LOGGER.exception("follower %s crashed", follower.id, exc_info=result)
                 out.append(FollowerResult(follower, False, event.action, 0.0, str(result)[:200]))
         return out
+
+    async def mirror_resting_order(
+        self, order: MasterOrder, followers: list[Account], *, reverse: bool = False
+    ) -> list[tuple[Account, str | None, str | None]]:
+        """Place each follower's own copy of a resting master order.
+
+        The point of the whole exercise: the follower's limit sits in the book at the master's
+        price and fills alongside it, instead of the bot noticing the master's fill afterwards and
+        paying the spread and taker fee to catch up.
+
+        Returns (account, follower order id, error) per account.
+        """
+        async def one(follower: Account) -> tuple[Account, str | None, str | None]:
+            credentials = await self._store.get_credentials(follower.id, follower.owner_id)
+            if not credentials:
+                return follower, None, "credentials missing"
+            client = MexcRestClient(*credentials, session=self._session)
+            side = order.side
+            if reverse:
+                # Opposite side of the same book. Not a price change: both accounts want the same
+                # price, they just want opposite exposure at it.
+                side = {1: 4, 4: 1, 2: 3, 3: 2}[order.side]
+            try:
+                if order.leverage:
+                    position_type = order.position_type
+                    with contextlib.suppress(MexcError):
+                        await client.set_leverage(
+                            position_id=None, leverage=order.leverage,
+                            open_type=order.open_type, symbol=order.symbol,
+                            position_type=position_type,
+                        )
+                result = await client.submit_order(
+                    symbol=order.symbol,
+                    side=side,
+                    vol=order.vol * follower.size_multiplier,
+                    leverage=order.leverage or None,
+                    open_type=order.open_type,
+                    order_type=ORDER_TYPE_LIMIT,
+                    price=order.price,
+                    external_oid=f"lm{order.order_id}-{follower.id}-{uuid.uuid4().hex[:6]}",
+                )
+                # MEXC returns the new order id as the bare payload.
+                return follower, str(result) if result is not None else None, None
+            except MexcError as err:
+                return follower, None, err.message or str(err)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                return follower, None, f"network: {err}"
+
+        results = await asyncio.gather(*(one(f) for f in followers), return_exceptions=True)
+        out: list[tuple[Account, str | None, str | None]] = []
+        for follower, res in zip(followers, results, strict=True):
+            if isinstance(res, tuple):
+                out.append(res)
+            else:
+                LOGGER.exception("follower %s crashed placing a limit", follower.id, exc_info=res)
+                out.append((follower, None, str(res)[:200]))
+        return out
+
+    async def cancel_mirrored_orders(self, pairs: list[tuple[Account, str]]) -> int:
+        """Pull the followers' copies. Best effort: an order that already filled or was cancelled
+        by hand is not an error worth surfacing."""
+        async def one(follower: Account, order_id: str) -> bool:
+            credentials = await self._store.get_credentials(follower.id, follower.owner_id)
+            if not credentials:
+                return False
+            client = MexcRestClient(*credentials, session=self._session)
+            try:
+                await client.cancel_orders([order_id])
+                return True
+            except MexcError as err:
+                LOGGER.info("follower %s cancel failed: %s", follower.id, err.message)
+                return False
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                return False
+
+        results = await asyncio.gather(*(one(f, o) for f, o in pairs), return_exceptions=True)
+        return sum(1 for r in results if r is True)
 
     async def _blocked_contract_reason(self, event: MasterEvent) -> str | None:
         """Whether MEXC forbids API orders on this contract, as a message worth showing.
