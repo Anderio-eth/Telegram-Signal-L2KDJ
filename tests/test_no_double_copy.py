@@ -33,12 +33,8 @@ LONG = 1
 
 
 class FakeStore:
-    """Only what the handlers touch. mirror_limits is on: that is the case under test."""
+    """Only what the handlers touch."""
 
-    def __init__(self):
-        self.mirror = True
-
-    async def get_mirror_limits(self, owner_id): return self.mirror
     async def get_mode(self, owner_id): return ("COPY", None)
     async def list_accounts(self, owner_id, kind=None): return []
     async def record_mirrored_order(self, **kw): pass
@@ -129,21 +125,6 @@ def test_a_later_unrelated_trade_is_copied_normally(monkeypatch):
     asyncio.run(scenario())
     assert len(dispatched) == 1
     assert dispatched[0].delta_vol == pytest.approx(7.0)
-
-
-def test_with_mirroring_off_nothing_is_discounted(monkeypatch):
-    """The old behaviour has to stay exactly as it was while the toggle is off."""
-    svc, dispatched = service(monkeypatch)
-    svc._store.mirror = False
-
-    async def scenario():
-        await svc._handle_order(order_frame(STATE_RESTING))
-        await svc._handle_order(order_frame(STATE_FILLED))
-        await svc._handle_position(position_frame(12))
-
-    asyncio.run(scenario())
-    assert len(dispatched) == 1
-    assert dispatched[0].delta_vol == 12
 
 
 def test_a_reconnect_drops_any_pending_discount(monkeypatch):

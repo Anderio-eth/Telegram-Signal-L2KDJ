@@ -197,9 +197,8 @@ CREATE TABLE IF NOT EXISTS copy_state (
     -- Which follower takes the opposite side in REVERSE mode. Cleared if that account is
     -- deleted, which leaves the mode unconfigured rather than silently retargeting someone else.
     reverse_account_id BIGINT REFERENCES copy_accounts(id) ON DELETE SET NULL,
-    -- Mirror the master's RESTING limit orders as resting limit orders, instead of waiting for
-    -- them to fill and then chasing with a market order. Off by default: it changes what gets
-    -- sent to nine live accounts, so it is switched on deliberately after a small test.
+    -- Unused. Limit mirroring is unconditional; this column is kept only so an older database
+    -- does not need a destructive migration to drop it.
     mirror_limits BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );

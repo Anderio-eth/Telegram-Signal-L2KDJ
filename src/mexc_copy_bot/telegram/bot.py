@@ -289,13 +289,6 @@ class CopyBot:
             )
         elif action == "mode":
             await self._show_mode(update, owner_id)
-        elif action == "toggle_limits":
-            if await self._refuse_while_running(update, owner_id):
-                return
-            await self._store.set_mirror_limits(
-                owner_id, not await self._store.get_mirror_limits(owner_id)
-            )
-            await self._show_mode(update, owner_id)
         elif action == "mode_copy":
             if await self._refuse_while_running(update, owner_id):
                 return
@@ -370,12 +363,7 @@ class CopyBot:
         mode, reverse_id = await self._store.get_mode(owner_id)
         followers = await self._store.list_accounts(owner_id, FOLLOWER)
         chosen = next((f for f in followers if f.id == reverse_id), None)
-        limits = await self._store.get_mirror_limits(owner_id)
-
-        rows = [[InlineKeyboardButton(
-            "📌 Limit mirroring: ON" if limits else "📌 Limit mirroring: OFF",
-            callback_data="toggle_limits",
-        )]]
+        rows = []
         if mode != MODE_COPY:
             rows.append([InlineKeyboardButton("📋 Switch to COPY", callback_data="mode_copy")])
         rows.append(
@@ -387,7 +375,7 @@ class CopyBot:
         rows.append([InlineKeyboardButton("« Back", callback_data="menu")])
 
         await update.callback_query.edit_message_text(
-            messages.mode_screen(mode, chosen, followers, limits),
+            messages.mode_screen(mode, chosen, followers),
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
         )

@@ -273,6 +273,20 @@ class MexcRestClient:
                 LOGGER.debug("unparseable closed position row: %s", row)
         return out
 
+    async def get_open_orders(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """Orders currently resting in the book. This is how a limit becomes visible before it
+        fills — the position feed says nothing until it already has."""
+        path = f"/private/order/list/open_orders/{symbol}" if symbol else "/private/order/list/open_orders"
+        return await self._request("GET", path) or []
+
+    async def get_recent_orders(self, page_size: int = 20) -> list[dict[str, Any]]:
+        """Recently finished orders, newest first. Used to tell a fill from a cancel once an order
+        has left the book — the two need opposite reactions and look identical from outside."""
+        return await self._request(
+            "GET", "/private/order/list/history_orders",
+            params={"page_num": 1, "page_size": page_size},
+        ) or []
+
     async def get_stop_orders(self, symbol: str | None = None) -> list[PositionStops]:
         """Live stop-loss / take-profit entries. Unfinished ones only — a triggered stop is
         history, and mirroring it would put a stop on a position that is already gone."""

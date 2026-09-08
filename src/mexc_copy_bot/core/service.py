@@ -38,6 +38,11 @@ LOGGER = logging.getLogger(__name__)
 # never redraws itself.
 CONNECT_TIMEOUT_SECONDS = 12.0
 
+# How often the master's resting orders are re-read. Limit mirroring is only worth anything if
+# the follower's order is in the book at about the same time as the master's, so this is fast.
+# It is one request per second against an endpoint that has no per-order cost.
+ORDER_POLL_SECONDS = 1.0
+
 ReportCallback = Callable[[MasterEvent, list[FollowerResult]], Awaitable[None]]
 NoticeCallback = Callable[[str], Awaitable[None]]
 
@@ -77,6 +82,9 @@ class CopyService:
         # placed ahead of it, and again as a market order chasing the result.
         self._filled_by_limit: dict[tuple[str, int], float] = {}
         self._reconcile_task: asyncio.Task[None] | None = None
+        self._order_poll_task: asyncio.Task[None] | None = None
+        # Master order ids currently resting in the book, as of the last poll.
+        self._resting: set[str] = set()
         # Events are handled one at a time. Master actions arrive in order and often in bursts
         # (three orders filling one position); processing them concurrently would race the
         # position diff and could mirror the same delta twice.
@@ -124,6 +132,7 @@ class CopyService:
         )
         self._ws.start()
         self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
+        self._order_poll_task = asyncio.create_task(self._order_poll_loop(), name="orders")
         await self._store.set_running(self._owner_id, True)
 
         if await self._ws.wait_connected(CONNECT_TIMEOUT_SECONDS):
@@ -135,11 +144,13 @@ class CopyService:
 
     async def stop(self) -> str:
         """Stop copying NEW actions. Existing follower positions are left untouched (spec §7)."""
-        if self._reconcile_task:
-            self._reconcile_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reconcile_task
-            self._reconcile_task = None
+        for name in ("_reconcile_task", "_order_poll_task"):
+            task = getattr(self, name)
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                setattr(self, name, None)
         if self._ws:
             await self._ws.stop()
             self._ws = None
@@ -206,6 +217,7 @@ class CopyService:
         # and any fill we were about to discount has already been folded into the fresh baseline.
         self._order_tracker.reset()
         self._filled_by_limit.clear()
+        self._resting.clear()
         self._tracker.resync(
             [
                 PositionSnapshot(
@@ -352,9 +364,6 @@ class CopyService:
             order.state, order.price, order.vol, order.deal_vol,
         )
 
-        if not await self._store.get_mirror_limits(self._owner_id):
-            return
-
         async with self._lock:
             event = self._order_tracker.apply(order)
             if event is None:
@@ -372,6 +381,105 @@ class CopyService:
                 self._filled_by_limit[key] = self._filled_by_limit.get(key, 0.0) + filled
                 await self._store.clear_mirrored_order(self._owner_id, order.order_id)
                 LOGGER.info("limit fill of %s on %s discounted from the position path", filled, key)
+
+    async def _master_client(self) -> MexcRestClient | None:
+        master = await self._store.get_master(self._owner_id)
+        if not master or not self._session:
+            return None
+        credentials = await self._store.get_credentials(master.id, self._owner_id)
+        if not credentials:
+            return None
+        return MexcRestClient(*credentials, session=self._session)
+
+    async def _order_poll_loop(self) -> None:
+        """Read the master's resting orders over REST, continuously.
+
+        The websocket order channel is also handled, but this is the path that is known to work:
+        the endpoint and its exact fields were verified against the live account, while MEXC's
+        documentation has already been wrong twice about channel names. Both feed the same tracker,
+        so whichever notices an order first, it is still mirrored exactly once.
+        """
+        # Seed silently. Orders already resting when copying starts have either been mirrored
+        # already or belong to before the bot's time; either way, placing copies now would be
+        # wrong.
+        client = await self._master_client()
+        if client:
+            with contextlib.suppress(Exception):
+                self._resting = {str(o.get("orderId")) for o in await client.get_open_orders()}
+                LOGGER.info("seeded with %d resting master order(s)", len(self._resting))
+
+        while True:
+            await asyncio.sleep(ORDER_POLL_SECONDS)
+            try:
+                await self._poll_orders_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — polling must never kill the service
+                LOGGER.exception("order poll failed")
+
+    async def _poll_orders_once(self) -> None:
+        client = await self._master_client()
+        if not client:
+            return
+        try:
+            live = await client.get_open_orders()
+        except MexcError as err:
+            LOGGER.info("could not read master orders: %s", err)
+            return
+
+        by_id = {str(o.get("orderId")): o for o in live}
+        appeared = set(by_id) - self._resting
+        vanished = self._resting - set(by_id)
+        self._resting = set(by_id)
+
+        for order_id in appeared:
+            parsed = parse_order(by_id[order_id])
+            if not parsed:
+                continue
+            async with self._lock:
+                event = self._order_tracker.apply(parsed)
+                if event and event.action is OrderAction.PLACE:
+                    LOGGER.info("master placed %s %s @ %s", parsed.symbol, parsed.vol, parsed.price)
+                    await self._place_mirrored(parsed)
+
+        if vanished:
+            await self._resolve_vanished(client, vanished)
+
+    async def _resolve_vanished(self, client: MexcRestClient, order_ids: set[str]) -> None:
+        """An order left the book. Whether it filled or was cancelled decides everything.
+
+        A fill means the followers' copies filled too, and the position change that follows must
+        not be copied again. A cancel means their copies are still live and have to be pulled.
+        From the open-orders list alone the two are indistinguishable, so the finished order is
+        read back.
+        """
+        try:
+            recent = {str(o.get("orderId")): o for o in await client.get_recent_orders()}
+        except MexcError as err:
+            LOGGER.warning("could not resolve %d vanished order(s): %s", len(order_ids), err)
+            return
+
+        for order_id in order_ids:
+            row = recent.get(order_id)
+            if not row:
+                LOGGER.info("order %s vanished but is not in recent history yet", order_id)
+                continue
+            parsed = parse_order(row)
+            if not parsed:
+                continue
+            async with self._lock:
+                event = self._order_tracker.apply(parsed)
+                if not event:
+                    continue
+                if event.action is OrderAction.CANCEL:
+                    LOGGER.info("master cancelled %s; pulling the copies", order_id)
+                    await self._cancel_mirrored(order_id)
+                elif event.action is OrderAction.FILL:
+                    key = (parsed.symbol, parsed.position_type)
+                    filled = parsed.deal_vol or parsed.vol
+                    self._filled_by_limit[key] = self._filled_by_limit.get(key, 0.0) + filled
+                    await self._store.clear_mirrored_order(self._owner_id, order_id)
+                    LOGGER.info("master limit filled %s on %s; discounted", filled, key)
 
     async def _place_mirrored(self, order) -> None:
         followers = await self._eligible_followers()

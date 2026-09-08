@@ -249,24 +249,6 @@ class Store:
                 reverse_account_id,
             )
 
-    async def get_mirror_limits(self, owner_id: int) -> bool:
-        async with self._pool.acquire() as conn:
-            return bool(await conn.fetchval(
-                "SELECT mirror_limits FROM copy_state WHERE owner_id = $1", owner_id
-            ))
-
-    async def set_mirror_limits(self, owner_id: int, enabled: bool) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO copy_state (owner_id, mirror_limits) VALUES ($1, $2)
-                ON CONFLICT (owner_id) DO UPDATE
-                SET mirror_limits = EXCLUDED.mirror_limits, updated_at = now()
-                """,
-                owner_id,
-                enabled,
-            )
-
     # ── mirrored resting orders ──────────────────────────────────────────────────
     async def record_mirrored_order(
         self, *, owner_id: int, master_order_id: str, account_id: int,
