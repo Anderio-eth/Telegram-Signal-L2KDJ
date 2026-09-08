@@ -156,6 +156,55 @@ STRINGS: dict[str, dict[str, str]] = {
         UK: "Для реверсу потрібен другий акаунт. Спершу додай follower.",
         EN: "Reverse mode needs a second account to hedge on. Add a follower first.",
     },
+    # ── stuck accounts ─────────────────────────────────────────────────────
+    "btn_stuck": {UK: "⚠️ Завислі ({n})", EN: "⚠️ Stuck ({n})"},
+    "stuck_title": {UK: "⚠️ <b>ЗАВИСЛІ АКАУНТИ</b>", EN: "⚠️ <b>STUCK ACCOUNTS</b>"},
+    "stuck_none": {
+        UK: "⚠️ <b>ЗАВИСЛІ АКАУНТИ</b>\n\nЗараз таких немає — усі йдуть за майстром.",
+        EN: "⚠️ <b>STUCK ACCOUNTS</b>\n\nNone right now — every account is following the master.",
+    },
+    "stuck_kind_exit": {UK: "ВИХІД", EN: "EXIT"},
+    "stuck_kind_entry": {UK: "ВХІД", EN: "ENTRY"},
+    "stuck_group_head": {
+        UK: "<b>Група #{id}</b> · {kind} · {symbol} {side} · {time}",
+        EN: "<b>Group #{id}</b> · {kind} · {symbol} {side} · {time}",
+    },
+    "stuck_group_limit": {UK: "Лімітка на {price}", EN: "Limit at {price}"},
+    "stuck_group_nolimit": {UK: "Лімітки немає", EN: "No resting limit"},
+    "stuck_explain_exit": {
+        UK: "Тримають позицію, з якої майстер уже вийшов.",
+        EN: "Holding a position the master has already exited.",
+    },
+    "stuck_explain_entry": {
+        UK: "Не увійшли в позицію, яку майстер відкрив.",
+        EN: "Never entered the position the master opened.",
+    },
+    "btn_close_market": {UK: "💥 Закрити маркетом", EN: "💥 Close at market"},
+    "btn_enter_market": {UK: "💥 Увійти маркетом", EN: "💥 Enter at market"},
+    "btn_move_limit": {UK: "✏️ Змінити ціну лімітки", EN: "✏️ Move the limit"},
+    "btn_drop_entry": {UK: "🚫 Скасувати вхід", EN: "🚫 Cancel the entry"},
+    "pick_accounts": {
+        UK: "Обери акаунти. Позначені — ті, на яких дія виконається.",
+        EN: "Choose the accounts. Ticked ones are the ones that will be acted on.",
+    },
+    "btn_do_it": {UK: "✅ Виконати ({n})", EN: "✅ Do it ({n})"},
+    "nothing_selected": {UK: "Жодного акаунта не обрано", EN: "No accounts selected"},
+    "move_limit_title": {UK: "✏️ <b>ЗМІНИТИ ЦІНУ</b>", EN: "✏️ <b>MOVE THE LIMIT</b>"},
+    "move_limit_market": {UK: "Ринок:        <b>{price}</b>", EN: "Market:      <b>{price}</b>"},
+    "move_limit_current": {UK: "Ваша лімітка: <b>{price}</b>", EN: "Your limit:  <b>{price}</b>"},
+    "move_limit_ask": {
+        UK: "Надішли нову ціну повідомленням.",
+        EN: "Send the new price as a message.",
+    },
+    "move_limit_bad": {UK: "Це не схоже на ціну. Спробуй ще раз.", EN: "That is not a price. Try again."},
+    "done_title": {UK: "✅ <b>ГОТОВО</b>", EN: "✅ <b>DONE</b>"},
+    "back_under_master": {
+        UK: "Розрулені акаунти знову під майстром. У поточну його позицію вони не заходять — "
+            "чекають наступного входу.",
+        EN: "Sorted accounts are back under the master. They do not join the position it is "
+            "already in — they wait for the next entry.",
+    },
+
     "reverse_pick": {
         UK: "Який акаунт має відкривати <b>протилежну</b> сторону до майстра?",
         EN: "Which account should take the <b>opposite</b> side of the master?",

@@ -155,6 +155,48 @@ CREATE TABLE IF NOT EXISTS copy_mirrored_orders (
 
 CREATE INDEX IF NOT EXISTS copy_mirrored_orders_owner ON copy_mirrored_orders (owner_id, created_at DESC);
 
+-- Accounts that failed to follow the master and are now managed by hand.
+--
+-- A follower whose limit did not fill is not merely late: it holds something the master does not,
+-- or misses something the master has. Until that is resolved it must stop listening to the master
+-- entirely — otherwise the next master action lands on an account in a completely different state.
+--
+-- Grouped by the master action that stranded them, so the user can see which accounts are stuck on
+-- what. Several groups coexist: a later failure is its own group, never merged into an earlier one.
+CREATE TABLE IF NOT EXISTS copy_stuck_groups (
+    id             BIGSERIAL   PRIMARY KEY,
+    owner_id       BIGINT      NOT NULL,
+    symbol         TEXT        NOT NULL,
+    position_type  INTEGER     NOT NULL,
+    -- ENTRY: the buy never filled, so there is no position and a limit is still resting.
+    -- EXIT:  the sell never filled (or filled partly), so the position is still held.
+    kind           TEXT        NOT NULL CHECK (kind IN ('ENTRY', 'EXIT')),
+    -- The price their resting limit currently sits at. The user can move it.
+    limit_price    DOUBLE PRECISION,
+    leverage       INTEGER     NOT NULL DEFAULT 0,
+    open_type      INTEGER     NOT NULL DEFAULT 1,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at    TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS copy_stuck_groups_open
+    ON copy_stuck_groups (owner_id) WHERE resolved_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS copy_stuck_accounts (
+    group_id          BIGINT NOT NULL REFERENCES copy_stuck_groups(id) ON DELETE CASCADE,
+    account_id        BIGINT NOT NULL REFERENCES copy_accounts(id) ON DELETE CASCADE,
+    -- What is outstanding: still to close (EXIT) or still to enter (ENTRY). A partial close is
+    -- not a close, so this is the remainder, not the original size.
+    vol               DOUBLE PRECISION NOT NULL,
+    follower_order_id TEXT,
+    resolved_at       TIMESTAMPTZ,
+    PRIMARY KEY (group_id, account_id)
+);
+
+-- Which accounts are currently deaf to the master. Read on every master action, so it is indexed.
+CREATE INDEX IF NOT EXISTS copy_stuck_accounts_open
+    ON copy_stuck_accounts (account_id) WHERE resolved_at IS NULL;
+
 -- One row per (event, follower). The unique constraint is the second idempotency guard: even if
 -- an event were somehow processed twice, a follower cannot receive the same instruction twice.
 CREATE TABLE IF NOT EXISTS copy_tasks (

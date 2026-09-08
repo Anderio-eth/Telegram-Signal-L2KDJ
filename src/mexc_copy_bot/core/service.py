@@ -23,7 +23,15 @@ from dataclasses import dataclass, replace
 
 import aiohttp
 
-from ..db.store import FOLLOWER, MODE_REVERSE, Account, PositionRow, Store
+from ..db.store import (
+    FOLLOWER,
+    KIND_ENTRY,
+    KIND_EXIT,
+    MODE_REVERSE,
+    Account,
+    PositionRow,
+    Store,
+)
 from ..mexc.rest import MexcError, MexcRestClient, PositionStops
 from ..mexc.websocket import MasterWebSocket
 from .copy_engine import CopyEngine, FollowerResult
@@ -89,6 +97,12 @@ class CopyService:
         # Recorded when the copies are placed, because by the time it fills the master's
         # position is already gone and the question can no longer be answered.
         self._closing_intent: dict[str, int | None] = {}
+        # master order id -> volume each follower was asked for. Needed to tell a straggler
+        # from an account that was never in the trade at all.
+        self._mirrored_vol: dict[str, dict[int, float]] = {}
+        # master order id -> volume each follower was asked for. Needed to tell a straggler
+        # from an account that was never in the trade at all.
+        self._mirrored_vol: dict[str, dict[int, float]] = {}
         # Events are handled one at a time. Master actions arrive in order and often in bursts
         # (three orders filling one position); processing them concurrently would race the
         # position diff and could mirror the same delta twice.
@@ -234,6 +248,7 @@ class CopyService:
         # reconciler compares a real position against a blank row and reports drift on every
         # single mirrored trade — which is exactly what it did.
         await self._sync_expected(order, followers, results)
+        await self._detach_stragglers(order, followers, results)
 
         closing_side = self._closing_intent.pop(order.order_id, None)
         if closing_side is not None:
@@ -267,6 +282,70 @@ class CopyService:
             else:
                 lines.append(f"⏳ {follower.label} — ще не заповнилось")
         await self._notify("\n".join(lines))
+
+    async def _detach_stragglers(self, order, followers, results) -> None:
+        """Find the accounts that did not keep up, and take them out of the master's control.
+
+        The master's limit filled. Every follower had a copy at the same price, but one behind in
+        the queue may still be sitting there while the price walks away. That account now holds
+        something the master does not, or lacks something the master has, and must stop taking
+        instructions until a person sorts it out — otherwise the next master action lands on an
+        account in an entirely different state.
+        """
+        closing_side = self._closing_intent.get(order.order_id)
+        asked = self._mirrored_vol.pop(order.order_id, {})
+        order_ids = dict(await self._store.get_mirrored_orders(self._owner_id, order.order_id))
+
+        outstanding: list[tuple[int, float, str | None]] = []
+        labels: list[str] = []
+        for follower, res in zip(followers, results, strict=True):
+            if not isinstance(res, tuple):
+                continue
+            vol, error = res
+            if error or follower.id not in asked:
+                continue
+            if closing_side is not None:
+                # Meant to close. Whatever is still held is what did not close, and a partial
+                # close is not a close.
+                remaining = vol or 0.0
+            else:
+                # Meant to open. Whatever is missing from the requested size never filled.
+                remaining = max(0.0, asked[follower.id] - (vol or 0.0))
+            if remaining > 1e-9:
+                outstanding.append((follower.id, remaining, order_ids.get(follower.id)))
+                labels.append(follower.label)
+
+        if not outstanding:
+            return
+
+        kind = KIND_EXIT if closing_side is not None else KIND_ENTRY
+        group_id = await self._store.create_stuck_group(
+            owner_id=self._owner_id,
+            symbol=order.symbol,
+            position_type=closing_side if closing_side is not None else order.position_type,
+            kind=kind,
+            limit_price=order.price,
+            leverage=order.leverage,
+            open_type=order.open_type,
+            members=outstanding,
+        )
+        LOGGER.warning(
+            "group %s: %d account(s) stranded on %s (%s)",
+            group_id, len(outstanding), order.symbol, kind,
+        )
+        await self._notify(
+            "\n".join(
+                [
+                    f"⚠️ <b>ЗАВИСЛО {len(outstanding)} АКАУНТ(ІВ)</b>",
+                    "",
+                    f"<b>{order.symbol}</b> — лімітка не заповнилась.",
+                    ", ".join(labels),
+                    "",
+                    "Ці акаунти більше не слухають майстра, поки не розрулиш вручну.",
+                    "Меню → ⚠️ Завислі",
+                ]
+            )
+        )
 
     async def _sync_expected(self, order, followers, results) -> None:
         for follower, res in zip(followers, results, strict=True):
@@ -586,19 +665,20 @@ class CopyService:
                     asyncio.create_task(self._report_limit_fill(parsed))
 
     async def _place_mirrored(self, order) -> None:
-        followers = await self._eligible_followers()
+        assert self._session is not None
+
+        # Is the master getting OUT of something? On MEXC a close is expressed as an open on the
+        # opposite side, so this cannot be read off the order alone — it needs the master's
+        # position. Everything downstream depends on the answer, including who is eligible.
+        closing_side = await self._closing_side(order)
+
+        followers = await self._eligible_followers(
+            opening=closing_side is None, symbol=order.symbol
+        )
         if not followers:
             return
         mode, _ = await self._store.get_mode(self._owner_id)
         reverse = mode == MODE_REVERSE
-
-        assert self._session is not None
-
-        # Is the master getting OUT of something? If so, an account that never got in must not
-        # receive this order: on MEXC a close is expressed as an open on the opposite side, so
-        # mirroring it blindly would leave that account holding a fresh naked position facing the
-        # wrong way, with nothing to close it later.
-        closing_side = await self._closing_side(order)
         self._closing_intent[order.order_id] = closing_side
         vol_by_account: dict[int, float] | None = None
         skipped: list[str] = []
@@ -629,9 +709,15 @@ class CopyService:
         )
 
         placed, failed = 0, []
+        asked: dict[int, float] = {}
         for follower, follower_order_id, error in results:
             if follower_order_id:
                 placed += 1
+                asked[follower.id] = (
+                    vol_by_account[follower.id]
+                    if vol_by_account is not None
+                    else order.vol * follower.size_multiplier
+                )
                 await self._store.record_mirrored_order(
                     owner_id=self._owner_id, master_order_id=order.order_id,
                     account_id=follower.id, follower_order_id=follower_order_id,
@@ -639,6 +725,8 @@ class CopyService:
                 )
             else:
                 failed.append(f"{follower.label}: {error}")
+
+        self._mirrored_vol[order.order_id] = asked
 
         # Described by what it does, not by MEXC's side number: in one-way mode an exit is sent
         # as "open short", and reporting that literally is how a close reads as a new position.
@@ -704,13 +792,63 @@ class CopyService:
             f"Скасовано на {cancelled}/{len(todo)} акаунт(ах)."
         )
 
-    async def _eligible_followers(self) -> list[Account]:
-        """Whose accounts an action applies to, honouring the copy/hedge mode."""
+    async def _eligible_followers(self, *, opening: bool | None = None, symbol: str | None = None) -> list[Account]:
+        """Who an action from the master applies to. Every such action goes through here.
+
+        Three filters, in order of how badly getting them wrong would hurt:
+
+        1. Detached accounts are excluded outright. An account that failed to follow the master
+           holds something the master does not, or lacks something the master has; until that is
+           sorted out by hand it must hear nothing at all, on any symbol.
+
+        2. The mode decides whether this is a mirror or a one-account hedge.
+
+        3. An account only acts with the master when its position on this symbol already matches
+           the master's before the action. This is what stops a freshly un-stuck account from
+           diving into a position the master opened while it was stranded — the entry price is
+           gone, and it would be joining a trade half way through. It waits for the next one
+           instead, which by definition starts with both of them flat.
+        """
         active = [a for a in await self._store.list_accounts(self._owner_id, FOLLOWER) if a.active]
+
+        detached = await self._store.detached_account_ids(self._owner_id)
+        if detached:
+            skipped = [a.label for a in active if a.id in detached]
+            active = [a for a in active if a.id not in detached]
+            LOGGER.info("skipping detached accounts: %s", ", ".join(skipped))
+
         mode, reverse_account_id = await self._store.get_mode(self._owner_id)
         if mode == MODE_REVERSE:
-            return [a for a in active if a.id == reverse_account_id]
-        return active
+            active = [a for a in active if a.id == reverse_account_id]
+
+        if opening is None or symbol is None or not active:
+            return active
+
+        # Opening: the account must be flat here, or it is already in something of its own.
+        # Closing: it must be holding, or there is nothing of its to close.
+        matched = []
+        for follower in active:
+            held = await self._held_any(follower, symbol)
+            if (held <= 0) == opening:
+                matched.append(follower)
+            else:
+                LOGGER.info(
+                    "%s is out of step on %s (holds %g, master is %s); waiting for the next trade",
+                    follower.label, symbol, held, "opening" if opening else "closing",
+                )
+        return matched
+
+    async def _held_any(self, follower: Account, symbol: str) -> float:
+        """Total this account holds on a symbol, either side."""
+        credentials = await self._store.get_credentials(follower.id, follower.owner_id)
+        if not credentials or not self._session:
+            return 0.0
+        client = MexcRestClient(*credentials, session=self._session)
+        try:
+            positions = await client.get_open_positions(symbol)
+        except MexcError:
+            return 0.0
+        return sum(p.hold_vol for p in positions if p.hold_vol > 0)
 
     async def _handle_position(self, data: dict) -> None:
         snapshot = parse_position(data)
@@ -759,23 +897,20 @@ class CopyService:
             LOGGER.info("duplicate master event ignored: %s", event.dedupe_key)
             return
 
-        active = [a for a in await self._store.list_accounts(self._owner_id, FOLLOWER) if a.active]
-        mode, reverse_account_id = await self._store.get_mode(self._owner_id)
+        mode, _ = await self._store.get_mode(self._owner_id)
         reverse = mode == MODE_REVERSE
-
-        if reverse:
-            # Exactly one account hedges the master. If it was deleted or deactivated, do nothing
-            # and say so: quietly falling back to copying every follower would open positions on
-            # the same side as the master, the precise opposite of what was asked for.
-            followers = [a for a in active if a.id == reverse_account_id]
-            if not followers:
-                LOGGER.warning("reverse mode has no usable account for owner %s", self._owner_id)
-                await self._notice(
-                    "⚠️ Увімкнено реверс, але його акаунт відсутній або на паузі — нічого не скопійовано."
-                )
-                return
-        else:
-            followers = active
+        followers = await self._eligible_followers(
+            opening=event.action is not Action.CLOSE, symbol=event.symbol
+        )
+        if reverse and not followers:
+            # Exactly one account hedges the master. If it was deleted, paused or stranded, do
+            # nothing and say so: quietly falling back to every follower would open positions on
+            # the same side as the master, the precise opposite of what reverse is for.
+            LOGGER.warning("reverse mode has no usable account for owner %s", self._owner_id)
+            await self._notice(
+                "⚠️ Увімкнено реверс, але його акаунт відсутній, на паузі або завис — нічого не скопійовано."
+            )
+            return
 
         if not followers:
             LOGGER.info("no active followers for event %s", event_id)

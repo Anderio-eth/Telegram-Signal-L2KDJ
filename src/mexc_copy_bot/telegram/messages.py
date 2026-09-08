@@ -241,6 +241,39 @@ def mode_screen(
     return "\n".join(lines)
 
 
+def stuck_screen(groups: list, lang: str = DEFAULT) -> str:
+    """Every group of stranded accounts, with what is outstanding on each.
+
+    Groups are never merged: a later failure is its own group, so it stays obvious which accounts
+    are stuck on which trade rather than becoming one undifferentiated pile.
+    """
+    if not groups:
+        return t(lang, "stuck_none")
+
+    lines = [t(lang, "stuck_title"), ""]
+    for group in groups:
+        kind = t(lang, "stuck_kind_entry" if group.is_entry else "stuck_kind_exit")
+        lines.append(
+            t(
+                lang, "stuck_group_head",
+                id=group.id, kind=kind, symbol=group.symbol,
+                side=side_name(group.position_type),
+                time=group.created_at.strftime("%H:%M"),
+            )
+        )
+        lines.append(
+            t(lang, "stuck_group_limit", price=f"{group.limit_price:g}")
+            if group.limit_price
+            else t(lang, "stuck_group_nolimit")
+        )
+        lines.append(t(lang, "stuck_explain_entry" if group.is_entry else "stuck_explain_exit"))
+        for member in group.members:
+            lines.append(f"     • {member.label} — {member.vol:g}")
+        lines.append("")
+    lines.append(t(lang, "back_under_master"))
+    return "\n".join(lines)
+
+
 def accounts_list(master: Account | None, followers: list[Account], lang: str = DEFAULT) -> str:
     lines = [t(lang, "accounts_title"), ""]
     if master:

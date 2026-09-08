@@ -53,6 +53,37 @@ class Account:
         return self.kind == MASTER
 
 
+KIND_ENTRY = "ENTRY"
+KIND_EXIT = "EXIT"
+
+
+@dataclass(frozen=True)
+class StuckMember:
+    account_id: int
+    label: str
+    vol: float
+    follower_order_id: str | None
+
+
+@dataclass(frozen=True)
+class StuckGroup:
+    """Accounts stranded by one master action, and what is outstanding on each."""
+
+    id: int
+    symbol: str
+    position_type: int
+    kind: str
+    limit_price: float | None
+    leverage: int
+    open_type: int
+    created_at: object
+    members: list[StuckMember]
+
+    @property
+    def is_entry(self) -> bool:
+        return self.kind == KIND_ENTRY
+
+
 @dataclass(frozen=True)
 class PositionRow:
     account_id: int
@@ -265,6 +296,133 @@ class Store:
                 owner_id,
                 language,
             )
+
+    # ── stuck accounts ──────────────────────────────────────────────────────────────────────
+    async def create_stuck_group(
+        self,
+        *,
+        owner_id: int,
+        symbol: str,
+        position_type: int,
+        kind: str,
+        limit_price: float | None,
+        leverage: int,
+        open_type: int,
+        members: list[tuple[int, float, str | None]],
+    ) -> int:
+        """Record accounts stranded by one master action. Returns the group id."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                group_id = await conn.fetchval(
+                    """
+                    INSERT INTO copy_stuck_groups
+                        (owner_id, symbol, position_type, kind, limit_price, leverage, open_type)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    RETURNING id
+                    """,
+                    owner_id, symbol, position_type, kind, limit_price, leverage, open_type,
+                )
+                await conn.executemany(
+                    "INSERT INTO copy_stuck_accounts (group_id, account_id, vol, follower_order_id)"
+                    " VALUES ($1, $2, $3, $4)",
+                    [(group_id, account_id, vol, order_id) for account_id, vol, order_id in members],
+                )
+        return group_id
+
+    async def list_stuck_groups(self, owner_id: int) -> list[StuckGroup]:
+        """Unresolved groups, oldest first, each with the accounts still outstanding."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT g.id, g.symbol, g.position_type, g.kind, g.limit_price, g.leverage,
+                       g.open_type, g.created_at,
+                       s.account_id, s.vol, s.follower_order_id, a.label
+                FROM copy_stuck_groups g
+                JOIN copy_stuck_accounts s ON s.group_id = g.id AND s.resolved_at IS NULL
+                JOIN copy_accounts a ON a.id = s.account_id
+                WHERE g.owner_id = $1 AND g.resolved_at IS NULL
+                ORDER BY g.created_at, s.account_id
+                """,
+                owner_id,
+            )
+        groups: dict[int, StuckGroup] = {}
+        for r in rows:
+            group = groups.get(r["id"])
+            if group is None:
+                group = StuckGroup(
+                    id=r["id"], symbol=r["symbol"], position_type=r["position_type"],
+                    kind=r["kind"], limit_price=r["limit_price"], leverage=r["leverage"],
+                    open_type=r["open_type"], created_at=r["created_at"], members=[],
+                )
+                groups[r["id"]] = group
+            group.members.append(
+                StuckMember(r["account_id"], r["label"], r["vol"], r["follower_order_id"])
+            )
+        return list(groups.values())
+
+    async def get_stuck_group(self, owner_id: int, group_id: int) -> StuckGroup | None:
+        for group in await self.list_stuck_groups(owner_id):
+            if group.id == group_id:
+                return group
+        return None
+
+    async def detached_account_ids(self, owner_id: int) -> set[int]:
+        """Accounts currently deaf to the master.
+
+        Checked before every master action, which is why it is one query rather than a walk over
+        the groups: a miss here means a stranded account receives an instruction meant for an
+        account in a completely different state.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT s.account_id
+                FROM copy_stuck_accounts s
+                JOIN copy_stuck_groups g ON g.id = s.group_id
+                WHERE g.owner_id = $1 AND s.resolved_at IS NULL AND g.resolved_at IS NULL
+                """,
+                owner_id,
+            )
+        return {r["account_id"] for r in rows}
+
+    async def resolve_stuck_accounts(self, group_id: int, account_ids: list[int]) -> None:
+        """Mark accounts as sorted out. A group with nobody left is closed too."""
+        if not account_ids:
+            return
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE copy_stuck_accounts SET resolved_at = now()"
+                    " WHERE group_id = $1 AND account_id = ANY($2) AND resolved_at IS NULL",
+                    group_id, account_ids,
+                )
+                await conn.execute(
+                    """
+                    UPDATE copy_stuck_groups SET resolved_at = now()
+                    WHERE id = $1 AND resolved_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM copy_stuck_accounts
+                          WHERE group_id = $1 AND resolved_at IS NULL
+                      )
+                    """,
+                    group_id,
+                )
+
+    async def set_stuck_limit(
+        self, group_id: int, price: float, order_ids: dict[int, str | None]
+    ) -> None:
+        """Record a moved limit: the group's new price and each account's new order id."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "UPDATE copy_stuck_groups SET limit_price = $2 WHERE id = $1", group_id, price
+                )
+                for account_id, order_id in order_ids.items():
+                    await conn.execute(
+                        "UPDATE copy_stuck_accounts SET follower_order_id = $3"
+                        " WHERE group_id = $1 AND account_id = $2",
+                        group_id, account_id, order_id,
+                    )
 
     # ── mirrored resting orders ──────────────────────────────────────────────────
     async def record_mirrored_order(

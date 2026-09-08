@@ -39,6 +39,7 @@ from ..config import Settings
 from ..core.copy_engine import FollowerResult
 from ..core.events import MasterEvent
 from ..core.registry import ServiceRegistry
+from ..core.stuck import StuckManager
 from ..db.store import FOLLOWER, MASTER, MODE_COPY, MODE_REVERSE, Account, Store
 from ..mexc.rest import MexcError, MexcRestClient, get_contract_specs, get_ticker_price
 from . import messages
@@ -49,6 +50,14 @@ LOGGER = logging.getLogger(__name__)
 # Conversation states for adding an account.
 ASK_KEY, ASK_SECRET = range(2)
 
+# Its own conversation: moving a limit asks for a number, and it must not be confused with the
+# key/secret flow, which is waiting for text of a completely different kind.
+ASK_PRICE = 100
+
+# Written out rather than inlined: patching this file has twice turned an escaped newline into
+# a real one, which is a syntax error that only shows up at import time.
+NEWLINE = chr(10)
+
 # How long a balance reading stays good enough to reuse. Tapping around the menu should not fire
 # ten exchange calls per screen; five seconds is under the time it takes to read the menu, so what
 # you see is still effectively live, while a burst of taps costs one round of calls instead of one
@@ -56,7 +65,7 @@ ASK_KEY, ASK_SECRET = range(2)
 BALANCE_TTL_SECONDS = 5.0
 
 
-def _menu_keyboard(running: bool, lang: str) -> InlineKeyboardMarkup:
+def _menu_keyboard(running: bool, lang: str, stuck: int = 0) -> InlineKeyboardMarkup:
     control = (
         InlineKeyboardButton(t(lang, "btn_stop"), callback_data="stop")
         if running
@@ -73,6 +82,9 @@ def _menu_keyboard(running: bool, lang: str) -> InlineKeyboardMarkup:
             [control],
             [InlineKeyboardButton(t(lang, "btn_emergency"), callback_data="emergency")],
         ]
+        # Shown only when it means something. A permanent "Stuck (0)" is noise that teaches
+        # people to stop reading the row it sits in.
+        + ([[InlineKeyboardButton(t(lang, "btn_stuck", n=stuck), callback_data="stuck")]] if stuck else [])
     )
 
 
@@ -103,6 +115,8 @@ class CopyBot:
         # Language per owner, read once and kept: it is needed by every screen and every
         # notice, and a database round trip per line of text would be absurd.
         self._lang_cache: dict[int, str] = {}
+        # Sessions opened for stuck-account work while copying is stopped, closed on shutdown.
+        self._own_sessions: list[aiohttp.ClientSession] = []
 
         registry.configure_callbacks(on_report=self._report_for, on_notice=self._notice_for)
 
@@ -131,8 +145,20 @@ class CopyBot:
             per_message=False,
         )
 
+        price_conversation = ConversationHandler(
+            entry_points=[CallbackQueryHandler(self._begin_price, pattern=r"^sme:\d+$")],
+            states={ASK_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_price)]},
+            fallbacks=[
+                CommandHandler("cancel", self._cancel_add),
+                CallbackQueryHandler(self._abandon_and_dispatch),
+            ],
+            allow_reentry=True,
+            per_message=False,
+        )
+
         app.add_handler(CommandHandler("start", self._cmd_start))
         app.add_handler(add_conversation)
+        app.add_handler(price_conversation)
         app.add_handler(CallbackQueryHandler(self._on_button))
         self._app = app
         return app
@@ -241,7 +267,9 @@ class CopyBot:
     async def _show_menu(self, update: Update, owner_id: int) -> None:
         service = await self._registry.get(owner_id)
         text = await self._menu_text(owner_id)
-        keyboard = _menu_keyboard(service.running, await self._lang(owner_id))
+        keyboard = _menu_keyboard(
+            service.running, await self._lang(owner_id), await self._stuck_count(owner_id)
+        )
         if update.callback_query:
             await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         elif update.message:
@@ -308,6 +336,28 @@ class CopyBot:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(self._lang_now(owner_id), "btn_back"), callback_data="menu")]]),
                 parse_mode=ParseMode.HTML,
             )
+        elif action == "stuck":
+            await self._show_stuck(update, owner_id)
+        elif action.startswith("sg:"):
+            _, gid, what = action.split(":")
+            context.user_data["picked"] = None
+            await self._show_picker(update, owner_id, int(gid), what, context)
+        elif action.startswith("sp:"):
+            _, gid, what, acc = action.split(":")
+            picked = context.user_data.get("picked")
+            group = await self._store.get_stuck_group(owner_id, int(gid))
+            if group:
+                if picked is None:
+                    picked = {m.account_id for m in group.members}
+                picked = set(picked)
+                picked.symmetric_difference_update({int(acc)})
+                context.user_data["picked"] = picked
+            await self._show_picker(update, owner_id, int(gid), what, context)
+        elif action.startswith("sx:"):
+            _, gid, what = action.split(":")
+            await self._run_stuck_action(update, owner_id, int(gid), what, context)
+        elif action.startswith("sm:"):
+            await self._show_move_limit(update, owner_id, int(action.split(":")[1]))
         elif action == "lang":
             current = await self._lang(owner_id)
             new = EN if current == UK else UK
@@ -366,7 +416,9 @@ class CopyBot:
         await self._app.bot.send_message(
             chat_id,
             await self._menu_text(owner_id),
-            reply_markup=_menu_keyboard(service.running, await self._lang(owner_id)),
+            reply_markup=_menu_keyboard(
+                service.running, await self._lang(owner_id), await self._stuck_count(owner_id)
+            ),
             parse_mode=ParseMode.HTML,
         )
 
@@ -428,6 +480,193 @@ class CopyBot:
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
         )
+
+    async def _stuck_count(self, owner_id: int) -> int:
+        return sum(len(g.members) for g in await self._store.list_stuck_groups(owner_id))
+
+    async def _show_stuck(self, update: Update, owner_id: int) -> None:
+        lang = await self._lang(owner_id)
+        groups = await self._store.list_stuck_groups(owner_id)
+        rows = []
+        for group in groups:
+            if group.is_entry:
+                rows.append([
+                    InlineKeyboardButton(t(lang, "btn_enter_market"), callback_data=f"sg:{group.id}:enter"),
+                    InlineKeyboardButton(t(lang, "btn_drop_entry"), callback_data=f"sg:{group.id}:drop"),
+                ])
+            else:
+                rows.append([
+                    InlineKeyboardButton(t(lang, "btn_close_market"), callback_data=f"sg:{group.id}:close"),
+                ])
+            rows.append([InlineKeyboardButton(t(lang, "btn_move_limit"), callback_data=f"sm:{group.id}")])
+        rows.append([InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu")])
+        await update.callback_query.edit_message_text(
+            messages.stuck_screen(groups, lang),
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _show_picker(
+        self, update: Update, owner_id: int, group_id: int, what: str,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Tick-list of the group's accounts. Everyone is ticked to begin with, because acting on
+        all of them is the common case and un-ticking is the exception."""
+        lang = await self._lang(owner_id)
+        group = await self._store.get_stuck_group(owner_id, group_id)
+        if not group:
+            await self._show_stuck(update, owner_id)
+            return
+        picked = self._picked(context, group)
+
+        rows = [
+            [InlineKeyboardButton(
+                f"{'☑️' if m.account_id in picked else '⬜️'} {m.label} — {m.vol:g}",
+                callback_data=f"sp:{group_id}:{what}:{m.account_id}",
+            )]
+            for m in group.members
+        ]
+        rows.append([InlineKeyboardButton(
+            t(lang, "btn_do_it", n=len(picked)), callback_data=f"sx:{group_id}:{what}"
+        )])
+        rows.append([InlineKeyboardButton(t(lang, "btn_back"), callback_data="stuck")])
+        await update.callback_query.edit_message_text(
+            t(lang, "pick_accounts"), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML
+        )
+
+    @staticmethod
+    def _picked(context: ContextTypes.DEFAULT_TYPE, group) -> set[int]:
+        """Who is currently ticked. Absent means "nobody has touched it", which is everyone."""
+        picked = context.user_data.get("picked")
+        if picked is None:
+            return {m.account_id for m in group.members}
+        return set(picked)
+
+    async def _stuck_manager(self, owner_id: int) -> StuckManager | None:
+        """Actions on stranded accounts need an HTTP session. Borrow the running service's when
+        there is one; otherwise these buttons must still work while copying is stopped, which is
+        exactly when someone is most likely to be sorting a mess out."""
+        service = await self._registry.get(owner_id)
+        session = getattr(service, "_session", None)
+        if session is None or session.closed:
+            session = aiohttp.ClientSession()
+            self._own_sessions.append(session)
+        return StuckManager(self._store, session, owner_id)
+
+    async def _run_stuck_action(
+        self, update: Update, owner_id: int, group_id: int, what: str,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        lang = await self._lang(owner_id)
+        group = await self._store.get_stuck_group(owner_id, group_id)
+        if not group:
+            await self._show_stuck(update, owner_id)
+            return
+        picked = sorted(self._picked(context, group))
+        if not picked:
+            await update.callback_query.answer(t(lang, "nothing_selected"), show_alert=True)
+            return
+
+        await update.callback_query.edit_message_text(t(lang, "emergency_working"))
+        manager = await self._stuck_manager(owner_id)
+        if what == "close":
+            outcomes = await manager.close_at_market(group, picked)
+        elif what == "enter":
+            outcomes = await manager.enter_at_market(group, picked)
+        else:
+            outcomes = await manager.cancel_entry(group, picked)
+
+        context.user_data.pop("picked", None)
+        lines = [t(lang, "done_title"), ""]
+        lines += [f"{label} — {outcome}" for label, outcome in outcomes]
+        lines += ["", t(lang, "back_under_master")]
+        await update.callback_query.edit_message_text(
+            NEWLINE.join(lines),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                t(lang, "btn_back"), callback_data="stuck")]]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _show_move_limit(self, update: Update, owner_id: int, group_id: int) -> None:
+        lang = await self._lang(owner_id)
+        group = await self._store.get_stuck_group(owner_id, group_id)
+        if not group:
+            await self._show_stuck(update, owner_id)
+            return
+
+        market = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                market = await get_ticker_price(session, group.symbol)
+        except Exception:  # noqa: BLE001 — a missing quote must not block moving the order
+            LOGGER.debug("no ticker for %s", group.symbol)
+
+        lines = [
+            t(lang, "move_limit_title"),
+            "",
+            f"<b>{group.symbol}</b> {messages.side_name(group.position_type)} · "
+            f"{len(group.members)}",
+            "",
+            t(lang, "move_limit_market", price=f"{market:g}" if market else "—"),
+            t(lang, "move_limit_current", price=f"{group.limit_price:g}" if group.limit_price else "—"),
+            "",
+            t(lang, "move_limit_ask"),
+        ]
+        await update.callback_query.edit_message_text(
+            NEWLINE.join(lines),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(t(lang, "btn_refresh"), callback_data=f"sm:{group_id}"),
+                 InlineKeyboardButton(t(lang, "btn_move_limit"), callback_data=f"sme:{group_id}")],
+                [InlineKeyboardButton(t(lang, "btn_back"), callback_data="stuck")],
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _begin_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        owner_id = await self._guard(update)
+        if owner_id is None:
+            return ConversationHandler.END
+        await update.callback_query.answer()
+        context.user_data["price_group"] = int(update.callback_query.data.split(":")[1])
+        await update.callback_query.edit_message_text(
+            t(await self._lang(owner_id), "move_limit_ask"),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                t(self._lang_now(owner_id), "btn_cancel_x"), callback_data="stuck")]]),
+        )
+        return ASK_PRICE
+
+    async def _got_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        owner_id = await self._guard(update)
+        if owner_id is None:
+            return ConversationHandler.END
+        lang = await self._lang(owner_id)
+        raw = (update.message.text or "").strip().replace(",", ".")
+        try:
+            price = float(raw)
+            if price <= 0:
+                raise ValueError
+        except ValueError:
+            # Stay in the conversation: a typo should cost one more message, not the whole flow.
+            await update.message.reply_text(t(lang, "move_limit_bad"))
+            return ASK_PRICE
+
+        group_id = context.user_data.pop("price_group", None)
+        group = await self._store.get_stuck_group(owner_id, group_id) if group_id else None
+        if not group:
+            await update.message.reply_text(t(lang, "stuck_none"), parse_mode=ParseMode.HTML)
+            return ConversationHandler.END
+
+        manager = await self._stuck_manager(owner_id)
+        outcomes = await manager.move_limit(group, price)
+        lines = [t(lang, "done_title"), "", f"<b>{group.symbol}</b> → {price:g}", ""]
+        lines += [f"{label} — {outcome}" for label, outcome in outcomes]
+        await update.effective_chat.send_message(
+            NEWLINE.join(lines),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                t(lang, "btn_back"), callback_data="stuck")]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
 
     async def _show_accounts(self, update: Update, owner_id: int) -> None:
         master = await self._store.get_master(owner_id)
