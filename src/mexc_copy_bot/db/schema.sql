@@ -38,6 +38,7 @@ BEGIN
         ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'COPY';
         ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS reverse_account_id BIGINT;
         ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS mirror_limits BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'uk';
     END IF;
 
     IF to_regclass('public.copy_master_events') IS NOT NULL THEN
@@ -197,6 +198,9 @@ CREATE TABLE IF NOT EXISTS copy_state (
     -- Which follower takes the opposite side in REVERSE mode. Cleared if that account is
     -- deleted, which leaves the mode unconfigured rather than silently retargeting someone else.
     reverse_account_id BIGINT REFERENCES copy_accounts(id) ON DELETE SET NULL,
+    -- Interface language for this owner: 'uk' or 'en'. Per owner rather than global, since the
+    -- two brothers do not have to agree on one.
+    language     TEXT        NOT NULL DEFAULT 'uk',
     -- Unused. Limit mirroring is unconditional; this column is kept only so an older database
     -- does not need a destructive migration to drop it.
     mirror_limits BOOLEAN NOT NULL DEFAULT FALSE,

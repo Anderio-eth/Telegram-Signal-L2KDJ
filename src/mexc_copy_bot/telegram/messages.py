@@ -4,6 +4,9 @@ Sizes are shown as NOTIONAL (contracts × contract size × price), because "1 co
 nothing to a human while "$1,000" does — that was the explicit ask. Contract counts stay internal:
 they are what actually gets sent to the exchange, so that a follower ends up with the master's
 position rather than a rounded dollar approximation.
+
+Every function takes the reader's language and pulls its wording from i18n, so there is one
+version of each screen rather than two that drift apart.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from dataclasses import dataclass
 from ..core.copy_engine import FollowerResult
 from ..core.events import Action, MasterEvent
 from ..db.store import MODE_REVERSE, Account
+from .i18n import DEFAULT, t
 
 ACTION_ICON = {
     Action.OPEN: "📈",
@@ -21,11 +25,11 @@ ACTION_ICON = {
     Action.CLOSE: "📕",
 }
 
-ACTION_TITLE = {
-    Action.OPEN: "ПОЗИЦІЮ ВІДКРИТО",
-    Action.INCREASE: "ПОЗИЦІЮ ЗБІЛЬШЕНО",
-    Action.DECREASE: "ПОЗИЦІЮ ЗМЕНШЕНО",
-    Action.CLOSE: "ПОЗИЦІЮ ЗАКРИТО",
+ACTION_KEY = {
+    Action.OPEN: "act_open",
+    Action.INCREASE: "act_increase",
+    Action.DECREASE: "act_decrease",
+    Action.CLOSE: "act_close",
 }
 
 
@@ -46,6 +50,20 @@ def money(value: float) -> str:
     return f"${whole}.{(frac + '00')[:max(2, len(frac))]}"
 
 
+def signed_money(value: float) -> str:
+    """PnL with an explicit sign, so a loss can never be misread as a gain at a glance."""
+    return f"{'+' if value >= 0 else '−'}{money(abs(value))}"
+
+
+def mode_name(mode: int | None) -> str:
+    # Left untranslated: these are the words MEXC itself uses in its own interface.
+    if mode == 1:
+        return "hedge"
+    if mode == 2:
+        return "one-way"
+    return "unknown"
+
+
 @dataclass(frozen=True)
 class Balance:
     """What one account is worth right now, or why we could not find out.
@@ -58,25 +76,12 @@ class Balance:
     available: float | None = None
     error: str | None = None
 
-    def line(self) -> str:
+    def line(self, lang: str = DEFAULT) -> str:
         if self.error:
             return f"❌ {self.error}"
         if self.equity is None:
             return "…"
-        return f"{money(self.equity)} (available {money(self.available or 0.0)})"
-
-
-def signed_money(value: float) -> str:
-    """PnL with an explicit sign, so a loss can never be misread as a gain at a glance."""
-    return f"{'+' if value >= 0 else '−'}{money(abs(value))}"
-
-
-def mode_name(mode: int | None) -> str:
-    if mode == 1:
-        return "hedge"
-    if mode == 2:
-        return "one-way"
-    return "unknown"
+        return t(lang, "available", equity=money(self.equity), available=money(self.available or 0.0))
 
 
 def main_menu(
@@ -89,6 +94,7 @@ def main_menu(
     balances: dict[int, Balance] | None = None,
     mode: str = "COPY",
     reverse_account: Account | None = None,
+    lang: str = DEFAULT,
 ) -> str:
     """The main screen.
 
@@ -100,52 +106,62 @@ def main_menu(
     """
     balances = balances or {}
     if not master:
-        status = "⚪️ НЕМАЄ MASTER"
+        status = t(lang, "status_no_master")
     elif running and master_connected:
-        status = "🟢 ПРАЦЮЄ"
+        status = t(lang, "status_running")
     elif running:
-        status = "🟡 ПРАЦЮЄ (майстер перепідключається)"
+        status = t(lang, "status_reconnecting")
     else:
-        status = "🔴 ЗУПИНЕНО"
+        status = t(lang, "status_stopped")
 
-    lines = ["🤖 <b>MEXC COPY BOT</b>", "", f"Статус: {status}"]
+    lines = ["🤖 <b>MEXC COPY BOT</b>", "", t(lang, "menu_status", status=status)]
 
     if mode == MODE_REVERSE:
-        target = reverse_account.label if reverse_account else "⚠️ акаунт не обрано"
-        lines.append(f"Режим: 🔁 <b>РЕВЕРС</b> → {target}")
+        target = reverse_account.label if reverse_account else t(lang, "no_account_chosen")
+        lines.append(t(lang, "menu_mode_reverse", target=target))
     else:
-        lines.append("Режим: 📋 Копіювання (усі followers)")
+        lines.append(t(lang, "menu_mode_copy"))
     lines.append("")
 
     if not master:
-        lines.append("👤 <b>Master:</b> не додано")
+        lines.append(t(lang, "master_not_set"))
     else:
         lines.append(f"👤 <b>Master</b> — …{master.api_key_hint}")
-        lines.append(f"     {balances.get(master.id, Balance()).line()}")
-        lines.append(f"     Режим: {mode_name(master.position_mode)}")
+        lines.append(f"     {balances.get(master.id, Balance()).line(lang)}")
+        lines.append(t(lang, "master_mode", mode=mode_name(master.position_mode)))
 
     lines.append("")
-    lines.append(f"👥 <b>Followers:</b> {len(followers)}/{max_followers}")
+    lines.append(t(lang, "followers_count", n=len(followers), max=max_followers))
     for follower in followers:
-        mark = "" if follower.active else "  (на паузі)"
+        mark = "" if follower.active else t(lang, "paused")
         lines.append(f"     • {follower.label} — …{follower.api_key_hint}{mark}")
-        lines.append(f"          {balances.get(follower.id, Balance()).line()}")
+        lines.append(f"          {balances.get(follower.id, Balance()).line(lang)}")
 
     # Only with several followers: repeating one follower's own balance as a "total" underneath
     # it is noise, and a total that quietly omits the accounts that failed to report would be
     # worse than none.
     known = [balances[f.id].equity for f in followers if balances.get(f.id) and balances[f.id].equity is not None]
     if len(known) > 1:
-        suffix = "" if len(known) == len(followers) else f" (відповіли {len(known)}/{len(followers)})"
-        lines.append(f"     <b>Разом:</b> {money(sum(known))}{suffix}")
+        suffix = (
+            ""
+            if len(known) == len(followers)
+            else t(lang, "reporting_suffix", n=len(known), total=len(followers))
+        )
+        lines.append(t(lang, "total", amount=money(sum(known)), suffix=suffix))
 
     return "\n".join(lines)
 
 
-def event_report(event: MasterEvent, results: list[FollowerResult], notional: float | None) -> str:
+def event_report(
+    event: MasterEvent, results: list[FollowerResult], notional: float | None, lang: str = DEFAULT
+) -> str:
     icon = ACTION_ICON[event.action]
-    title = ACTION_TITLE[event.action]
-    size_line = f"Обсяг: {money(notional)}" if notional else f"Обсяг: {event.delta_vol:g} контрактів"
+    title = t(lang, ACTION_KEY[event.action])
+    size_line = (
+        t(lang, "size_usd", amount=money(notional))
+        if notional
+        else t(lang, "size_contracts", n=f"{event.delta_vol:g}")
+    )
 
     lines = [
         f"{icon} <b>{title}</b>",
@@ -153,7 +169,7 @@ def event_report(event: MasterEvent, results: list[FollowerResult], notional: fl
         f"<b>{event.symbol}</b> {side_name(event.position_type)}",
     ]
     if event.action is not Action.CLOSE:
-        lines.append(f"Плече: {event.leverage}x")
+        lines.append(t(lang, "leverage", n=event.leverage))
         lines.append(size_line)
     lines.append("")
     lines.append("━━━━━━━━━━━━━━")
@@ -163,7 +179,7 @@ def event_report(event: MasterEvent, results: list[FollowerResult], notional: fl
     for result in results:
         if result.ok:
             ok += 1
-            detail = "ЗАКРИТО" if event.action is Action.CLOSE else f"{result.action.value}"
+            detail = t(lang, "closed") if event.action is Action.CLOSE else result.action.value
             line = f"✅ {result.account.label} — {detail}"
             if event.action is Action.CLOSE:
                 # An unknown settlement says so rather than printing a zero, which would read as
@@ -171,76 +187,75 @@ def event_report(event: MasterEvent, results: list[FollowerResult], notional: fl
                 line += (
                     f"  {signed_money(result.realized_pnl)}"
                     if result.realized_pnl is not None
-                    else "  (PnL рахується)"
+                    else t(lang, "pnl_pending")
                 )
             lines.append(line)
         else:
-            lines.append(f"❌ {result.account.label} — {result.error or 'помилка'}")
+            lines.append(f"❌ {result.account.label} — {result.error or t(lang, 'failed')}")
 
     lines.append("")
-    lines.append(f"Успішно: {ok}/{len(results)}")
+    lines.append(t(lang, "success_count", ok=ok, total=len(results)))
 
     if event.action is Action.CLOSE:
         known = [r.realized_pnl for r in results if r.ok and r.realized_pnl is not None]
         if known:
             reported = len(known)
             closed = sum(1 for r in results if r.ok)
-            suffix = "" if reported == closed else f"  (порахували {reported}/{closed})"
-            lines.append(f"<b>Загальний PnL: {signed_money(sum(known))}</b>{suffix}")
+            suffix = "" if reported == closed else t(lang, "counted_suffix", n=reported, total=closed)
+            lines.append(t(lang, "total_pnl", amount=signed_money(sum(known)), suffix=suffix))
 
     return "\n".join(lines)
 
 
-def mode_screen(mode: str, reverse_account: Account | None, followers: list[Account]) -> str:
-    lines = ["⚙️ <b>РЕЖИМ</b>", ""]
+def mode_screen(
+    mode: str, reverse_account: Account | None, followers: list[Account], lang: str = DEFAULT
+) -> str:
+    lines = [t(lang, "mode_title"), ""]
     if mode == MODE_REVERSE:
-        lines.append("Зараз: 🔁 <b>РЕВЕРС</b>")
+        lines.append(t(lang, "mode_now_reverse"))
         lines.append(
-            f"Хеджує на: <b>{reverse_account.label}</b>"
+            t(lang, "mode_hedging_on", label=reverse_account.label)
             if reverse_account
-            else "⚠️ Акаунт не обрано — нічого копіюватись не буде."
+            else t(lang, "mode_no_hedge")
         )
     else:
-        lines.append("Зараз: 📋 <b>КОПІЮВАННЯ</b>")
-        lines.append(f"Дзеркалить майстра на всі {len(followers)} акаунт(и).")
+        lines.append(t(lang, "mode_now_copy"))
+        lines.append(t(lang, "mode_mirroring_all", n=len(followers)))
 
     lines += [
         "",
         "━━━━━━━━━━━━━━",
         "",
-        "📋 <b>Копіювання</b> — кожен follower відкриває <i>ту саму</i> сторону, що майстер.",
+        t(lang, "mode_explain_copy"),
         "",
-        "🔁 <b>Реверс</b> — один обраний акаунт відкриває <i>протилежну</i>: майстер у LONG, "
-        "він у SHORT. Автоматичний хедж.",
+        t(lang, "mode_explain_reverse"),
         "",
-        "Одночасно працює лише один режим.",
+        t(lang, "mode_one_at_a_time"),
         "",
         "━━━━━━━━━━━━━━",
         "",
-        "📌 <b>Лімітні ордери:</b> копіюються завжди",
+        t(lang, "limits_title"),
         "",
-        "Лімітка, що стоїть у майстра, виставляється на всіх followers за тією самою ціною — "
-        "і на відкриття, і на закриття. Вони заповнюються разом із майстром, а не наздоганяють "
-        "його маркетом.",
+        t(lang, "limits_explain"),
     ]
     return "\n".join(lines)
 
 
-def accounts_list(master: Account | None, followers: list[Account]) -> str:
-    lines = ["👥 <b>ACCOUNTS</b>", ""]
+def accounts_list(master: Account | None, followers: list[Account], lang: str = DEFAULT) -> str:
+    lines = [t(lang, "accounts_title"), ""]
     if master:
-        state = "🔴 error" if master.last_error else "🟢 connected"
+        state = t(lang, "acc_error") if master.last_error else t(lang, "acc_connected")
         lines.append(f"👑 <b>{master.label}</b> (…{master.api_key_hint}) {state}")
         if master.last_error:
             lines.append(f"    {master.last_error[:80]}")
     else:
-        lines.append("👑 Master: not set")
+        lines.append(t(lang, "acc_master_not_set"))
 
     lines.append("")
     if not followers:
-        lines.append("No followers yet.")
+        lines.append(t(lang, "acc_no_followers"))
     else:
-        lines.append("<b>Followers:</b>")
+        lines.append(t(lang, "acc_followers"))
         for f in followers:
             state = "🔴" if f.last_error else ("🟢" if f.active else "⏸")
             multiplier = "" if abs(f.size_multiplier - 1.0) < 1e-9 else f" ×{f.size_multiplier:g}"
@@ -250,10 +265,10 @@ def accounts_list(master: Account | None, followers: list[Account]) -> str:
     return "\n".join(lines)
 
 
-def history(events: list[dict]) -> str:
+def history(events: list[dict], lang: str = DEFAULT) -> str:
     if not events:
-        return "📜 <b>ІСТОРІЯ</b>\n\nЩе нічого не копіювалось."
-    lines = ["📜 <b>ІСТОРІЯ</b>", ""]
+        return t(lang, "history_empty")
+    lines = [t(lang, "history_title"), ""]
     for e in events:
         when = e["observed_at"].strftime("%d.%m %H:%M")
         line = (

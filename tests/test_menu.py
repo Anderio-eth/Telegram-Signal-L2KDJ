@@ -43,7 +43,7 @@ def test_every_follower_shows_its_own_balance():
         },
     )
     assert "$2.10" in text
-    assert "$50.00 (available $48.00)" in text
+    assert "$50.00 (вільно $48.00)" in text
     assert "$17.50" in text
 
 

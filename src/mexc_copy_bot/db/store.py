@@ -249,6 +249,23 @@ class Store:
                 reverse_account_id,
             )
 
+    async def get_language(self, owner_id: int) -> str:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT language FROM copy_state WHERE owner_id = $1", owner_id
+            ) or "uk"
+
+    async def set_language(self, owner_id: int, language: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO copy_state (owner_id, language) VALUES ($1, $2)
+                ON CONFLICT (owner_id) DO UPDATE SET language = EXCLUDED.language, updated_at = now()
+                """,
+                owner_id,
+                language,
+            )
+
     # ── mirrored resting orders ──────────────────────────────────────────────────
     async def record_mirrored_order(
         self, *, owner_id: int, master_order_id: str, account_id: int,
