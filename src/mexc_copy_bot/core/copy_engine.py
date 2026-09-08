@@ -175,7 +175,12 @@ class CopyEngine:
         return out
 
     async def mirror_resting_order(
-        self, order: MasterOrder, followers: list[Account], *, reverse: bool = False
+        self,
+        order: MasterOrder,
+        followers: list[Account],
+        *,
+        reverse: bool = False,
+        vol_by_account: dict[int, float] | None = None,
     ) -> list[tuple[Account, str | None, str | None]]:
         """Place each follower's own copy of a resting master order.
 
@@ -205,10 +210,15 @@ class CopyEngine:
                             position_type=position_type,
                         )
                 tag = f"lm{order.order_id}-{follower.id}-{uuid.uuid4().hex[:6]}"
+                vol = (
+                    vol_by_account[follower.id]
+                    if vol_by_account is not None
+                    else order.vol * follower.size_multiplier
+                )
                 result = await client.submit_order(
                     symbol=order.symbol,
                     side=side,
-                    vol=order.vol * follower.size_multiplier,
+                    vol=vol,
                     leverage=order.leverage or None,
                     open_type=order.open_type,
                     order_type=ORDER_TYPE_LIMIT,

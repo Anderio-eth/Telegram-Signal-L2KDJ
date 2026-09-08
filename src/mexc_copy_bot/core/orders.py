@@ -95,6 +95,33 @@ class MasterOrder:
         return self.side in OPENING_SIDES
 
 
+# Which side an order consumes when it reduces. In one-way mode MEXC expresses a close as an
+# "open" on the opposite side, so the side alone cannot say whether a position is being opened or
+# shut — it has to be read against what is actually held.
+REDUCES_SIDE = {
+    SIDE_OPEN_LONG: 2,      # buying reduces a short
+    SIDE_CLOSE_SHORT: 2,
+    SIDE_OPEN_SHORT: 1,     # selling reduces a long
+    SIDE_CLOSE_LONG: 1,
+}
+
+
+def reduces_position(order: "MasterOrder", held: dict[int, float]) -> int | None:
+    """Which position side this order would close out, or None if it opens exposure.
+
+    `held` is {position type: volume} on the account the order belongs to.
+
+    This is the difference between mirroring a close and accidentally opening the opposite
+    position. Verified on a live account: exiting a long came through as side=4, "open short" —
+    identical in shape to genuinely opening a short. The only thing that separates them is whether
+    a long was being held at the time.
+    """
+    if order.side in CLOSING_SIDES:
+        return REDUCES_SIDE[order.side]
+    side = REDUCES_SIDE[order.side]
+    return side if held.get(side, 0.0) > 0 else None
+
+
 @dataclass(frozen=True)
 class OrderEvent:
     action: OrderAction

@@ -28,7 +28,7 @@ from ..mexc.rest import MexcError, MexcRestClient, PositionStops
 from ..mexc.websocket import MasterWebSocket
 from .copy_engine import CopyEngine, FollowerResult
 from .events import Action, MasterEvent, MasterPositionTracker, PositionSnapshot, parse_position
-from .orders import MasterOrderTracker, OrderAction, parse_order
+from .orders import MasterOrderTracker, OrderAction, parse_order, reduces_position
 
 LOGGER = logging.getLogger(__name__)
 
@@ -549,8 +549,39 @@ class CopyService:
         reverse = mode == MODE_REVERSE
 
         assert self._session is not None
+
+        # Is the master getting OUT of something? If so, an account that never got in must not
+        # receive this order: on MEXC a close is expressed as an open on the opposite side, so
+        # mirroring it blindly would leave that account holding a fresh naked position facing the
+        # wrong way, with nothing to close it later.
+        closing_side = await self._closing_side(order)
+        vol_by_account: dict[int, float] | None = None
+        skipped: list[str] = []
+        if closing_side is not None:
+            vol_by_account = {}
+            eligible = []
+            for follower in followers:
+                held = await self._held(follower, order.symbol, closing_side)
+                if held <= 0:
+                    skipped.append(follower.label)
+                    continue
+                # Never more than they actually hold, or the surplus opens the opposite side.
+                vol_by_account[follower.id] = min(order.vol * follower.size_multiplier, held)
+                eligible.append(follower)
+            followers = eligible
+            if not followers:
+                await self._notify(
+                    "\u26a0\ufe0f <b>CLOSE NOT MIRRORED</b>\n\n"
+                    f"The master is closing <b>{order.symbol}</b>, but no follower holds that "
+                    "position. Nothing was sent \u2014 mirroring it would have opened the opposite "
+                    "side instead of closing anything."
+                )
+                return
+
         engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts)
-        results = await engine.mirror_resting_order(order, followers, reverse=reverse)
+        results = await engine.mirror_resting_order(
+            order, followers, reverse=reverse, vol_by_account=vol_by_account
+        )
 
         placed, failed = 0, []
         for follower, follower_order_id, error in results:
@@ -575,7 +606,36 @@ class CopyService:
             f"Placed on {placed}/{len(followers)} account(s)",
         ]
         lines += [f"❌ {f}" for f in failed]
+        if skipped:
+            lines.append("")
+            lines.append(f"⏭ Skipped (nothing to close): {', '.join(skipped)}")
         await self._notify("\n".join(lines))
+
+    async def _closing_side(self, order) -> int | None:
+        """Which position side the master is closing with this order, if any."""
+        client = await self._master_client()
+        if not client:
+            return None
+        try:
+            positions = await client.get_open_positions(order.symbol)
+        except MexcError as err:
+            # Unknown is treated as "opening", which is the behaviour that existed before this
+            # check. Blocking a mirror on a failed lookup would be the worse failure.
+            LOGGER.info("could not read master position for %s: %s", order.symbol, err)
+            return None
+        held = {p.position_type: p.hold_vol for p in positions if p.hold_vol > 0}
+        return reduces_position(order, held)
+
+    async def _held(self, follower: Account, symbol: str, position_type: int) -> float:
+        credentials = await self._store.get_credentials(follower.id, follower.owner_id)
+        if not credentials or not self._session:
+            return 0.0
+        client = MexcRestClient(*credentials, session=self._session)
+        try:
+            positions = await client.get_open_positions(symbol)
+        except MexcError:
+            return 0.0
+        return sum(p.hold_vol for p in positions if p.position_type == position_type and p.hold_vol > 0)
 
     async def _cancel_mirrored(self, master_order_id: str) -> None:
         pairs = await self._store.get_mirrored_orders(self._owner_id, master_order_id)

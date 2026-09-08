@@ -24,6 +24,7 @@ import time
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -609,7 +610,15 @@ class CopyBot:
     def _notice_for(self, owner_id: int):
         async def notice(text: str) -> None:
             chat_id = self._chat_for(owner_id)
-            if self._app and chat_id:
+            if not (self._app and chat_id):
+                return
+            try:
+                await self._app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+            except BadRequest:
+                # Notices carry text straight from the exchange — a symbol or an error message
+                # can contain a stray "<" that makes Telegram reject the whole message as invalid
+                # HTML. Losing a trade report to a formatting character is the worse outcome, so
+                # it goes out unformatted rather than not at all.
                 await self._app.bot.send_message(chat_id, text)
 
         return notice
