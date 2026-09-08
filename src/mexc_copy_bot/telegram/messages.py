@@ -22,10 +22,10 @@ ACTION_ICON = {
 }
 
 ACTION_TITLE = {
-    Action.OPEN: "POSITION OPENED",
-    Action.INCREASE: "POSITION INCREASED",
-    Action.DECREASE: "POSITION DECREASED",
-    Action.CLOSE: "POSITION CLOSED",
+    Action.OPEN: "ПОЗИЦІЮ ВІДКРИТО",
+    Action.INCREASE: "ПОЗИЦІЮ ЗБІЛЬШЕНО",
+    Action.DECREASE: "ПОЗИЦІЮ ЗМЕНШЕНО",
+    Action.CLOSE: "ПОЗИЦІЮ ЗАКРИТО",
 }
 
 
@@ -100,34 +100,34 @@ def main_menu(
     """
     balances = balances or {}
     if not master:
-        status = "⚪️ NO MASTER"
+        status = "⚪️ НЕМАЄ MASTER"
     elif running and master_connected:
-        status = "🟢 RUNNING"
+        status = "🟢 ПРАЦЮЄ"
     elif running:
-        status = "🟡 RUNNING (master reconnecting)"
+        status = "🟡 ПРАЦЮЄ (майстер перепідключається)"
     else:
-        status = "🔴 STOPPED"
+        status = "🔴 ЗУПИНЕНО"
 
-    lines = ["🤖 <b>MEXC COPY BOT</b>", "", f"Status: {status}"]
+    lines = ["🤖 <b>MEXC COPY BOT</b>", "", f"Статус: {status}"]
 
     if mode == MODE_REVERSE:
-        target = reverse_account.label if reverse_account else "⚠️ no account chosen"
-        lines.append(f"Mode: 🔁 <b>REVERSE</b> → {target}")
+        target = reverse_account.label if reverse_account else "⚠️ акаунт не обрано"
+        lines.append(f"Режим: 🔁 <b>РЕВЕРС</b> → {target}")
     else:
-        lines.append("Mode: 📋 Copy (all followers)")
+        lines.append("Режим: 📋 Копіювання (усі followers)")
     lines.append("")
 
     if not master:
-        lines.append("👤 <b>Master:</b> not set")
+        lines.append("👤 <b>Master:</b> не додано")
     else:
         lines.append(f"👤 <b>Master</b> — …{master.api_key_hint}")
         lines.append(f"     {balances.get(master.id, Balance()).line()}")
-        lines.append(f"     Mode: {mode_name(master.position_mode)}")
+        lines.append(f"     Режим: {mode_name(master.position_mode)}")
 
     lines.append("")
     lines.append(f"👥 <b>Followers:</b> {len(followers)}/{max_followers}")
     for follower in followers:
-        mark = "" if follower.active else "  (paused)"
+        mark = "" if follower.active else "  (на паузі)"
         lines.append(f"     • {follower.label} — …{follower.api_key_hint}{mark}")
         lines.append(f"          {balances.get(follower.id, Balance()).line()}")
 
@@ -136,8 +136,8 @@ def main_menu(
     # worse than none.
     known = [balances[f.id].equity for f in followers if balances.get(f.id) and balances[f.id].equity is not None]
     if len(known) > 1:
-        suffix = "" if len(known) == len(followers) else f" (of {len(known)}/{len(followers)} reporting)"
-        lines.append(f"     <b>Total:</b> {money(sum(known))}{suffix}")
+        suffix = "" if len(known) == len(followers) else f" (відповіли {len(known)}/{len(followers)})"
+        lines.append(f"     <b>Разом:</b> {money(sum(known))}{suffix}")
 
     return "\n".join(lines)
 
@@ -145,7 +145,7 @@ def main_menu(
 def event_report(event: MasterEvent, results: list[FollowerResult], notional: float | None) -> str:
     icon = ACTION_ICON[event.action]
     title = ACTION_TITLE[event.action]
-    size_line = f"Size: {money(notional)}" if notional else f"Size: {event.delta_vol:g} contracts"
+    size_line = f"Обсяг: {money(notional)}" if notional else f"Обсяг: {event.delta_vol:g} контрактів"
 
     lines = [
         f"{icon} <b>{title}</b>",
@@ -153,7 +153,7 @@ def event_report(event: MasterEvent, results: list[FollowerResult], notional: fl
         f"<b>{event.symbol}</b> {side_name(event.position_type)}",
     ]
     if event.action is not Action.CLOSE:
-        lines.append(f"Leverage: {event.leverage}x")
+        lines.append(f"Плече: {event.leverage}x")
         lines.append(size_line)
     lines.append("")
     lines.append("━━━━━━━━━━━━━━")
@@ -163,7 +163,7 @@ def event_report(event: MasterEvent, results: list[FollowerResult], notional: fl
     for result in results:
         if result.ok:
             ok += 1
-            detail = "CLOSED" if event.action is Action.CLOSE else f"{result.action.value}"
+            detail = "ЗАКРИТО" if event.action is Action.CLOSE else f"{result.action.value}"
             line = f"✅ {result.account.label} — {detail}"
             if event.action is Action.CLOSE:
                 # An unknown settlement says so rather than printing a zero, which would read as
@@ -171,56 +171,57 @@ def event_report(event: MasterEvent, results: list[FollowerResult], notional: fl
                 line += (
                     f"  {signed_money(result.realized_pnl)}"
                     if result.realized_pnl is not None
-                    else "  (PnL pending)"
+                    else "  (PnL рахується)"
                 )
             lines.append(line)
         else:
-            lines.append(f"❌ {result.account.label} — {result.error or 'failed'}")
+            lines.append(f"❌ {result.account.label} — {result.error or 'помилка'}")
 
     lines.append("")
-    lines.append(f"Success: {ok}/{len(results)}")
+    lines.append(f"Успішно: {ok}/{len(results)}")
 
     if event.action is Action.CLOSE:
         known = [r.realized_pnl for r in results if r.ok and r.realized_pnl is not None]
         if known:
             reported = len(known)
             closed = sum(1 for r in results if r.ok)
-            suffix = "" if reported == closed else f"  (of {reported}/{closed} reported)"
-            lines.append(f"<b>Total PnL: {signed_money(sum(known))}</b>{suffix}")
+            suffix = "" if reported == closed else f"  (порахували {reported}/{closed})"
+            lines.append(f"<b>Загальний PnL: {signed_money(sum(known))}</b>{suffix}")
 
     return "\n".join(lines)
 
 
 def mode_screen(mode: str, reverse_account: Account | None, followers: list[Account]) -> str:
-    lines = ["⚙️ <b>MODE</b>", ""]
+    lines = ["⚙️ <b>РЕЖИМ</b>", ""]
     if mode == MODE_REVERSE:
-        lines.append("Currently: 🔁 <b>REVERSE</b>")
+        lines.append("Зараз: 🔁 <b>РЕВЕРС</b>")
         lines.append(
-            f"Hedging on: <b>{reverse_account.label}</b>"
+            f"Хеджує на: <b>{reverse_account.label}</b>"
             if reverse_account
-            else "⚠️ No account chosen — nothing will be mirrored."
+            else "⚠️ Акаунт не обрано — нічого копіюватись не буде."
         )
     else:
-        lines.append("Currently: 📋 <b>COPY</b>")
-        lines.append(f"Mirroring the master onto all {len(followers)} follower(s).")
+        lines.append("Зараз: 📋 <b>КОПІЮВАННЯ</b>")
+        lines.append(f"Дзеркалить майстра на всі {len(followers)} акаунт(и).")
 
     lines += [
         "",
         "━━━━━━━━━━━━━━",
         "",
-        "📋 <b>Copy</b> — every follower opens the <i>same</i> side as the master.",
+        "📋 <b>Копіювання</b> — кожен follower відкриває <i>ту саму</i> сторону, що майстер.",
         "",
-        "🔁 <b>Reverse</b> — one chosen account opens the <i>opposite</i> side: master goes "
-        "LONG, it goes SHORT. An automatic hedge.",
+        "🔁 <b>Реверс</b> — один обраний акаунт відкриває <i>протилежну</i>: майстер у LONG, "
+        "він у SHORT. Автоматичний хедж.",
         "",
-        "Only one mode runs at a time.",
+        "Одночасно працює лише один режим.",
         "",
         "━━━━━━━━━━━━━━",
         "",
-        "📌 <b>Limit orders:</b> always mirrored",
+        "📌 <b>Лімітні ордери:</b> копіюються завжди",
         "",
-        "A limit resting on the master is placed on every follower at the same price, on the "
-        "open and on the close, so they fill alongside it instead of chasing afterwards.",
+        "Лімітка, що стоїть у майстра, виставляється на всіх followers за тією самою ціною — "
+        "і на відкриття, і на закриття. Вони заповнюються разом із майстром, а не наздоганяють "
+        "його маркетом.",
     ]
     return "\n".join(lines)
 
@@ -251,8 +252,8 @@ def accounts_list(master: Account | None, followers: list[Account]) -> str:
 
 def history(events: list[dict]) -> str:
     if not events:
-        return "📜 <b>HISTORY</b>\n\nNothing copied yet."
-    lines = ["📜 <b>HISTORY</b>", ""]
+        return "📜 <b>ІСТОРІЯ</b>\n\nЩе нічого не копіювалось."
+    lines = ["📜 <b>ІСТОРІЯ</b>", ""]
     for e in events:
         when = e["observed_at"].strftime("%d.%m %H:%M")
         line = (

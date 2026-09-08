@@ -78,7 +78,7 @@ def test_total_excludes_accounts_that_did_not_report_and_says_so():
         },
     )
     assert "$70.00" in text
-    assert "2/3 reporting" in text
+    assert "відповіли 2/3" in text
 
 
 def test_total_is_clean_when_everyone_reports():
@@ -86,8 +86,8 @@ def test_total_is_clean_when_everyone_reports():
         followers=[F1, F2],
         balances={2: Balance(equity=50.0, available=50.0), 3: Balance(equity=20.0, available=20.0)},
     )
-    assert "<b>Total:</b> $70.00" in text
-    assert "reporting" not in text
+    assert "<b>Разом:</b> $70.00" in text
+    assert "відповіли" not in text
 
 
 def test_missing_balance_is_not_rendered_as_zero():
@@ -97,10 +97,10 @@ def test_missing_balance_is_not_rendered_as_zero():
 
 def test_paused_follower_is_marked():
     text = render(followers=[account(2, FOLLOWER, "Follower #1", "AA11", active=False)], balances={})
-    assert "(paused)" in text
+    assert "(на паузі)" in text
 
 
 def test_menu_without_a_master_still_lists_followers():
     text = render(master=None, followers=[F1], balances={2: Balance(equity=9.0, available=9.0)})
-    assert "NO MASTER" in text
+    assert "НЕМАЄ MASTER" in text
     assert "Follower #1" in text and "$9.00" in text

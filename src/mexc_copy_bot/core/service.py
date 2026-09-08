@@ -23,7 +23,7 @@ from dataclasses import dataclass, replace
 
 import aiohttp
 
-from ..db.store import FOLLOWER, MODE_REVERSE, Account, Store
+from ..db.store import FOLLOWER, MODE_REVERSE, Account, PositionRow, Store
 from ..mexc.rest import MexcError, MexcRestClient, PositionStops
 from ..mexc.websocket import MasterWebSocket
 from .copy_engine import CopyEngine, FollowerResult
@@ -85,6 +85,10 @@ class CopyService:
         self._order_poll_task: asyncio.Task[None] | None = None
         # Master order ids currently resting in the book, as of the last poll.
         self._resting: set[str] = set()
+        # master order id -> the position side it closes, or None if it opens exposure.
+        # Recorded when the copies are placed, because by the time it fills the master's
+        # position is already gone and the question can no longer be answered.
+        self._closing_intent: dict[str, int | None] = {}
         # Events are handled one at a time. Master actions arrive in order and often in bursts
         # (three orders filling one position); processing them concurrently would race the
         # position diff and could mirror the same delta twice.
@@ -108,15 +112,15 @@ class CopyService:
 
     async def start(self) -> str:
         if self._ws:
-            return "Already running."
+            return "Вже працює."
 
         master = await self._store.get_master(self._owner_id)
         if not master:
-            return "No master account configured."
+            return "Master акаунт не додано."
 
         credentials = await self._store.get_credentials(master.id, self._owner_id)
         if not credentials:
-            return "Master credentials could not be read."
+            return "Не вдалося прочитати ключі майстра."
 
         self._session = aiohttp.ClientSession()
         api_key, secret = credentials
@@ -136,11 +140,11 @@ class CopyService:
         await self._store.set_running(self._owner_id, True)
 
         if await self._ws.wait_connected(CONNECT_TIMEOUT_SECONDS):
-            return "✅ Copy trading started — master connected."
+            return "✅ Копіювання запущено — майстер підключений."
         # Not an error: the socket keeps retrying on its own. But reporting a flat "started" while
         # nothing is listening to the master is the kind of half-truth that gets noticed only
         # after a missed trade.
-        return "⚠️ Copy trading started, but the master is not connected yet — still retrying."
+        return "⚠️ Копіювання запущено, але майстер ще не підключився — пробую далі."
 
     async def stop(self) -> str:
         """Stop copying NEW actions. Existing follower positions are left untouched (spec §7)."""
@@ -158,7 +162,7 @@ class CopyService:
             await self._session.close()
             self._session = None
         await self._store.set_running(self._owner_id, False)
-        return "Copy trading stopped. Open positions were left as they are."
+        return "Копіювання зупинено. Відкриті позиції лишились як були."
 
     async def emergency_close_all(self) -> list[tuple[Account, str]]:
         """Close every position on this owner's followers, after explicit confirmation.
@@ -225,31 +229,71 @@ class CopyService:
 
         results = await asyncio.gather(*(holding(f) for f in followers), return_exceptions=True)
 
-        side = "LONG" if order.position_type == 1 else "SHORT"
+        # Record what each follower now holds as the expectation. The limit path places these
+        # orders itself and never went through the position bookkeeping, so without this the
+        # reconciler compares a real position against a blank row and reports drift on every
+        # single mirrored trade — which is exactly what it did.
+        await self._sync_expected(order, followers, results)
+
+        closing_side = self._closing_intent.pop(order.order_id, None)
+        if closing_side is not None:
+            headline = f"CLOSE {'LONG' if closing_side == 1 else 'SHORT'}"
+        else:
+            headline = f"OPEN {'LONG' if order.position_type == 1 else 'SHORT'}"
+
         lines = [
-            "✅ <b>LIMIT FILLED</b>",
+            "✅ <b>ЛІМІТКУ ЗАПОВНЕНО</b>",
             "",
-            f"<b>{order.symbol}</b> {side} @ {order.price:g}",
-            f"Master filled {order.deal_vol or order.vol:g}",
+            f"<b>{order.symbol}</b> {headline} @ {order.price:g}",
+            f"Майстер заповнив {order.deal_vol or order.vol:g}",
             "",
         ]
         for follower, res in zip(followers, results, strict=True):
             if not isinstance(res, tuple):
-                lines.append(f"❓ {follower.label} — could not check")
+                lines.append(f"❓ {follower.label} — не вдалося перевірити")
                 continue
             vol, error = res
             if error:
                 lines.append(f"❌ {follower.label} — {error}")
+            elif closing_side is not None:
+                # Closing: an empty position is the goal, so it is success, not a missed fill.
+                lines.append(
+                    f"✅ {follower.label} — закрито"
+                    if not vol
+                    else f"⏳ {follower.label} — ще відкрито {vol:g}"
+                )
             elif vol:
-                lines.append(f"✅ {follower.label} — holding {vol:g}")
+                lines.append(f"✅ {follower.label} — тримає {vol:g}")
             else:
-                lines.append(f"⏳ {follower.label} — not filled yet")
+                lines.append(f"⏳ {follower.label} — ще не заповнилось")
         await self._notify("\n".join(lines))
+
+    async def _sync_expected(self, order, followers, results) -> None:
+        for follower, res in zip(followers, results, strict=True):
+            if not isinstance(res, tuple):
+                continue
+            vol, error = res
+            if error:
+                continue
+            if vol:
+                await self._store.upsert_position(
+                    PositionRow(
+                        account_id=follower.id,
+                        symbol=order.symbol,
+                        position_type=order.position_type,
+                        hold_vol=vol,
+                        leverage=order.leverage,
+                        open_type=order.open_type,
+                    )
+                )
+            else:
+                for side in (1, 2):
+                    await self._store.delete_position(follower.id, order.symbol, side)
 
     async def _notice(self, message: str) -> None:
         if self.on_notice:
             with contextlib.suppress(Exception):
-                await self.on_notice(f"Master: {message}")
+                await self.on_notice(f"Майстер: {message}")
 
     async def _resync_master(self) -> None:
         """Make the master's real positions the baseline, emitting nothing.
@@ -555,6 +599,7 @@ class CopyService:
         # mirroring it blindly would leave that account holding a fresh naked position facing the
         # wrong way, with nothing to close it later.
         closing_side = await self._closing_side(order)
+        self._closing_intent[order.order_id] = closing_side
         vol_by_account: dict[int, float] | None = None
         skipped: list[str] = []
         if closing_side is not None:
@@ -595,20 +640,24 @@ class CopyService:
             else:
                 failed.append(f"{follower.label}: {error}")
 
-        side = "LONG" if order.position_type == 1 else "SHORT"
-        what = "OPEN" if order.is_opening else "CLOSE"
+        # Described by what it does, not by MEXC's side number: in one-way mode an exit is sent
+        # as "open short", and reporting that literally is how a close reads as a new position.
+        if closing_side is not None:
+            headline = f"CLOSE {'LONG' if closing_side == 1 else 'SHORT'}"
+        else:
+            headline = f"OPEN {'LONG' if order.position_type == 1 else 'SHORT'}"
         lines = [
-            "📌 <b>LIMIT PLACED</b> — mirrored from master",
+            "📌 <b>ЛІМІТКУ ВИСТАВЛЕНО</b> — копія з майстра",
             "",
-            f"<b>{order.symbol}</b> {side} ({what})",
+            f"<b>{order.symbol}</b> {headline}",
             f"Price: {order.price:g}   Size: {order.vol:g}",
             "",
-            f"Placed on {placed}/{len(followers)} account(s)",
+            f"Виставлено на {placed}/{len(followers)} акаунт(ах)",
         ]
         lines += [f"❌ {f}" for f in failed]
         if skipped:
             lines.append("")
-            lines.append(f"⏭ Skipped (nothing to close): {', '.join(skipped)}")
+            lines.append(f"⏭ Пропущено (нема що закривати): {', '.join(skipped)}")
         await self._notify("\n".join(lines))
 
     async def _closing_side(self, order) -> int | None:
@@ -650,9 +699,9 @@ class CopyService:
         await self._store.clear_mirrored_order(self._owner_id, master_order_id)
         LOGGER.info("cancelled %s/%s mirrored copies of %s", cancelled, len(todo), master_order_id)
         await self._notify(
-            "🚫 <b>LIMIT CANCELLED</b>\n\n"
-            "The master pulled its order.\n"
-            f"Cancelled on {cancelled}/{len(todo)} account(s)."
+            "🚫 <b>ЛІМІТКУ СКАСОВАНО</b>\n\n"
+            "Майстер зняв свій ордер.\n"
+            f"Скасовано на {cancelled}/{len(todo)} акаунт(ах)."
         )
 
     async def _eligible_followers(self) -> list[Account]:
@@ -722,7 +771,7 @@ class CopyService:
             if not followers:
                 LOGGER.warning("reverse mode has no usable account for owner %s", self._owner_id)
                 await self._notice(
-                    "⚠️ Reverse mode is on but its account is missing or paused — nothing was mirrored."
+                    "⚠️ Увімкнено реверс, але його акаунт відсутній або на паузі — нічого не скопійовано."
                 )
                 return
         else:
@@ -752,10 +801,10 @@ class CopyService:
                 drifts = await self.reconcile()
                 if drifts and self.on_notice:
                     lines = [
-                        f"{d.account.label}: {d.symbol} expected {d.expected_vol:g}, actual {d.actual_vol:g}"
+                        f"{d.account.label}: {d.symbol} очікувалось {d.expected_vol:g}, фактично {d.actual_vol:g}"
                         for d in drifts
                     ]
-                    await self.on_notice("⚠️ Position drift detected\n" + "\n".join(lines))
+                    await self.on_notice("⚠️ Розбіжність позицій\n" + "\n".join(lines))
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — reconciliation must never kill the service

@@ -39,37 +39,37 @@ def closed(n: int, pnl: float | None) -> FollowerResult:
 
 def test_each_follower_shows_its_own_realised_pnl():
     text = event_report(close_event(), [closed(1, -0.1879), closed(2, -0.1879), closed(3, 2.42)], None)
-    assert "Follower #1 — CLOSED  −$0.1879" in text
-    assert "Follower #3 — CLOSED  +$2.42" in text
+    assert "Follower #1 — ЗАКРИТО  −$0.1879" in text
+    assert "Follower #3 — ЗАКРИТО  +$2.42" in text
 
 
 def test_total_is_the_sum_and_carries_its_sign():
     text = event_report(close_event(), [closed(1, -0.50), closed(2, 2.00)], None)
-    assert "Total PnL: +$1.50" in text
+    assert "Загальний PnL: +$1.50" in text
 
     text = event_report(close_event(), [closed(1, -0.50), closed(2, -2.00)], None)
-    assert "Total PnL: −$2.50" in text
+    assert "Загальний PnL: −$2.50" in text
 
 
 def test_unknown_settlement_is_pending_not_zero():
     """A close whose settlement could not be read must not read as "broke even"."""
     text = event_report(close_event(), [closed(1, None)], None)
-    assert "(PnL pending)" in text
+    assert "(PnL рахується)" in text
     assert "$0" not in text
-    assert "Total PnL" not in text
+    assert "Загальний PnL" not in text
 
 
 def test_partial_total_admits_it_is_partial():
     text = event_report(close_event(), [closed(1, -1.0), closed(2, None), closed(3, -1.0)], None)
-    assert "Total PnL: −$2.00" in text
-    assert "(of 2/3 reported)" in text
+    assert "Загальний PnL: −$2.00" in text
+    assert "(порахували 2/3)" in text
 
 
 def test_a_failed_follower_is_not_counted_into_pnl():
     results = [closed(1, -1.0), FollowerResult(follower(2), False, Action.CLOSE, 12.0, "insufficient balance")]
     text = event_report(close_event(), results, None)
-    assert "Total PnL: −$1.00" in text
-    assert "Success: 1/2" in text
+    assert "Загальний PnL: −$1.00" in text
+    assert "Успішно: 1/2" in text
 
 
 def test_opens_report_no_pnl_at_all():

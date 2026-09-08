@@ -57,19 +57,19 @@ BALANCE_TTL_SECONDS = 5.0
 
 def _menu_keyboard(running: bool) -> InlineKeyboardMarkup:
     control = (
-        InlineKeyboardButton("⏹ STOP", callback_data="stop")
+        InlineKeyboardButton("⏹ СТОП", callback_data="stop")
         if running
-        else InlineKeyboardButton("▶️ START", callback_data="start")
+        else InlineKeyboardButton("▶️ СТАРТ", callback_data="start")
     )
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📊 Positions", callback_data="positions"),
-             InlineKeyboardButton("👥 Accounts", callback_data="accounts")],
-            [InlineKeyboardButton("📜 History", callback_data="history"),
-             InlineKeyboardButton("⚙️ Mode", callback_data="mode")],
-            [InlineKeyboardButton("🔄 Refresh", callback_data="menu")],
+            [InlineKeyboardButton("📊 Позиції", callback_data="positions"),
+             InlineKeyboardButton("👥 Акаунти", callback_data="accounts")],
+            [InlineKeyboardButton("📜 Історія", callback_data="history"),
+             InlineKeyboardButton("⚙️ Режим", callback_data="mode")],
+            [InlineKeyboardButton("🔄 Оновити", callback_data="menu")],
             [control],
-            [InlineKeyboardButton("🛑 EMERGENCY STOP", callback_data="emergency")],
+            [InlineKeyboardButton("🛑 АВАРІЙНИЙ СТОП", callback_data="emergency")],
         ]
     )
 
@@ -77,11 +77,11 @@ def _menu_keyboard(running: bool) -> InlineKeyboardMarkup:
 def _accounts_keyboard(has_master: bool, can_add_follower: bool) -> InlineKeyboardMarkup:
     rows = []
     if not has_master:
-        rows.append([InlineKeyboardButton("👤 Add Master Account", callback_data="add_master")])
+        rows.append([InlineKeyboardButton("👤 Додати Master акаунт", callback_data="add_master")])
     if can_add_follower:
-        rows.append([InlineKeyboardButton("➕ Add Follower Account", callback_data="add_follower")])
-    rows.append([InlineKeyboardButton("🗑 Remove account", callback_data="remove_menu")])
-    rows.append([InlineKeyboardButton("« Back", callback_data="menu")])
+        rows.append([InlineKeyboardButton("➕ Додати Follower акаунт", callback_data="add_follower")])
+    rows.append([InlineKeyboardButton("🗑 Видалити акаунт", callback_data="remove_menu")])
+    rows.append([InlineKeyboardButton("« Назад", callback_data="menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -145,9 +145,9 @@ class CopyBot:
             return owner_id
         LOGGER.warning("refused telegram user %s", update.effective_user.id if update.effective_user else "?")
         if update.callback_query:
-            await update.callback_query.answer("Not authorized", show_alert=True)
+            await update.callback_query.answer("Немає доступу", show_alert=True)
         elif update.message:
-            await update.message.reply_text("Not authorized.")
+            await update.message.reply_text("Немає доступу.")
         return None
 
     # ── screens ─────────────────────────────────────────────────────────────────────────────
@@ -260,32 +260,32 @@ class CopyBot:
             events = await self._store.recent_events(owner_id, 10)
             await query.edit_message_text(
                 messages.history(events),
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="menu")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="menu")]]),
                 parse_mode=ParseMode.HTML,
             )
         elif action == "emergency":
             await query.edit_message_text(
-                "⚠️ <b>EMERGENCY STOP</b>\n\nThis stops copying AND closes every position on <b>your</b> "
-                "follower accounts. It cannot be undone.",
+                "⚠️ <b>АВАРІЙНИЙ СТОП</b>\n\nЦе зупинить копіювання І закриє всі позиції на "
+                "<b>твоїх</b> follower-акаунтах. Скасувати неможливо.",
                 reply_markup=InlineKeyboardMarkup(
                     [
-                        [InlineKeyboardButton("YES, CLOSE ALL", callback_data="emergency_confirm")],
-                        [InlineKeyboardButton("Cancel", callback_data="menu")],
+                        [InlineKeyboardButton("ТАК, ЗАКРИТИ ВСЕ", callback_data="emergency_confirm")],
+                        [InlineKeyboardButton("Скасувати", callback_data="menu")],
                     ]
                 ),
                 parse_mode=ParseMode.HTML,
             )
         elif action == "emergency_confirm":
-            await query.edit_message_text("Closing all follower positions…")
+            await query.edit_message_text("Закриваю всі позиції на follower-акаунтах…")
             await service.stop()
             outcomes = await service.emergency_close_all()
-            lines = ["🛑 <b>EMERGENCY STOP COMPLETE</b>", ""]
+            lines = ["🛑 <b>АВАРІЙНИЙ СТОП ВИКОНАНО</b>", ""]
             lines += [
                 f"{'✅' if result == 'closed' else '❌'} {account.label} — {result}" for account, result in outcomes
             ]
             await query.edit_message_text(
                 "\n".join(lines),
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="menu")]]),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="menu")]]),
                 parse_mode=ParseMode.HTML,
             )
         elif action == "mode":
@@ -355,7 +355,7 @@ class CopyBot:
         if not service.running:
             return False
         await update.callback_query.answer(
-            "Stop copying before changing mode — open positions would be left on the wrong side.",
+            "Спершу зупини копіювання — інакше відкриті позиції лишаться не на тій стороні.",
             show_alert=True,
         )
         return True
@@ -366,14 +366,14 @@ class CopyBot:
         chosen = next((f for f in followers if f.id == reverse_id), None)
         rows = []
         if mode != MODE_COPY:
-            rows.append([InlineKeyboardButton("📋 Switch to COPY", callback_data="mode_copy")])
+            rows.append([InlineKeyboardButton("📋 Перемкнути на КОПІЮВАННЯ", callback_data="mode_copy")])
         rows.append(
             [InlineKeyboardButton(
-                "🔁 Choose hedge account" if mode == MODE_REVERSE else "🔁 Switch to REVERSE",
+                "🔁 Обрати акаунт для хеджу" if mode == MODE_REVERSE else "🔁 Перемкнути на РЕВЕРС",
                 callback_data="mode_reverse",
             )]
         )
-        rows.append([InlineKeyboardButton("« Back", callback_data="menu")])
+        rows.append([InlineKeyboardButton("« Назад", callback_data="menu")])
 
         await update.callback_query.edit_message_text(
             messages.mode_screen(mode, chosen, followers),
@@ -385,8 +385,8 @@ class CopyBot:
         followers = await self._store.list_accounts(owner_id, FOLLOWER)
         if not followers:
             await update.callback_query.edit_message_text(
-                "Reverse mode needs a second account to hedge on. Add a follower first.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="mode")]]),
+                "Для реверсу потрібен другий акаунт. Спершу додай follower.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="mode")]]),
             )
             return
         rows = [
@@ -395,9 +395,9 @@ class CopyBot:
             )]
             for f in followers
         ]
-        rows.append([InlineKeyboardButton("« Back", callback_data="mode")])
+        rows.append([InlineKeyboardButton("« Назад", callback_data="mode")])
         await update.callback_query.edit_message_text(
-            "Which account should take the <b>opposite</b> side of the master?",
+            "Який акаунт має відкривати <b>протилежну</b> сторону до майстра?",
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
         )
@@ -418,20 +418,20 @@ class CopyBot:
         accounts = await self._store.list_accounts(owner_id)
         if not accounts:
             await update.callback_query.edit_message_text(
-                "No accounts.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="accounts")]])
+                "Акаунтів немає.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="accounts")]])
             )
             return
         rows = [
             [InlineKeyboardButton(f"🗑 {a.label} (…{a.api_key_hint})", callback_data=f"remove:{a.id}")]
             for a in accounts
         ]
-        rows.append([InlineKeyboardButton("« Back", callback_data="accounts")])
+        rows.append([InlineKeyboardButton("« Назад", callback_data="accounts")])
         await update.callback_query.edit_message_text(
-            "Select an account to remove:", reply_markup=InlineKeyboardMarkup(rows)
+            "Обери акаунт для видалення:", reply_markup=InlineKeyboardMarkup(rows)
         )
 
     async def _show_positions(self, update: Update, owner_id: int) -> None:
-        lines = ["📊 <b>POSITIONS</b>", ""]
+        lines = ["📊 <b>ПОЗИЦІЇ</b>", ""]
         async with aiohttp.ClientSession() as session:
             for account in await self._store.list_accounts(owner_id):
                 credentials = await self._store.get_credentials(account.id, owner_id)
@@ -445,7 +445,7 @@ class CopyBot:
                     lines.append(f"{marker} <b>{account.label}</b> — ❌ {err.message}")
                     continue
                 if not positions:
-                    lines.append(f"{marker} <b>{account.label}</b> — no position")
+                    lines.append(f"{marker} <b>{account.label}</b> — позицій немає")
                 else:
                     lines.append(f"{marker} <b>{account.label}</b>")
                     for p in positions:
@@ -456,7 +456,7 @@ class CopyBot:
                 lines.append("")
         await update.callback_query.edit_message_text(
             "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="menu")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data="menu")]]),
             parse_mode=ParseMode.HTML,
         )
 
@@ -470,9 +470,9 @@ class CopyBot:
         kind = MASTER if update.callback_query.data == "add_master" else FOLLOWER
         context.user_data["kind"] = kind
         prompt = await update.callback_query.edit_message_text(
-            f"Adding {kind.title()} account.\n\nSend the MEXC <b>API Key</b> as a message:",
+            f"Додаю {kind.title()} акаунт.\n\nНадішли <b>API Key</b> від MEXC повідомленням:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data="menu")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Скасувати", callback_data="menu")]]),
         )
         # Tracked so the whole exchange can be swept away once the account is connected: these
         # prompts are scaffolding, and what they were collecting now lives in the menu instead.
@@ -491,9 +491,9 @@ class CopyBot:
             except Exception:  # noqa: BLE001 — deletion is best-effort, not a reason to abort
                 pass
         prompt = await update.effective_chat.send_message(
-            "Now send the <b>Secret Key</b>:",
+            "Тепер надішли <b>Secret Key</b>:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data="menu")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✖ Скасувати", callback_data="menu")]]),
         )
         context.user_data.setdefault("cleanup", []).append(prompt.message_id)
         return ASK_SECRET
@@ -510,7 +510,7 @@ class CopyBot:
         except Exception:  # noqa: BLE001
             pass
 
-        status = await update.effective_chat.send_message("Validating with MEXC…")
+        status = await update.effective_chat.send_message("Перевіряю ключі на MEXC…")
 
         # Validate before storing: an account that cannot read its own balance will fail on the
         # first real trade, and finding that out now is far cheaper (spec §4).
@@ -520,7 +520,7 @@ class CopyBot:
                 equity, available = await client.get_usdt_balance()
                 mode = await client.get_position_mode()
             except MexcError as err:
-                await status.edit_text(f"❌ Could not connect: {err.message}")
+                await status.edit_text(f"❌ Не вдалося підключитись: {err.message}")
                 context.user_data.clear()
                 return ConversationHandler.END
 
@@ -530,8 +530,8 @@ class CopyBot:
             # Hedge vs one-way changes what a side means; copying across a mismatch mirrors the
             # wrong direction. Verified the hard way during testing.
             warning = (
-                f"\n\n⚠️ Position mode is {'hedge' if mode == 1 else 'one-way'}, but the master uses "
-                f"{'hedge' if master.position_mode == 1 else 'one-way'}. Make them match before trading."
+                f"\n\n⚠️ Режим позицій тут {'hedge' if mode == 1 else 'one-way'}, а в майстра "
+                f"{'hedge' if master.position_mode == 1 else 'one-way'}. Зроби однаковими до торгівлі."
             )
 
         followers = await self._store.list_accounts(owner_id, FOLLOWER)
@@ -546,7 +546,7 @@ class CopyBot:
                 position_mode=mode,
             )
         except Exception as err:  # noqa: BLE001 — most likely the one-master-per-owner constraint
-            await status.edit_text(f"❌ Could not save: {err}")
+            await status.edit_text(f"❌ Не вдалося зберегти: {err}")
             context.user_data.clear()
             return ConversationHandler.END
 
@@ -559,7 +559,7 @@ class CopyBot:
         if warning:
             # A position-mode mismatch would silently mirror the wrong direction, so that one
             # message survives the sweep rather than being replaced by a tidy menu.
-            await status.edit_text(f"✅ <b>{label} added</b>{warning}", parse_mode=ParseMode.HTML)
+            await status.edit_text(f"✅ <b>{label} додано</b>{warning}", parse_mode=ParseMode.HTML)
             cleanup.remove(status.message_id)
         await self._delete_messages(update.effective_chat.id, cleanup)
 
@@ -584,7 +584,7 @@ class CopyBot:
     async def _cancel_add(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await self._delete_messages(update.effective_chat.id, context.user_data.get("cleanup", []))
         context.user_data.clear()
-        await update.message.reply_text("Cancelled.")
+        await update.message.reply_text("Скасовано.")
         return ConversationHandler.END
 
     async def _delete_messages(self, chat_id: int, message_ids: list[int]) -> None:
