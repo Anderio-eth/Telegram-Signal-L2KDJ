@@ -51,6 +51,10 @@ CONNECT_TIMEOUT_SECONDS = 12.0
 # It is one request per second against an endpoint that has no per-order cost.
 ORDER_POLL_SECONDS = 1.0
 
+# Named rather than inlined: patching this file has repeatedly turned an escaped newline into a
+# real one, which is a syntax error that only surfaces at import.
+NEWLINE = chr(10)
+
 ReportCallback = Callable[[MasterEvent, list[FollowerResult]], Awaitable[None]]
 NoticeCallback = Callable[[str], Awaitable[None]]
 
@@ -93,13 +97,12 @@ class CopyService:
         self._order_poll_task: asyncio.Task[None] | None = None
         # Master order ids currently resting in the book, as of the last poll.
         self._resting: set[str] = set()
+        # None until the socket first reports in, so the initial connect can stay quiet.
+        self._was_connected: bool | None = None
         # master order id -> the position side it closes, or None if it opens exposure.
         # Recorded when the copies are placed, because by the time it fills the master's
         # position is already gone and the question can no longer be answered.
         self._closing_intent: dict[str, int | None] = {}
-        # master order id -> volume each follower was asked for. Needed to tell a straggler
-        # from an account that was never in the trade at all.
-        self._mirrored_vol: dict[str, dict[int, float]] = {}
         # master order id -> volume each follower was asked for. Needed to tell a straggler
         # from an account that was never in the trade at all.
         self._mirrored_vol: dict[str, dict[int, float]] = {}
@@ -145,7 +148,7 @@ class CopyService:
             on_order=self._handle_order,
             on_stop_order=self._handle_stop_order,
             on_resync=self._resync_master,
-            on_status=self._notice,
+            on_status=self._master_status,
             reconnect_max_seconds=self._ws_reconnect_max,
         )
         self._ws.start()
@@ -369,10 +372,34 @@ class CopyService:
                 for side in (1, 2):
                     await self._store.delete_position(follower.id, order.symbol, side)
 
-    async def _notice(self, message: str) -> None:
-        if self.on_notice:
-            with contextlib.suppress(Exception):
-                await self.on_notice(f"Майстер: {message}")
+    async def _master_status(self, connected: bool, detail: str = "") -> None:
+        """Say something only when the connection actually changes state.
+
+        The socket reconnects on its own for all sorts of reasons, and a "connected" line on each
+        one is noise — it trains you to ignore the row it appears in, which is the row a real
+        disconnection will appear in too. The first connect is silent as well: pressing START
+        already answered that question.
+        """
+        was = self._was_connected
+        self._was_connected = connected
+
+        if connected:
+            if was is False:
+                await self._notify("✅ <b>Майстер знову підключений.</b>")
+            return
+
+        if was:
+            await self._notify(
+                NEWLINE.join(
+                    [
+                        "⚠️ <b>Майстер відключився</b>",
+                        "",
+                        detail or "звʼязок втрачено",
+                        "",
+                        "Копіювання призупинено, перепідключаюсь автоматично.",
+                    ]
+                )
+            )
 
     async def _resync_master(self) -> None:
         """Make the master's real positions the baseline, emitting nothing.
@@ -907,8 +934,9 @@ class CopyService:
             # nothing and say so: quietly falling back to every follower would open positions on
             # the same side as the master, the precise opposite of what reverse is for.
             LOGGER.warning("reverse mode has no usable account for owner %s", self._owner_id)
-            await self._notice(
-                "⚠️ Увімкнено реверс, але його акаунт відсутній, на паузі або завис — нічого не скопійовано."
+            await self._notify(
+                "⚠️ Увімкнено реверс, але його акаунт відсутній, на паузі або завис — "
+                "нічого не скопійовано."
             )
             return
 

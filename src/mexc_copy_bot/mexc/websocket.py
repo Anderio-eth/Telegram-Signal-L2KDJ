@@ -65,7 +65,7 @@ class MasterWebSocket:
         on_order: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_stop_order: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
         on_resync: Callable[[], Awaitable[None]] | None = None,
-        on_status: Callable[[str], Awaitable[None]] | None = None,
+        on_status: Callable[[bool, str], Awaitable[None]] | None = None,
         reconnect_max_seconds: float = 30.0,
     ) -> None:
         self._api_key = api_key
@@ -115,11 +115,11 @@ class MasterWebSocket:
         self._connected = False
         self._connected_event.clear()
 
-    async def _status(self, message: str) -> None:
+    async def _status(self, connected: bool, detail: str = "") -> None:
         LOGGER.info("master ws: %s", message)
         if self._on_status:
             with contextlib.suppress(Exception):
-                await self._on_status(message)
+                await self._on_status(connected, detail)
 
     async def _run(self) -> None:
         backoff = 1.0
@@ -133,7 +133,7 @@ class MasterWebSocket:
                 self._connected = False
                 self._connected_event.clear()
                 LOGGER.warning("master ws dropped: %s (retry in %.0fs)", err, backoff)
-                await self._status(f"disconnected: {err}")
+                await self._status(False, str(err))
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self._reconnect_max)
 
@@ -161,7 +161,7 @@ class MasterWebSocket:
 
                 self._connected = True
                 self._connected_event.set()
-                await self._status("connected")
+                await self._status(True)
 
                 # A reconnect may have missed changes; re-read reality before trusting deltas.
                 if self._on_resync:
