@@ -93,6 +93,7 @@ def _accounts_keyboard(has_master: bool, can_add_follower: bool, lang: str) -> I
     if not has_master:
         rows.append([InlineKeyboardButton(t(lang, "btn_add_master"), callback_data="add_master")])
     else:
+        rows.append([InlineKeyboardButton(t(lang, "btn_promote"), callback_data="promote")])
         rows.append([InlineKeyboardButton(t(lang, "btn_change_master"), callback_data="change_master")])
     if can_add_follower:
         rows.append([InlineKeyboardButton(t(lang, "btn_add_follower"), callback_data="add_follower")])
@@ -338,6 +339,14 @@ class CopyBot:
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(self._lang_now(owner_id), "btn_back"), callback_data="menu")]]),
                 parse_mode=ParseMode.HTML,
             )
+        elif action == "promote":
+            if await self._refuse_while_running(update, owner_id):
+                return
+            await self._show_promote(update, owner_id)
+        elif action.startswith("promote:"):
+            if await self._refuse_while_running(update, owner_id):
+                return
+            await self._do_promote(update, owner_id, int(action.split(":", 1)[1]))
         elif action == "change_master":
             if await self._refuse_while_running(update, owner_id):
                 return
@@ -495,6 +504,50 @@ class CopyBot:
         await update.callback_query.edit_message_text(
             t(await self._lang(owner_id), "reverse_pick"),
             reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _show_promote(self, update: Update, owner_id: int) -> None:
+        lang = await self._lang(owner_id)
+        master = await self._store.get_master(owner_id)
+        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        if not master or not followers:
+            await self._show_accounts(update, owner_id)
+            return
+        rows = [
+            [InlineKeyboardButton(
+                f"⬆️ {f.label} (…{f.api_key_hint})", callback_data=f"promote:{f.id}"
+            )]
+            for f in followers
+        ]
+        rows.append([InlineKeyboardButton(t(lang, "btn_back"), callback_data="accounts")])
+        await update.callback_query.edit_message_text(
+            t(lang, "promote_pick", hint=master.api_key_hint),
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _do_promote(self, update: Update, owner_id: int, account_id: int) -> None:
+        lang = await self._lang(owner_id)
+        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        chosen = next((f for f in followers if f.id == account_id), None)
+        # Checked against this owner's own followers: a stale callback must not be able to hand
+        # the master role to an account that is not theirs, or no longer exists.
+        if not chosen or not await self._store.promote_follower(owner_id, account_id):
+            await self._show_accounts(update, owner_id)
+            return
+
+        # The service is holding the previous master's socket and position baseline, both of which
+        # now describe a follower. START must build them again from the new master.
+        service = await self._registry.get(owner_id)
+        if service.running:
+            await service.stop()
+        self._invalidate_balances(owner_id)
+
+        await update.callback_query.edit_message_text(
+            t(lang, "promoted", new=chosen.label),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                t(lang, "btn_back"), callback_data="accounts")]]),
             parse_mode=ParseMode.HTML,
         )
 

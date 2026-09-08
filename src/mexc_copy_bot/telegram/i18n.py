@@ -33,7 +33,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "btn_add_master": {UK: "👤 Додати Master акаунт", EN: "👤 Add Master account"},
     "btn_add_follower": {UK: "➕ Додати Follower акаунт", EN: "➕ Add Follower account"},
     "btn_remove": {UK: "🗑 Видалити акаунт", EN: "🗑 Remove account"},
-    "btn_change_master": {UK: "🔄 Змінити Master", EN: "🔄 Change the Master"},
+    "btn_change_master": {UK: "🔄 Змінити Master (нові ключі)", EN: "🔄 Change the Master (new keys)"},
+    "btn_promote": {UK: "⬆️ Зробити Master з Follower", EN: "⬆️ Promote a Follower"},
     "btn_confirm_change": {UK: "✅ Так, змінити", EN: "✅ Yes, change it"},
     "btn_back": {UK: "« Назад", EN: "« Back"},
     "btn_cancel": {UK: "Скасувати", EN: "Cancel"},
@@ -224,6 +225,19 @@ STRINGS: dict[str, dict[str, str]] = {
     "master_changed": {
         UK: "✅ <b>Master змінено</b>\n\nНовий Master: …{hint}",
         EN: "✅ <b>Master changed</b>\n\nNew Master: …{hint}",
+    },
+
+    "promote_pick": {
+        UK: "⬆️ <b>ЗРОБИТИ MASTER</b>\n\n"
+            "Обери акаунт. Він стане Master, а поточний Master (…{hint}) займе його місце серед "
+            "followers — ключі нікуди не зникають.",
+        EN: "⬆️ <b>PROMOTE TO MASTER</b>\n\n"
+            "Pick an account. It becomes the Master, and the current Master (…{hint}) takes its "
+            "place among the followers — no keys are lost.",
+    },
+    "promoted": {
+        UK: "✅ <b>Ролі змінено</b>\n\nНовий Master: <b>{new}</b>\nСтарий Master тепер follower.",
+        EN: "✅ <b>Roles swapped</b>\n\nNew Master: <b>{new}</b>\nThe old Master is now a follower.",
     },
 
     "reverse_pick": {

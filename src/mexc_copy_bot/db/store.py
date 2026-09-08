@@ -178,6 +178,46 @@ class Store:
                     position_mode,
                 )
 
+    async def promote_follower(self, owner_id: int, account_id: int) -> bool:
+        """Make one of this owner's followers the master, and the master a follower.
+
+        A swap rather than a replacement: both accounts keep their keys, so nothing is lost and
+        the roles can be swapped back. The counts do not move either — the promoted account leaves
+        the follower list as the demoted one joins it.
+
+        Order matters inside the transaction. The old master is demoted first, because the schema
+        permits exactly one master per owner and promoting first would collide with it. Zero
+        masters for the instant in between is allowed; two are not.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                candidate = await conn.fetchrow(
+                    "SELECT label FROM copy_accounts WHERE id = $1 AND owner_id = $2 AND kind = $3",
+                    account_id, owner_id, FOLLOWER,
+                )
+                if not candidate:
+                    return False
+
+                # The demoted master takes the promoted account's old label, so the follower
+                # numbering stays contiguous and unique instead of gaining a second "Follower #3".
+                await conn.execute(
+                    "UPDATE copy_accounts SET kind = $2, label = $3, updated_at = now()"
+                    " WHERE owner_id = $1 AND kind = $4",
+                    owner_id, FOLLOWER, candidate["label"], MASTER,
+                )
+                await conn.execute(
+                    "UPDATE copy_accounts SET kind = $2, label = 'Master', updated_at = now()"
+                    " WHERE id = $1",
+                    account_id, MASTER,
+                )
+                # A hedge account that has just become the master would be hedging itself.
+                await conn.execute(
+                    "UPDATE copy_state SET reverse_account_id = NULL"
+                    " WHERE owner_id = $1 AND reverse_account_id = $2",
+                    owner_id, account_id,
+                )
+        return True
+
     async def list_accounts(self, owner_id: int, kind: str | None = None) -> list[Account]:
         query = """
             SELECT id, owner_id, label, kind, api_key_hint, size_multiplier, active, position_mode,
