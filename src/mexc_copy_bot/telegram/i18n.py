@@ -33,6 +33,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "btn_add_master": {UK: "👤 Додати Master акаунт", EN: "👤 Add Master account"},
     "btn_add_follower": {UK: "➕ Додати Follower акаунт", EN: "➕ Add Follower account"},
     "btn_remove": {UK: "🗑 Видалити акаунт", EN: "🗑 Remove account"},
+    "btn_change_master": {UK: "🔄 Змінити Master", EN: "🔄 Change the Master"},
+    "btn_confirm_change": {UK: "✅ Так, змінити", EN: "✅ Yes, change it"},
     "btn_back": {UK: "« Назад", EN: "« Back"},
     "btn_cancel": {UK: "Скасувати", EN: "Cancel"},
     "btn_cancel_x": {UK: "✖ Скасувати", EN: "✖ Cancel"},
@@ -203,6 +205,25 @@ STRINGS: dict[str, dict[str, str]] = {
             "чекають наступного входу.",
         EN: "Sorted accounts are back under the master. They do not join the position it is "
             "already in — they wait for the next entry.",
+    },
+
+    "change_master_warn": {
+        UK: "🔄 <b>ЗМІНА MASTER АКАУНТА</b>\n\n"
+            "Поточний Master (…{hint}) буде <b>видалено</b>, разом з його ключами.\n\n"
+            "Позиції на follower-акаунтах <b>не чіпаються</b> — вони лишаться як є. Але новий "
+            "Master їх не знає: копіювання почнеться з його наступної дії.\n\n"
+            "Якщо на followers зараз щось відкрито — закрий це до заміни, інакше воно зависне "
+            "без нагляду.",
+        EN: "🔄 <b>CHANGE THE MASTER</b>\n\n"
+            "The current Master (…{hint}) will be <b>deleted</b>, keys and all.\n\n"
+            "Follower positions are <b>left alone</b>. But the new Master knows nothing about "
+            "them: copying starts from its next action.\n\n"
+            "If the followers are holding anything right now, close it first, or it will sit "
+            "there unattended.",
+    },
+    "master_changed": {
+        UK: "✅ <b>Master змінено</b>\n\nНовий Master: …{hint}",
+        EN: "✅ <b>Master changed</b>\n\nNew Master: …{hint}",
     },
 
     "reverse_pick": {

@@ -92,6 +92,8 @@ def _accounts_keyboard(has_master: bool, can_add_follower: bool, lang: str) -> I
     rows = []
     if not has_master:
         rows.append([InlineKeyboardButton(t(lang, "btn_add_master"), callback_data="add_master")])
+    else:
+        rows.append([InlineKeyboardButton(t(lang, "btn_change_master"), callback_data="change_master")])
     if can_add_follower:
         rows.append([InlineKeyboardButton(t(lang, "btn_add_follower"), callback_data="add_follower")])
     rows.append([InlineKeyboardButton(t(lang, "btn_remove"), callback_data="remove_menu")])
@@ -334,6 +336,21 @@ class CopyBot:
             await query.edit_message_text(
                 "\n".join(lines),
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(self._lang_now(owner_id), "btn_back"), callback_data="menu")]]),
+                parse_mode=ParseMode.HTML,
+            )
+        elif action == "change_master":
+            if await self._refuse_while_running(update, owner_id):
+                return
+            master = await self._store.get_master(owner_id)
+            if not master:
+                await self._show_accounts(update, owner_id)
+                return
+            await update.callback_query.edit_message_text(
+                t(lang_now := await self._lang(owner_id), "change_master_warn", hint=master.api_key_hint),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(t(lang_now, "btn_confirm_change"), callback_data="add_master")],
+                    [InlineKeyboardButton(t(lang_now, "btn_back"), callback_data="accounts")],
+                ]),
                 parse_mode=ParseMode.HTML,
             )
         elif action == "stuck":
@@ -826,7 +843,14 @@ class CopyBot:
         # they showed (balance, mode) is now on the menu, which stays put instead of scrolling off.
         cleanup = list(context.user_data.get("cleanup", []))
         cleanup.append(status.message_id)
-        if warning:
+        if replacing:
+            # A swap deleted an account and its keys. That deserves a line that stays, not a menu
+            # quietly redrawn with a different key hint.
+            await status.edit_text(
+                t(lang, "master_changed", hint=api_key[-4:]), parse_mode=ParseMode.HTML
+            )
+            cleanup.remove(status.message_id)
+        elif warning:
             # A position-mode mismatch would silently mirror the wrong direction, so that one
             # message survives the sweep rather than being replaced by a tidy menu.
             await status.edit_text(t(lang, "add_done", label=label, warning=warning), parse_mode=ParseMode.HTML)

@@ -145,6 +145,39 @@ class Store:
                 position_mode,
             )
 
+    async def replace_master(
+        self, *, owner_id: int, api_key: str, api_secret: str, position_mode: int | None
+    ) -> int:
+        """Swap in a new master, removing the old one, as a single transaction.
+
+        Both halves together or neither: the schema allows exactly one master per owner, so a
+        delete that succeeded while the insert failed would leave the owner with no master at all
+        and their keys already gone.
+
+        The old master's rows go with it — its expected positions and any mirrored-order mappings
+        are about an account that is no longer part of this setup, and keeping them would leave
+        reconciliation comparing followers against a master that is not the master.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM copy_accounts WHERE owner_id = $1 AND kind = $2", owner_id, MASTER
+                )
+                return await conn.fetchval(
+                    """
+                    INSERT INTO copy_accounts
+                        (owner_id, label, kind, api_key_enc, api_secret_enc, api_key_hint, position_mode)
+                    VALUES ($1, 'Master', $2, $3, $4, $5, $6)
+                    RETURNING id
+                    """,
+                    owner_id,
+                    MASTER,
+                    self._cipher.encrypt(api_key),
+                    self._cipher.encrypt(api_secret),
+                    api_key[-4:],
+                    position_mode,
+                )
+
     async def list_accounts(self, owner_id: int, kind: str | None = None) -> list[Account]:
         query = """
             SELECT id, owner_id, label, kind, api_key_hint, size_multiplier, active, position_mode,
