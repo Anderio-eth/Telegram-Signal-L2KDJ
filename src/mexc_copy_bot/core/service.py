@@ -189,6 +189,63 @@ class CopyService:
         return outcomes
 
     # ── master monitoring ───────────────────────────────────────────────────────────────────
+    async def _notify(self, text: str) -> None:
+        """Send an unsolicited message, never letting a Telegram failure reach the trading path."""
+        if self.on_notice:
+            with contextlib.suppress(Exception):
+                await self.on_notice(text)
+
+    async def _report_limit_fill(self, order) -> None:
+        """Say where the mirrored copies actually ended up.
+
+        Read from the exchange rather than assumed. The whole point of a limit is that it fills
+        only if price reaches it, so "the master filled" does not by itself mean the followers did
+        — a copy can still be resting, and whoever is watching needs to be told that rather than
+        handed a tidy success message.
+        """
+        followers = await self._eligible_followers()
+        if not followers or not self._session:
+            return
+        # A moment for the venue to settle the copies before asking about them.
+        await asyncio.sleep(1.5)
+
+        async def holding(follower: Account):
+            credentials = await self._store.get_credentials(follower.id, follower.owner_id)
+            if not credentials:
+                return None, "credentials missing"
+            client = MexcRestClient(*credentials, session=self._session)
+            try:
+                positions = await client.get_open_positions(order.symbol)
+            except MexcError as err:
+                return None, err.message
+            return sum(
+                p.hold_vol for p in positions
+                if p.position_type == order.position_type and p.hold_vol > 0
+            ), None
+
+        results = await asyncio.gather(*(holding(f) for f in followers), return_exceptions=True)
+
+        side = "LONG" if order.position_type == 1 else "SHORT"
+        lines = [
+            "✅ <b>LIMIT FILLED</b>",
+            "",
+            f"<b>{order.symbol}</b> {side} @ {order.price:g}",
+            f"Master filled {order.deal_vol or order.vol:g}",
+            "",
+        ]
+        for follower, res in zip(followers, results, strict=True):
+            if not isinstance(res, tuple):
+                lines.append(f"❓ {follower.label} — could not check")
+                continue
+            vol, error = res
+            if error:
+                lines.append(f"❌ {follower.label} — {error}")
+            elif vol:
+                lines.append(f"✅ {follower.label} — holding {vol:g}")
+            else:
+                lines.append(f"⏳ {follower.label} — not filled yet")
+        await self._notify("\n".join(lines))
+
     async def _notice(self, message: str) -> None:
         if self.on_notice:
             with contextlib.suppress(Exception):
@@ -381,6 +438,7 @@ class CopyService:
                 self._filled_by_limit[key] = self._filled_by_limit.get(key, 0.0) + filled
                 await self._store.clear_mirrored_order(self._owner_id, order.order_id)
                 LOGGER.info("limit fill of %s on %s discounted from the position path", filled, key)
+                asyncio.create_task(self._report_limit_fill(order))
 
     async def _master_client(self) -> MexcRestClient | None:
         master = await self._store.get_master(self._owner_id)
@@ -480,6 +538,8 @@ class CopyService:
                     self._filled_by_limit[key] = self._filled_by_limit.get(key, 0.0) + filled
                     await self._store.clear_mirrored_order(self._owner_id, order_id)
                     LOGGER.info("master limit filled %s on %s; discounted", filled, key)
+                    # Off the lock: it reads every follower and must not hold up the next event.
+                    asyncio.create_task(self._report_limit_fill(parsed))
 
     async def _place_mirrored(self, order) -> None:
         followers = await self._eligible_followers()
@@ -504,15 +564,18 @@ class CopyService:
             else:
                 failed.append(f"{follower.label}: {error}")
 
-        if self.on_notice:
-            lines = [
-                f"📌 <b>LIMIT MIRRORED</b>",
-                f"{order.symbol} @ {order.price:g}  vol {order.vol:g}",
-                f"placed on {placed}/{len(followers)}",
-            ]
-            lines += [f"❌ {f}" for f in failed]
-            with contextlib.suppress(Exception):
-                await self.on_notice("\n".join(lines))
+        side = "LONG" if order.position_type == 1 else "SHORT"
+        what = "OPEN" if order.is_opening else "CLOSE"
+        lines = [
+            "📌 <b>LIMIT PLACED</b> — mirrored from master",
+            "",
+            f"<b>{order.symbol}</b> {side} ({what})",
+            f"Price: {order.price:g}   Size: {order.vol:g}",
+            "",
+            f"Placed on {placed}/{len(followers)} account(s)",
+        ]
+        lines += [f"❌ {f}" for f in failed]
+        await self._notify("\n".join(lines))
 
     async def _cancel_mirrored(self, master_order_id: str) -> None:
         pairs = await self._store.get_mirrored_orders(self._owner_id, master_order_id)
@@ -526,6 +589,11 @@ class CopyService:
         cancelled = await engine.cancel_mirrored_orders(todo)
         await self._store.clear_mirrored_order(self._owner_id, master_order_id)
         LOGGER.info("cancelled %s/%s mirrored copies of %s", cancelled, len(todo), master_order_id)
+        await self._notify(
+            "🚫 <b>LIMIT CANCELLED</b>\n\n"
+            "The master pulled its order.\n"
+            f"Cancelled on {cancelled}/{len(todo)} account(s)."
+        )
 
     async def _eligible_followers(self) -> list[Account]:
         """Whose accounts an action applies to, honouring the copy/hedge mode."""

@@ -25,6 +25,7 @@ import logging
 import random
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 
@@ -87,6 +88,18 @@ class FollowerResult:
 # How long to keep asking the exchange what a just-closed position settled at. Settlement is not
 # instant, and reporting "unknown" on a close that simply had not settled yet would be noise.
 PNL_POLL_DELAYS = (0.0, 0.5, 1.0, 2.0)
+
+
+def _order_id_from(payload: Any) -> str | None:
+    """MEXC returns a new order id either bare or wrapped; accept both, reject neither silently."""
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        value = payload.get("orderId") or payload.get("id")
+        return str(value) if value else None
+    if isinstance(payload, (str, int)):
+        return str(payload)
+    return None
 
 
 def _is_already_flat(err: MexcError) -> bool:
@@ -191,6 +204,7 @@ class CopyEngine:
                             open_type=order.open_type, symbol=order.symbol,
                             position_type=position_type,
                         )
+                tag = f"lm{order.order_id}-{follower.id}-{uuid.uuid4().hex[:6]}"
                 result = await client.submit_order(
                     symbol=order.symbol,
                     side=side,
@@ -199,10 +213,15 @@ class CopyEngine:
                     open_type=order.open_type,
                     order_type=ORDER_TYPE_LIMIT,
                     price=order.price,
-                    external_oid=f"lm{order.order_id}-{follower.id}-{uuid.uuid4().hex[:6]}",
+                    external_oid=tag,
                 )
-                # MEXC returns the new order id as the bare payload.
-                return follower, str(result) if result is not None else None, None
+                order_id = _order_id_from(result)
+                if not order_id:
+                    # The order exists on the exchange but we cannot name it, which would leave it
+                    # resting with no way to pull it when the master cancels. Find it by the tag we
+                    # sent, rather than leaving an untrackable live order on someone's account.
+                    order_id = await self._find_by_tag(client, order.symbol, tag)
+                return follower, order_id, None
             except MexcError as err:
                 return follower, None, err.message or str(err)
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
@@ -217,6 +236,17 @@ class CopyEngine:
                 LOGGER.exception("follower %s crashed placing a limit", follower.id, exc_info=res)
                 out.append((follower, None, str(res)[:200]))
         return out
+
+    @staticmethod
+    async def _find_by_tag(client: MexcRestClient, symbol: str, tag: str) -> str | None:
+        """Recover an order's id from the client id we chose for it."""
+        try:
+            for row in await client.get_open_orders(symbol):
+                if str(row.get("externalOid") or "") == tag:
+                    return str(row.get("orderId"))
+        except (MexcError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+            LOGGER.warning("could not recover order id for %s: %s", tag, err)
+        return None
 
     async def cancel_mirrored_orders(self, pairs: list[tuple[Account, str]]) -> int:
         """Pull the followers' copies. Best effort: an order that already filled or was cancelled
