@@ -116,7 +116,11 @@ class MasterWebSocket:
         self._connected_event.clear()
 
     async def _status(self, connected: bool, detail: str = "") -> None:
-        LOGGER.info("master ws: %s", message)
+        LOGGER.info(
+            "master ws: %s%s",
+            "connected" if connected else "disconnected",
+            f" ({detail})" if detail else "",
+        )
         if self._on_status:
             with contextlib.suppress(Exception):
                 await self._on_status(connected, detail)
