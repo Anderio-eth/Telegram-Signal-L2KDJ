@@ -43,6 +43,10 @@ class PositionSnapshot:
     open_type: int
     state: int
     version: int | None = None
+    # Which position this is. MEXC opens a new one every time the pair is entered again, and the
+    # id is the only thing in the frame that tells two of them apart — `version` counts updates
+    # inside one position and starts again at 1 for the next.
+    position_id: int | None = None
 
     @property
     def key(self) -> tuple[str, int]:
@@ -83,6 +87,7 @@ def parse_position(data: dict[str, Any]) -> PositionSnapshot | None:
             open_type=int(data.get("openType") or 2),
             state=int(data.get("state") or STATE_HOLDING),
             version=int(data["version"]) if data.get("version") is not None else None,
+            position_id=int(data["positionId"]) if data.get("positionId") is not None else None,
         )
     except (TypeError, ValueError):
         return None
@@ -152,11 +157,21 @@ class MasterPositionTracker:
 def _dedupe_key(snapshot: PositionSnapshot, action: Action, after: float) -> str:
     """Stable identity for one observed change.
 
-    MEXC's `version` increments per position update, so (position, version) identifies a change
-    exactly — that is the ideal key. Where a frame arrives without one, the resulting size plus
-    action is used instead: replaying the same frame yields the same key, while a genuinely new
-    change moves the size and produces a different one.
+    The position id has to be in here. `version` counts updates WITHIN one position and starts
+    again at 1 for the next one, so a key of symbol + side + version repeats itself the moment the
+    same pair is traded a second time — and the second trade is then dropped as a duplicate of the
+    first. Silently: a swallowed event never reaches a follower and never reports anything, so the
+    master opens, nothing happens anywhere, and the bot says nothing.
+
+    That is not hypothetical. SILVER_USDT was opened twice; the second open produced
+    "SILVER_USDT:1:v1" all over again, collided with the first, and was discarded. Every symbol
+    worked exactly once and was then permanently deaf on that side.
+
+    Without an id — no frame seen so far lacks one — the resulting size plus action is the
+    fallback: replaying the same frame yields the same key, while a genuinely different change
+    produces a different one.
     """
+    scope = f"#{snapshot.position_id}" if snapshot.position_id is not None else ""
     if snapshot.version is not None:
-        return f"{snapshot.symbol}:{snapshot.position_type}:v{snapshot.version}"
-    return f"{snapshot.symbol}:{snapshot.position_type}:{action.value}:{after:.10f}"
+        return f"{snapshot.symbol}:{snapshot.position_type}{scope}:v{snapshot.version}"
+    return f"{snapshot.symbol}:{snapshot.position_type}{scope}:{action.value}:{after:.10f}"

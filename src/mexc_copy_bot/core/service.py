@@ -1000,7 +1000,12 @@ class CopyService:
             raw=raw,
         )
         if event_id is None:
-            LOGGER.info("duplicate master event ignored: %s", event.dedupe_key)
+            # A dropped event reaches nobody and reports nothing, so when the key was wrong this
+            # was the whole of the evidence. Logged loudly enough to find in a deploy's output.
+            LOGGER.warning(
+                "master event dropped as a duplicate: %s (%s %s)",
+                event.dedupe_key, event.action.value, event.symbol,
+            )
             return
 
         mode, _ = await self._store.get_mode(self._folder_id)
