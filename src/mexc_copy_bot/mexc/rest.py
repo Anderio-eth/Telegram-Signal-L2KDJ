@@ -85,11 +85,19 @@ RATE_LIMIT_BACKOFF = (0.4, 1.2, 3.0)
 # there. Changing this back will make every order fail with an HTML error page.
 BASE_URL = "https://api.mexc.com/api/v1"
 
-# MEXC's own enums (see futures docs → Enum Values).
+# MEXC's own enums. Verified against the live venue, because the futures documentation lists
+# these in a different order than the API actually behaves — and 3 and 4 were the wrong way round
+# here, which meant every attempt to open a SHORT was really an attempt to close a LONG:
+#
+#   side=3, holding nothing  -> a SHORT position of 1 contract appeared
+#   side=4, holding a SHORT  -> [2009] Position is nonexistent or closed
+#   side=4, holding nothing  -> [2009] Position is nonexistent or closed
+#
+# So 3 opens a short and 4 closes a long. Do not "correct" these back to match the docs.
 SIDE_OPEN_LONG = 1
 SIDE_CLOSE_SHORT = 2
-SIDE_CLOSE_LONG = 3
-SIDE_OPEN_SHORT = 4
+SIDE_OPEN_SHORT = 3
+SIDE_CLOSE_LONG = 4
 
 ORDER_TYPE_LIMIT = 1
 ORDER_TYPE_POST_ONLY = 2
@@ -462,9 +470,10 @@ class MexcRestClient:
         """Close every position on a symbol.
 
         This is the ONLY way this bot closes. Do not "close" by submitting the opposite side:
-        verified on a live hedge-mode account, sending side=3 (close long) against an open long
-        did not close it — MEXC opened a fresh SHORT alongside it, at the account's default
-        leverage rather than the position's:
+        verified on a live hedge-mode account, sending side=3 against an open long did not close
+        it — MEXC opened a fresh SHORT alongside it, at the account's default leverage rather than
+        the position's. Which is exactly right, side=3 being "open short": the enum above named it
+        "close long" at the time, and that mislabel is what made this look like a venue quirk.
 
             before:  ADA LONG  vol=1 lev=20
             after:   ADA LONG  vol=1 lev=20  +  ADA SHORT vol=1 lev=5

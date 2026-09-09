@@ -38,10 +38,11 @@ STATE_CANCELLED = 4
 STATE_INVALID = 5
 
 # MEXC order sides.
+# See the note in mexc/rest.py: 3 opens a short, 4 closes a long. Verified live.
 SIDE_OPEN_LONG = 1
 SIDE_CLOSE_SHORT = 2
-SIDE_CLOSE_LONG = 3
-SIDE_OPEN_SHORT = 4
+SIDE_OPEN_SHORT = 3
+SIDE_CLOSE_LONG = 4
 
 OPENING_SIDES = frozenset({SIDE_OPEN_LONG, SIDE_OPEN_SHORT})
 CLOSING_SIDES = frozenset({SIDE_CLOSE_LONG, SIDE_CLOSE_SHORT})
@@ -112,9 +113,15 @@ def reduces_position(order: "MasterOrder", held: dict[int, float]) -> int | None
     `held` is {position type: volume} on the account the order belongs to.
 
     This is the difference between mirroring a close and accidentally opening the opposite
-    position. Verified on a live account: exiting a long came through as side=4, "open short" —
-    identical in shape to genuinely opening a short. The only thing that separates them is whether
-    a long was being held at the time.
+    position. Exiting a long was seen coming through as side=4, which the enum called "open short"
+    at the time and which is in fact "close long" — so that particular case is now unambiguous and
+    handled by the explicit branch below.
+
+    The held-position check stays for the case it was really written for: an account in one-way
+    mode, where MEXC does express a close as an open on the opposite side. It costs a lookup and
+    it is the difference between closing a position and opening a naked one facing the wrong way.
+    Its one blind spot is a master deliberately holding both sides in hedge mode, where opening a
+    short while long is a hedge rather than an exit.
     """
     if order.side in CLOSING_SIDES:
         return REDUCES_SIDE[order.side]

@@ -12,9 +12,11 @@ Two rules drive the whole design:
     master's, or reconciliation will chase a position that was never opened.
 
   · Closing goes through close_all, never through an opposite-side order. Verified on a live
-    hedge-mode account: submitting side=3 ("close long") against an open long did not close it —
-    MEXC opened a fresh short alongside, at the account's default leverage. For a copy bot that
-    is the worst possible failure, since a "close" would leave every follower doubly exposed.
+    hedge-mode account: submitting side=3 against an open long did not close it — MEXC opened a
+    fresh short alongside, at the account's default leverage. That reads oddly until you know
+    side=3 is "open short" and not "close long"; the enum here said the latter for a long time,
+    which is the whole reason the experiment was a surprise. For a copy bot the failure is the
+    worst one possible, since a "close" would leave every follower doubly exposed.
 """
 
 from __future__ import annotations
