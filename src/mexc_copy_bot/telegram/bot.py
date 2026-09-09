@@ -1027,6 +1027,7 @@ class CopyBot:
         except Exception:  # noqa: BLE001
             pass
 
+        lang = await self._lang(owner_id)
         folder_id = self._folder(owner_id)
         status = await update.effective_chat.send_message(t(lang, "add_validating"))
 
