@@ -35,6 +35,11 @@ WS_URL = "wss://contract.mexc.com/edge"
 PING_SECONDS = 15.0
 LOGIN_TIMEOUT = 10.0
 
+# A session that stood up this long was working; whatever ended it is a fresh problem and gets a
+# fresh short delay. Anything shorter is a socket that will not stay up, and backing off is the
+# only thing that stops it becoming a hot loop.
+HEALTHY_SESSION_SECONDS = 60.0
+
 # MEXC's own docs disagree with what the socket actually sends: the position channel is
 # `push.personal.position`, while the docs name the stop channel `push.stop.order`. Both spellings
 # are accepted rather than betting on either — the same class of documentation error already cost
@@ -126,20 +131,39 @@ class MasterWebSocket:
                 await self._on_status(connected, detail)
 
     async def _run(self) -> None:
+        """Keep one master socket up, backing off when it will not stay up.
+
+        The wait applies to EVERY reconnect, not only to one that failed with an exception. MEXC
+        closes an idle socket after about a minute and aiohttp reports that as the iterator simply
+        ending — no exception at all. This loop used to sleep only in the `except` branch, so a
+        venue-side close came back round instantly, and each pass re-connects, re-logs in and calls
+        on_resync, which reads positions over REST. A socket that would not stay up therefore
+        turned into an unpaced loop of REST calls, which is one way to be told your requests are
+        too frequent while doing nothing at all.
+
+        Backoff resets on a session that actually lasted, not on one that merely connected.
+        Otherwise connect-then-drop keeps resetting the delay to a second and the loop never slows.
+        """
         backoff = 1.0
         while self._running:
+            started = asyncio.get_running_loop().time()
             try:
                 await self._session_loop()
-                backoff = 1.0
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 — any failure must lead to a reconnect, not a crash
-                self._connected = False
-                self._connected_event.clear()
-                LOGGER.warning("master ws dropped: %s (retry in %.0fs)", err, backoff)
-                await self._status(False, str(err))
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self._reconnect_max)
+                detail = str(err)
+            else:
+                detail = "closed by the venue"
+            self._connected = False
+            self._connected_event.clear()
+
+            if asyncio.get_running_loop().time() - started >= HEALTHY_SESSION_SECONDS:
+                backoff = 1.0
+            LOGGER.warning("master ws dropped: %s (retry in %.0fs)", detail, backoff)
+            await self._status(False, detail)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self._reconnect_max)
 
     async def _session_loop(self) -> None:
         async with aiohttp.ClientSession() as session:
