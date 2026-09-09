@@ -485,16 +485,7 @@ class CopyBot:
         elif action == "mode_reverse":
             if await self._refuse_while_running(update, owner_id):
                 return
-            await self._show_reverse_picker(update, owner_id)
-        elif action.startswith("reverse_pick:"):
-            if await self._refuse_while_running(update, owner_id):
-                return
-            account_id = int(action.split(":", 1)[1])
-            # Verified against this owner's own followers: a stale callback must not be able to
-            # point the hedge at an account that is not theirs, or no longer exists.
-            followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
-            if any(f.id == account_id for f in followers):
-                await self._store.set_mode(self._folder(owner_id), MODE_REVERSE, account_id)
+            await self._store.set_mode(self._folder(owner_id), MODE_REVERSE, None)
             await self._show_mode(update, owner_id)
         elif action == "remove_menu":
             await self._show_remove_menu(update, owner_id)
@@ -566,37 +557,16 @@ class CopyBot:
                     f"{follower.label} — {arrow}", callback_data=f"dir:{follower.id}"
                 )])
             rows.append([InlineKeyboardButton(t(lang, "btn_to_copy"), callback_data="mode_copy")])
-        rows.append(
-            [InlineKeyboardButton(
-                t(lang, "btn_pick_hedge") if mode == MODE_REVERSE else t(lang, "btn_to_reverse"),
-                callback_data="mode_reverse",
-            )]
-        )
+        else:
+            # Only offered when it would change something. In REVERSE the accounts are already
+            # listed above, and a button that re-selects the mode you are in is a dead tap.
+            rows.append(
+                [InlineKeyboardButton(t(lang, "btn_to_reverse"), callback_data="mode_reverse")]
+            )
         rows.append([InlineKeyboardButton(t(self._lang_now(owner_id), "btn_back"), callback_data="menu")])
 
         await update.callback_query.edit_message_text(
             messages.mode_screen(mode, chosen, followers, lang),
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML,
-        )
-
-    async def _show_reverse_picker(self, update: Update, owner_id: int) -> None:
-        followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
-        if not followers:
-            await update.callback_query.edit_message_text(
-                t(await self._lang(owner_id), "reverse_needs_follower"),
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(self._lang_now(owner_id), "btn_back"), callback_data="mode")]]),
-            )
-            return
-        rows = [
-            [InlineKeyboardButton(
-                f"🔁 {f.label} (…{f.api_key_hint})", callback_data=f"reverse_pick:{f.id}"
-            )]
-            for f in followers
-        ]
-        rows.append([InlineKeyboardButton(t(self._lang_now(owner_id), "btn_back"), callback_data="mode")])
-        await update.callback_query.edit_message_text(
-            t(await self._lang(owner_id), "reverse_pick"),
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
         )
