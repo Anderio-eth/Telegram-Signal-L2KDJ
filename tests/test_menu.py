@@ -12,14 +12,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mexc_copy_bot.db.store import FOLLOWER, MASTER, Account  # noqa: E402
+from mexc_copy_bot.db.store import FOLLOWER, MASTER, MODE_REVERSE, Account  # noqa: E402
 from mexc_copy_bot.telegram.messages import Balance, main_menu  # noqa: E402
 
 
-def account(account_id: int, kind: str, label: str, hint: str, active: bool = True) -> Account:
+def account(
+    account_id: int, kind: str, label: str, hint: str, active: bool = True, direction: str = "COPY"
+) -> Account:
     return Account(
         id=account_id, owner_id=1, label=label, kind=kind, api_key_hint=hint,
-        size_multiplier=1.0, active=active, position_mode=1, last_error=None,
+        size_multiplier=1.0, active=active, position_mode=1, last_error=None, direction=direction,
     )
 
 
@@ -104,3 +106,29 @@ def test_menu_without_a_master_still_lists_followers():
     text = render(master=None, followers=[F1], balances={2: Balance(equity=9.0, available=9.0)})
     assert "НЕМАЄ MASTER" in text
     assert "Follower #1" in text and "$9.00" in text
+
+
+# ── reverse mode on the main screen ─────────────────────────────────────────
+def test_reverse_mode_reports_the_split_not_a_missing_account():
+    """REVERSE stopped meaning "one nominated account" when every account got its own direction.
+    The menu kept reading the nominated-account field, which is now always empty, so a correctly
+    configured folder permanently warned that no account had been chosen."""
+    text = render(
+        running=True,
+        master_connected=True,
+        mode=MODE_REVERSE,
+        followers=[
+            account(2, FOLLOWER, "Follower #1", "AA11", direction="REVERSE"),
+            account(3, FOLLOWER, "Follower #2", "BB22", direction="REVERSE"),
+            account(4, FOLLOWER, "Follower #3", "CC33"),
+        ],
+    )
+    assert "не обрано" not in text
+    assert "2 навпаки" in text
+    assert "1 як майстер" in text
+
+
+def test_reverse_mode_with_no_followers_says_so_without_warning():
+    text = render(mode=MODE_REVERSE, followers=[])
+    assert "не обрано" not in text
+    assert "РЕВЕРС" in text

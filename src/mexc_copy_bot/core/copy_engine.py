@@ -67,7 +67,6 @@ BLOCKED_CONTRACT_TEXT = ("not activated", "contract not activated")
 # spends the next allowance. These waits are long enough for the window to actually roll over.
 RETRY_DELAYS = (0.2, 0.5, 1.0)
 RATE_LIMIT_DELAYS = (1.5, 4.0, 8.0)
-RATE_LIMIT_TEXT = ("too frequent", "rate limit", "too many requests")
 
 # MEXC's position types: 1 long, 2 short. Reversing is just swapping the two.
 OPPOSITE_SIDE = {1: 2, 2: 1}
@@ -125,8 +124,12 @@ def _is_already_flat(err: MexcError) -> bool:
 
 
 def _is_rate_limit(err: MexcError) -> bool:
-    text = (err.message or "").lower()
-    return any(word in text for word in RATE_LIMIT_TEXT)
+    """Deferred to the client, which knows the code as well as the wording.
+
+    Matching on text alone missed a refusal reported as a bare code 510, and a rate limit read as
+    a permanent error is an account dropped from a trade for no reason.
+    """
+    return err.is_rate_limited
 
 
 def _is_blocked_contract(err: MexcError) -> bool:

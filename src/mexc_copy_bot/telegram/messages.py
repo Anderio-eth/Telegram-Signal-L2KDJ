@@ -93,7 +93,6 @@ def main_menu(
     master_connected: bool,
     balances: dict[int, Balance] | None = None,
     mode: str = "COPY",
-    reverse_account: Account | None = None,
     lang: str = DEFAULT,
 ) -> str:
     """The main screen.
@@ -117,8 +116,18 @@ def main_menu(
     lines = ["🤖 <b>MEXC COPY BOT</b>", "", t(lang, "menu_status", status=status)]
 
     if mode == MODE_REVERSE:
-        target = reverse_account.label if reverse_account else t(lang, "no_account_chosen")
-        lines.append(t(lang, "menu_mode_reverse", target=target))
+        # Each account carries its own direction, so the headline is a count of both sides rather
+        # than one nominated account — with nine followers split five/four, naming one of them
+        # would describe almost nothing about what the folder is going to do.
+        reversed_count = sum(1 for f in followers if f.is_reversed)
+        lines.append(
+            t(lang, "menu_mode_reverse_none")
+            if not followers
+            else t(
+                lang, "menu_mode_reverse_split",
+                reverse=reversed_count, copy=len(followers) - reversed_count,
+            )
+        )
     else:
         lines.append(t(lang, "menu_mode_copy"))
     lines.append("")

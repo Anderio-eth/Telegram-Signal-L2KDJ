@@ -706,7 +706,27 @@ class CopyService:
         # Is the master getting OUT of something? On MEXC a close is expressed as an open on the
         # opposite side, so this cannot be read off the order alone — it needs the master's
         # position. Everything downstream depends on the answer, including who is eligible.
-        closing_side = await self._closing_side(order)
+        try:
+            closing_side = await self._closing_side(order)
+        except MexcError as err:
+            # Better a limit that was not mirrored, and said so, than nine accounts opening the
+            # opposite side because the one call that tells open from close did not come back.
+            LOGGER.warning("not mirroring %s: %s", order.symbol, err)
+            await self._notify(
+                NEWLINE.join(
+                    [
+                        "⚠️ <b>ЛІМІТКУ НЕ СКОПІЙОВАНО</b>",
+                        "",
+                        f"Майстер виставив ордер на <b>{order.symbol}</b>, але не вдалося",
+                        "прочитати його позицію, тому невідомо, це вхід чи вихід.",
+                        f"Причина: {err.message}",
+                        "",
+                        "Нічого не відправлено — інакше вихід міг би скопіюватись",
+                        "як вхід у протилежний бік.",
+                    ]
+                )
+            )
+            return
 
         followers = await self._eligible_followers(
             opening=closing_side is None, symbol=order.symbol
@@ -723,8 +743,15 @@ class CopyService:
             eligible = []
             for follower in followers:
                 held = await self._held(follower, order.symbol, closing_side)
+                if held is None:
+                    # Unknown, and a limit needs an exact size — capping at "what they hold" is
+                    # the whole reason for reading it, and guessing high would open the opposite
+                    # side. Named in the report rather than dropped silently, so whoever is
+                    # watching can close it by hand.
+                    skipped.append(f"{follower.label} (не вдалося прочитати позицію)")
+                    continue
                 if held <= 0:
-                    skipped.append(follower.label)
+                    skipped.append(f"{follower.label} (нема що закривати)")
                     continue
                 # Never more than they actually hold, or the surplus opens the opposite side.
                 vol_by_account[follower.id] = min(order.vol * follower.size_multiplier, held)
@@ -781,33 +808,42 @@ class CopyService:
         lines += [f"❌ {f}" for f in failed]
         if skipped:
             lines.append("")
-            lines.append(f"⏭ Пропущено (нема що закривати): {', '.join(skipped)}")
+            lines.append(f"⏭ Пропущено: {', '.join(skipped)}")
         await self._notify("\n".join(lines))
 
     async def _closing_side(self, order) -> int | None:
-        """Which position side the master is closing with this order, if any."""
+        """Which position side the master is closing with this order, if any.
+
+        Raises if the master's position cannot be read. On MEXC a close is expressed as an open on
+        the opposite side, so this lookup is the only thing separating the two — and answering it
+        with a default meant a failed read could turn the master getting OUT into every follower
+        opening a fresh position the other way. There is no defensible guess, so the caller is
+        made to deal with not knowing.
+        """
         client = await self._master_client()
         if not client:
-            return None
-        try:
-            positions = await client.get_open_positions(order.symbol)
-        except MexcError as err:
-            # Unknown is treated as "opening", which is the behaviour that existed before this
-            # check. Blocking a mirror on a failed lookup would be the worse failure.
-            LOGGER.info("could not read master position for %s: %s", order.symbol, err)
-            return None
+            raise MexcError(None, "master credentials unavailable", endpoint="closing_side")
+        positions = await client.get_open_positions(order.symbol)
         held = {p.position_type: p.hold_vol for p in positions if p.hold_vol > 0}
         return reduces_position(order, held)
 
-    async def _held(self, follower: Account, symbol: str, position_type: int) -> float:
+    async def _held(self, follower: Account, symbol: str, position_type: int) -> float | None:
+        """How much of one side this account holds. None means the venue would not say.
+
+        None rather than 0.0, because the two are opposite instructions. This used to answer a
+        rate-limited read with "holds nothing", and "holds nothing" is exactly what makes an
+        account skipped when the master closes — a transient refusal became a position left open
+        with no copy of it anywhere.
+        """
         credentials = await self._store.get_credentials(follower.id, follower.owner_id)
         if not credentials or not self._session:
-            return 0.0
+            return None
         client = MexcRestClient(*credentials, session=self._session)
         try:
             positions = await client.get_open_positions(symbol)
-        except MexcError:
-            return 0.0
+        except MexcError as err:
+            LOGGER.warning("could not read %s on %s: %s", follower.label, symbol, err)
+            return None
         return sum(p.hold_vol for p in positions if p.position_type == position_type and p.hold_vol > 0)
 
     async def _cancel_mirrored(self, master_order_id: str) -> None:
@@ -865,6 +901,22 @@ class CopyService:
         matched = []
         for follower in active:
             held = await self._held_any(follower, symbol)
+            if held is None:
+                # The venue would not say what this account holds. There is no safe default, so
+                # the two directions are decided by what going wrong would cost:
+                #   closing — send it anyway. Closing an account that turns out to be flat is a
+                #             no-op the engine already handles; skipping one that was holding
+                #             leaves a live position with nothing watching it.
+                #   opening — leave it out. Opening an account that turns out to hold something
+                #             doubles the position, and there is no undo for that.
+                LOGGER.warning(
+                    "could not read what %s holds on %s; %s",
+                    follower.label, symbol,
+                    "closing anyway" if not opening else "not opening it",
+                )
+                if not opening:
+                    matched.append(follower)
+                continue
             if (held <= 0) == opening:
                 matched.append(follower)
             else:
@@ -874,16 +926,17 @@ class CopyService:
                 )
         return matched
 
-    async def _held_any(self, follower: Account, symbol: str) -> float:
-        """Total this account holds on a symbol, either side."""
+    async def _held_any(self, follower: Account, symbol: str) -> float | None:
+        """Total this account holds on a symbol, either side. None means unknown — see `_held`."""
         credentials = await self._store.get_credentials(follower.id, follower.owner_id)
         if not credentials or not self._session:
-            return 0.0
+            return None
         client = MexcRestClient(*credentials, session=self._session)
         try:
             positions = await client.get_open_positions(symbol)
-        except MexcError:
-            return 0.0
+        except MexcError as err:
+            LOGGER.warning("could not read %s on %s: %s", follower.label, symbol, err)
+            return None
         return sum(p.hold_vol for p in positions if p.hold_vol > 0)
 
     async def _handle_position(self, data: dict) -> None:

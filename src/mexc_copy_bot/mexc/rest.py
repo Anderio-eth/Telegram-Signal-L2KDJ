@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,9 +55,27 @@ class _Throttle:
             yield
 
 
-# Sized well under MEXC's published per-IP allowance: the cost of being a little slower is a
-# fraction of a second per trade, and the cost of being too fast is a trade that never happened.
-THROTTLE = _Throttle(max_concurrent=4, min_interval=0.06)
+# Measured against a live account rather than taken from the docs, which give a figure the venue
+# does not actually honour. Private endpoints start returning code 510 above roughly 12 requests
+# per second from one IP, whatever mix of accounts they belong to:
+#
+#     60 private reads paced 0.06s apart (16.6/s)  ->  12 refused
+#     60 private reads paced 0.14s apart ( 7.1/s)  ->   0 refused
+#
+# The old 0.06s was chosen to be "well under" a published limit and was in fact above the real
+# one, which is why a single follower on an otherwise idle account could still be told its
+# requests were too frequent. Public market data is on a separate, far looser allowance — 30/s
+# went through untouched — so it is paced separately instead of competing with the trading path.
+PRIVATE_THROTTLE = _Throttle(max_concurrent=3, min_interval=0.14)
+PUBLIC_THROTTLE = _Throttle(max_concurrent=6, min_interval=0.03)
+
+# MEXC's code for "Requests are too frequent". It refuses the request before acting on it, so a
+# retry cannot duplicate an order — and orders carry an externalOid besides.
+RATE_LIMITED_CODE = 510
+
+# Long enough for the window to roll over. Retrying in 100ms just spends the next allowance, which
+# is how a burst turns into a refusal that lasts.
+RATE_LIMIT_BACKOFF = (0.4, 1.2, 3.0)
 
 # api.mexc.com, NOT contract.mexc.com — verified against a live account:
 #   contract.mexc.com  read 200 / order submit 403 "Access Denied" (blocked at the CDN)
@@ -91,6 +110,19 @@ class MexcError(RuntimeError):
         self.code = code
         self.message = message
         self.endpoint = endpoint
+
+    @property
+    def is_rate_limited(self) -> bool:
+        """Refused for arriving too fast, and therefore worth trying again.
+
+        Both the code and the wording are checked: 510 is what the futures API returns, 429 what
+        the edge in front of it returns, and the text catches either being reported some third way
+        without this quietly deciding the call had failed for good.
+        """
+        if self.code in (RATE_LIMITED_CODE, 429):
+            return True
+        lowered = (self.message or "").lower()
+        return any(phrase in lowered for phrase in ("too frequent", "rate limit", "too many requests"))
 
 
 def _opt_float(value: Any) -> float | None:
@@ -193,18 +225,42 @@ class MexcRestClient:
         self._timeout = aiohttp.ClientTimeout(total=timeout)
 
     async def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None, body: Any = None) -> Any:
+        """One signed call, retried if the venue says it came too fast.
+
+        Retried here rather than only in the copy engine because most callers are reads, and a
+        read that gives up returns "nothing" — which downstream is indistinguishable from an
+        account that genuinely holds nothing. Pacing alone is not enough: this process shares its
+        IP allowance with whatever else Render is running on the same address.
+        """
+        for attempt in range(len(RATE_LIMIT_BACKOFF) + 1):
+            try:
+                return await self._request_once(method, path, params=params, body=body)
+            except MexcError as err:
+                if not err.is_rate_limited or attempt == len(RATE_LIMIT_BACKOFF):
+                    raise
+                delay = RATE_LIMIT_BACKOFF[attempt] * (1.0 + random.random() * 0.4)
+                LOGGER.info("%s rate limited, retrying in %.1fs", path, delay)
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
+    async def _request_once(self, method: str, path: str, *, params: dict[str, Any] | None = None, body: Any = None) -> Any:
         url = f"{BASE_URL}{path}"
-        headers = sign_rest(self._api_key, self._secret, params=params, body=body)
         data = rest_body_string(body) if body is not None else None
 
-        async with THROTTLE.slot(), self._session.request(
-            method, url, params=params, data=data, headers=headers, timeout=self._timeout
-        ) as response:
-            text = await response.text()
-            if response.status != 200:
-                # Deliberately does not include headers: they carry the signature.
-                raise MexcError(response.status, text[:200], endpoint=path)
-            payload = await response.json(content_type=None)
+        # Signed INSIDE the slot, never before it. The signature carries a timestamp the venue
+        # checks, so a request stamped and then held in the queue goes out already stale — under
+        # the slower pacing a queue of 120 calls turned into "Confirming signature failed" on the
+        # ones that waited longest. The wait has to happen first, then the clock is read.
+        async with PRIVATE_THROTTLE.slot():
+            headers = sign_rest(self._api_key, self._secret, params=params, body=body)
+            async with self._session.request(
+                method, url, params=params, data=data, headers=headers, timeout=self._timeout
+            ) as response:
+                text = await response.text()
+                if response.status != 200:
+                    # Deliberately does not include headers: they carry the signature.
+                    raise MexcError(response.status, text[:200], endpoint=path)
+                payload = await response.json(content_type=None)
 
         if isinstance(payload, dict) and payload.get("success") is False:
             raise MexcError(payload.get("code"), str(payload.get("message", "unknown")), endpoint=path)

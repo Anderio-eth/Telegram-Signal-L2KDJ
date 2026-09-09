@@ -63,7 +63,17 @@ STRINGS: dict[str, dict[str, str]] = {
     "menu_status": {UK: "Статус: {status}", EN: "Status: {status}"},
     "menu_mode_reverse": {UK: "Режим: 🔁 <b>РЕВЕРС</b> → {target}", EN: "Mode: 🔁 <b>REVERSE</b> → {target}"},
     "menu_mode_copy": {UK: "Режим: 📋 Копіювання (усі followers)", EN: "Mode: 📋 Copy (all followers)"},
-    "no_account_chosen": {UK: "⚠️ акаунт не обрано", EN: "⚠️ no account chosen"},
+    # REVERSE stopped meaning "one nominated account" when every account got its own direction,
+    # but the menu still read the old nominated-account field — which is now always empty, so it
+    # permanently warned "no account chosen" about a setting that no longer exists.
+    "menu_mode_reverse_split": {
+        UK: "Режим: 🔁 <b>РЕВЕРС</b> — {reverse} навпаки, {copy} як майстер",
+        EN: "Mode: 🔁 <b>REVERSE</b> — {reverse} opposite, {copy} same as master",
+    },
+    "menu_mode_reverse_none": {
+        UK: "Режим: 🔁 <b>РЕВЕРС</b> — ще нема followers",
+        EN: "Mode: 🔁 <b>REVERSE</b> — no followers yet",
+    },
     "master_not_set": {UK: "👤 <b>Master:</b> не додано", EN: "👤 <b>Master:</b> not set"},
     "master_mode": {UK: "     Режим: {mode}", EN: "     Mode: {mode}"},
     "followers_count": {UK: "👥 <b>Followers:</b> {n}/{max}", EN: "👥 <b>Followers:</b> {n}/{max}"},

@@ -252,7 +252,7 @@ class CopyBot:
         service = await self._registry.get(self._folder(owner_id), owner_id)
         master = await self._store.get_master(self._folder(owner_id))
         followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
-        mode, reverse_id = await self._store.get_mode(self._folder(owner_id))
+        mode, _ = await self._store.get_mode(self._folder(owner_id))
         lang = await self._lang(owner_id)
 
         accounts = ([master] if master else []) + followers
@@ -264,7 +264,6 @@ class CopyBot:
             master_connected=service.master_connected,
             balances=await self._balances(owner_id, accounts),
             mode=mode,
-            reverse_account=next((f for f in followers if f.id == reverse_id), None),
             lang=lang,
         )
 
