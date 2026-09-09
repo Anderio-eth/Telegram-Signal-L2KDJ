@@ -71,6 +71,28 @@ class MasterEvent:
     dedupe_key: str
     raw: dict[str, Any] | None = None
 
+    @property
+    def realized_pnl(self) -> float | None:
+        """What the master's own position settled at, or None if this is not a close.
+
+        MEXC's `realised` on the position frame, which is the same field the followers' figures
+        come from — so the master's line and theirs mean the same thing and can be added up. It is
+        net of fees: on the SILVER close it read -1.333, being -0.3608 of price movement and
+        -0.9722 of fees, which is what actually left the balance.
+
+        Only for a close. An opening frame carries a `realised` too — the entry fee — and showing
+        that as the trade's PnL would report a loss on every position the moment it opened.
+        """
+        if self.action is not Action.CLOSE or not self.raw:
+            return None
+        value = self.raw.get("realised")
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
 
 def parse_position(data: dict[str, Any]) -> PositionSnapshot | None:
     """Read a push.personal.position frame. Returns None if it isn't usable."""

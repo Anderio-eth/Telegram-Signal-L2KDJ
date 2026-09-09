@@ -184,6 +184,15 @@ def event_report(
     lines.append("━━━━━━━━━━━━━━")
     lines.append("")
 
+    # The master goes first and in the same shape as the accounts below it: it is the position
+    # every other line is a copy of, and a report that showed what the copies made while leaving
+    # out what the original made answered half the question. Its number comes from the same field
+    # theirs do, so the total underneath is a sum of like with like.
+    master_pnl = event.realized_pnl if event.action is Action.CLOSE else None
+    if master_pnl is not None:
+        detail = f"{t(lang, 'closed')}  {signed_money(master_pnl)}"
+        lines.append(t(lang, "master_line", detail=detail))
+
     ok = 0
     for result in results:
         if result.ok:
@@ -212,11 +221,15 @@ def event_report(
 
     if event.action is Action.CLOSE:
         known = [r.realized_pnl for r in results if r.ok and r.realized_pnl is not None]
-        if known:
+        # "Success" counts mirroring, so the master is deliberately not in it — no order was placed
+        # on the master's behalf and there was nothing there to succeed or fail. It is in the
+        # total, because the total is money and every line above it is money.
+        counted = known + ([master_pnl] if master_pnl is not None else [])
+        if counted:
             reported = len(known)
             closed = sum(1 for r in results if r.ok)
             suffix = "" if reported == closed else t(lang, "counted_suffix", n=reported, total=closed)
-            lines.append(t(lang, "total_pnl", amount=signed_money(sum(known)), suffix=suffix))
+            lines.append(t(lang, "total_pnl", amount=signed_money(sum(counted)), suffix=suffix))
 
     return "\n".join(lines)
 

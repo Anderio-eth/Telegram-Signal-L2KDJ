@@ -96,6 +96,7 @@ STRINGS: dict[str, dict[str, str]] = {
     "success_count": {UK: "Успішно: {ok}/{total}", EN: "Success: {ok}/{total}"},
     "total_pnl": {UK: "<b>Загальний PnL: {amount}</b>{suffix}", EN: "<b>Total PnL: {amount}</b>{suffix}"},
     "counted_suffix": {UK: "  (порахували {n}/{total})", EN: "  (of {n}/{total} reported)"},
+    "master_line": {UK: "👑 Master — {detail}", EN: "👑 Master — {detail}"},
 
     # ── mode screen ────────────────────────────────────────────────────────
     "mode_title": {UK: "⚙️ <b>РЕЖИМ</b>", EN: "⚙️ <b>MODE</b>"},

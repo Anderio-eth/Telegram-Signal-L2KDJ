@@ -103,3 +103,55 @@ def test_signed_money_never_hides_a_loss():
     assert signed_money(-0.05).startswith("−")
     assert signed_money(0.0).startswith("+")
     assert signed_money(12.5) == "+$12.50"
+
+
+# ── the master's own line ───────────────────────────────────────────────────
+def master_close(realised: float | None = -1.333) -> MasterEvent:
+    """The SILVER close as the venue actually sent it: -0.3608 of price and -0.9722 of fees."""
+    raw = {"closeProfitLoss": -0.3608, "fee": -0.9722}
+    if realised is not None:
+        raw["realised"] = realised
+    return MasterEvent(
+        symbol="SILVER_USDT", position_type=1, action=Action.CLOSE, master_vol=0.0,
+        delta_vol=3608.0, leverage=981, open_type=1, dedupe_key="k", raw=raw,
+    )
+
+
+def test_the_master_gets_a_line_of_its_own():
+    text = event_report(master_close(), [closed(1, 2.14)], None)
+    assert "👑 Master — ЗАКРИТО  −$1.33" in text
+
+
+def test_the_masters_pnl_is_net_of_fees():
+    """-1.333, not the -0.3608 of price movement: fees are what actually left the balance."""
+    assert master_close().realized_pnl == -1.333
+
+
+def test_the_total_covers_the_master_as_well():
+    text = event_report(master_close(), [closed(1, 2.14), closed(2, -0.87)], None)
+    assert signed_money(-1.333 + 2.14 - 0.87) in text
+
+
+def test_the_success_count_still_counts_only_the_copies():
+    """No order is placed on the master's behalf, so there is nothing there to succeed or fail;
+    folding it in would quietly inflate every report by one."""
+    text = event_report(master_close(), [closed(1, 2.14), closed(2, -0.87)], None)
+    assert "Успішно: 2/2" in text
+
+
+def test_an_open_reports_no_master_pnl():
+    """An opening frame carries a `realised` too — the entry fee. Shown as the trade's PnL it
+    would report a loss on every position the moment it opened."""
+    opening = MasterEvent(
+        symbol="SILVER_USDT", position_type=1, action=Action.OPEN, master_vol=3608.0,
+        delta_vol=3608.0, leverage=981, open_type=1, dedupe_key="k",
+        raw={"realised": -0.4861},
+    )
+    assert opening.realized_pnl is None
+    assert "Master" not in event_report(opening, [], None)
+
+
+def test_a_close_without_a_settlement_figure_says_nothing_rather_than_zero():
+    text = event_report(master_close(realised=None), [closed(1, 2.14)], None)
+    assert "Master" not in text
+    assert signed_money(2.14) in text
