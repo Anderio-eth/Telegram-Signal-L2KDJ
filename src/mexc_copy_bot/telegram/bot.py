@@ -1186,6 +1186,10 @@ class CopyBot:
         except Exception:  # noqa: BLE001 — a missing price must not suppress the trade report
             LOGGER.debug("could not compute notional for %s", event.symbol)
 
-        await self._app.bot.send_message(
-            chat_id, messages.event_report(event, results, notional), parse_mode=ParseMode.HTML
-        )
+        text = messages.event_report(event, results, notional, await self._lang(owner_id))
+        try:
+            await self._app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        except BadRequest:
+            # Same reasoning as _notice_for: these lines carry exchange text, and one stray "<"
+            # in an error message would otherwise cost the whole trade report.
+            await self._app.bot.send_message(chat_id, text)

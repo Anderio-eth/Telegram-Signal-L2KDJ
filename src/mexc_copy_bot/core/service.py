@@ -865,6 +865,13 @@ class CopyService:
         )
 
     async def _eligible_followers(self, *, opening: bool | None = None, symbol: str | None = None) -> list[Account]:
+        """Who acts. See `_eligibility`, which also says who did not and why."""
+        matched, _ = await self._eligibility(opening=opening, symbol=symbol)
+        return matched
+
+    async def _eligibility(
+        self, *, opening: bool | None = None, symbol: str | None = None
+    ) -> tuple[list[Account], list[str]]:
         """Who an action from the master applies to. Every such action goes through here.
 
         Three filters, in order of how badly getting them wrong would hurt:
@@ -881,12 +888,16 @@ class CopyService:
            gone, and it would be joining a trade half way through. It waits for the next one
            instead, which by definition starts with both of them flat.
         """
-        active = [a for a in await self._store.list_accounts(self._folder_id, FOLLOWER) if a.active]
+        reasons: list[str] = []
+        everyone = await self._store.list_accounts(self._folder_id, FOLLOWER)
+        active = [a for a in everyone if a.active]
+        reasons += [f"{a.label} — на паузі" for a in everyone if not a.active]
 
         detached = await self._store.detached_account_ids(self._owner_id)
         if detached:
             skipped = [a.label for a in active if a.id in detached]
             active = [a for a in active if a.id not in detached]
+            reasons += [f"{label} — відчеплений від майстра" for label in skipped]
             LOGGER.info("skipping detached accounts: %s", ", ".join(skipped))
 
         # REVERSE no longer means "one nominated account and the rest idle": every active
@@ -894,7 +905,7 @@ class CopyService:
         # per-account settings are honoured at all, which is settled where the trade is placed.
 
         if opening is None or symbol is None or not active:
-            return active
+            return active, reasons
 
         # Opening: the account must be flat here, or it is already in something of its own.
         # Closing: it must be holding, or there is nothing of its to close.
@@ -916,15 +927,21 @@ class CopyService:
                 )
                 if not opening:
                     matched.append(follower)
+                else:
+                    reasons.append(f"{follower.label} — не вдалося прочитати позицію")
                 continue
             if (held <= 0) == opening:
                 matched.append(follower)
             else:
+                reasons.append(
+                    f"{follower.label} — "
+                    + ("вже щось тримає по цьому токену" if opening else "нема відкритої позиції")
+                )
                 LOGGER.info(
                     "%s is out of step on %s (holds %g, master is %s); waiting for the next trade",
                     follower.label, symbol, held, "opening" if opening else "closing",
                 )
-        return matched
+        return matched, reasons
 
     async def _held_any(self, follower: Account, symbol: str) -> float | None:
         """Total this account holds on a symbol, either side. None means unknown — see `_held`."""
@@ -988,11 +1005,24 @@ class CopyService:
 
         mode, _ = await self._store.get_mode(self._folder_id)
         reverse = mode == MODE_REVERSE
-        followers = await self._eligible_followers(
+        followers, skipped = await self._eligibility(
             opening=event.action is not Action.CLOSE, symbol=event.symbol
         )
         if not followers:
+            # Silence here is what made a failed trade indistinguishable from a bot that had
+            # stopped working. The master did something, and nothing happened on any account —
+            # that is exactly the moment worth being told about, not the moment to say nothing.
             LOGGER.info("no active followers for event %s", event_id)
+            action = "закрив" if event.action is Action.CLOSE else "відкрив"
+            side = "LONG" if event.position_type == 1 else "SHORT"
+            lines = [
+                "⚠️ <b>НІЧОГО НЕ СКОПІЙОВАНО</b>",
+                "",
+                f"Майстер {action} <b>{event.symbol}</b> {side}, але жоден акаунт не спрацював.",
+                "",
+            ]
+            lines += [f"   • {reason}" for reason in skipped] or ["   • нема жодного фоловера"]
+            await self._notify(NEWLINE.join(lines))
             return
 
         assert self._session is not None
@@ -1004,8 +1034,12 @@ class CopyService:
         results = await engine.execute(event, event_id, followers, reverse=reverse, stops=stops)
 
         if self.on_report:
-            with contextlib.suppress(Exception):
+            try:
                 await self.on_report(event, results)
+            except Exception:  # noqa: BLE001 — a failed report must not undo a placed trade
+                # Logged, not swallowed. A report that never arrives looks exactly like a bot that
+                # stopped working, and suppressing this left nothing behind to tell them apart.
+                LOGGER.exception("could not deliver the report for event %s", event_id)
 
     # ── reconciliation ──────────────────────────────────────────────────────────────────────
     async def _reconcile_loop(self) -> None:
