@@ -274,6 +274,27 @@ def stuck_screen(groups: list, lang: str = DEFAULT) -> str:
     return "\n".join(lines)
 
 
+def folders_screen(folders, active_id, counts, lang=DEFAULT) -> str:
+    """Every folder this owner has: which one is on screen, and which are trading.
+
+    The running marker matters more than the selected one. Folders keep copying whether or not
+    anyone is looking at them, and a list that showed only the selection would hide exactly the
+    thing worth knowing before you walk away from the bot.
+    """
+    lines = [t(lang, "folders_title"), "", t(lang, "folders_explain"), ""]
+    for folder in folders:
+        lines.append(
+            t(
+                lang, "folder_row",
+                mark="▶️" if folder.id == active_id else "  ",
+                name=folder.name,
+                accounts=counts.get(folder.id, 0),
+                state=t(lang, "folder_running" if folder.running else "folder_stopped"),
+            )
+        )
+    return "\n".join(lines)
+
+
 def accounts_list(master: Account | None, followers: list[Account], lang: str = DEFAULT) -> str:
     lines = [t(lang, "accounts_title"), ""]
     if master:

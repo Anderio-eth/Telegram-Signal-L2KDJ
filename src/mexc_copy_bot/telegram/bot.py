@@ -53,6 +53,7 @@ ASK_KEY, ASK_SECRET = range(2)
 # Its own conversation: moving a limit asks for a number, and it must not be confused with the
 # key/secret flow, which is waiting for text of a completely different kind.
 ASK_PRICE = 100
+ASK_FOLDER_NAME = 101
 
 # Written out rather than inlined: patching this file has twice turned an escaped newline into
 # a real one, which is a syntax error that only shows up at import time.
@@ -65,7 +66,7 @@ NEWLINE = chr(10)
 BALANCE_TTL_SECONDS = 5.0
 
 
-def _menu_keyboard(running: bool, lang: str, stuck: int = 0) -> InlineKeyboardMarkup:
+def _menu_keyboard(running: bool, lang: str, stuck: int = 0, folder: str = "") -> InlineKeyboardMarkup:
     control = (
         InlineKeyboardButton(t(lang, "btn_stop"), callback_data="stop")
         if running
@@ -77,6 +78,7 @@ def _menu_keyboard(running: bool, lang: str, stuck: int = 0) -> InlineKeyboardMa
              InlineKeyboardButton(t(lang, "btn_accounts"), callback_data="accounts")],
             [InlineKeyboardButton(t(lang, "btn_history"), callback_data="history"),
              InlineKeyboardButton(t(lang, "btn_mode"), callback_data="mode")],
+            [InlineKeyboardButton(t(lang, "btn_folder", name=folder), callback_data="folders")],
             [InlineKeyboardButton(t(lang, "btn_refresh"), callback_data="menu"),
              InlineKeyboardButton(t(lang, "btn_lang"), callback_data="lang")],
             [control],
@@ -118,6 +120,11 @@ class CopyBot:
         # Language per owner, read once and kept: it is needed by every screen and every
         # notice, and a database round trip per line of text would be absurd.
         self._lang_cache: dict[int, str] = {}
+        # Which folder each owner is looking at. Resolved in _guard, so every handler can
+        # reach it without another round trip — the alternative was threading a folder id
+        # through every screen by hand, which is the sort of change one place gets forgotten
+        # in, and a forgotten one mixes two setups' accounts together.
+        self._folder_cache: dict[int, int] = {}
         # Sessions opened for stuck-account work while copying is stopped, closed on shutdown.
         self._own_sessions: list[aiohttp.ClientSession] = []
 
@@ -159,9 +166,25 @@ class CopyBot:
             per_message=False,
         )
 
+        folder_conversation = ConversationHandler(
+            entry_points=[CallbackQueryHandler(self._begin_folder_name, pattern="^f(new|ren)$")],
+            states={
+                ASK_FOLDER_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_folder_name)
+                ]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self._cancel_add),
+                CallbackQueryHandler(self._abandon_and_dispatch),
+            ],
+            allow_reentry=True,
+            per_message=False,
+        )
+
         app.add_handler(CommandHandler("start", self._cmd_start))
         app.add_handler(add_conversation)
         app.add_handler(price_conversation)
+        app.add_handler(folder_conversation)
         app.add_handler(CallbackQueryHandler(self._on_button))
         self._app = app
         return app
@@ -176,6 +199,7 @@ class CopyBot:
             owner_id = update.effective_user.id
             if update.effective_chat:
                 self._chat_ids[owner_id] = update.effective_chat.id
+            await self._resolve_folder(owner_id)
             return owner_id
         LOGGER.warning("refused telegram user %s", update.effective_user.id if update.effective_user else "?")
         if update.callback_query:
@@ -183,6 +207,24 @@ class CopyBot:
         elif update.message:
             await update.message.reply_text(t(UK, "not_authorized") + ".")
         return None
+
+    async def _resolve_folder(self, owner_id: int) -> int:
+        """The folder this owner is working in, creating their first one if they have none.
+
+        A brand new owner has never chosen a folder and has none to choose. Making one beats
+        showing an empty screen that reads as though their accounts had gone missing.
+        """
+        folder_id = await self._store.active_folder_id(owner_id)
+        if folder_id is None:
+            folder_id = await self._store.create_folder(owner_id, "MEXC")
+            await self._store.set_active_folder(owner_id, folder_id)
+            LOGGER.info("created first folder %s for owner %s", folder_id, owner_id)
+        self._folder_cache[owner_id] = folder_id
+        return folder_id
+
+    def _folder(self, owner_id: int) -> int:
+        """The cached folder. Warm by the time any handler runs, because _guard fills it."""
+        return self._folder_cache[owner_id]
 
     def _lang_now(self, owner_id: int) -> str:
         """The cached language. Every handler calls _lang() early, so this is warm by the time a
@@ -198,10 +240,10 @@ class CopyBot:
 
     # ── screens ─────────────────────────────────────────────────────────────────────────────
     async def _menu_text(self, owner_id: int) -> str:
-        service = await self._registry.get(owner_id)
-        master = await self._store.get_master(owner_id)
-        followers = await self._store.list_accounts(owner_id, FOLLOWER)
-        mode, reverse_id = await self._store.get_mode(owner_id)
+        service = await self._registry.get(self._folder(owner_id), owner_id)
+        master = await self._store.get_master(self._folder(owner_id))
+        followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
+        mode, reverse_id = await self._store.get_mode(self._folder(owner_id))
         lang = await self._lang(owner_id)
 
         accounts = ([master] if master else []) + followers
@@ -240,7 +282,7 @@ class CopyBot:
         ):
             return cached
 
-        credentials_by_id = await self._store.get_credentials_for(owner_id)
+        credentials_by_id = await self._store.get_credentials_for(self._folder(owner_id))
 
         async with aiohttp.ClientSession() as session:
             async def fetch(account: Account) -> messages.Balance:
@@ -268,10 +310,13 @@ class CopyBot:
         self._balance_cache.pop(owner_id, None)
 
     async def _show_menu(self, update: Update, owner_id: int) -> None:
-        service = await self._registry.get(owner_id)
+        service = await self._registry.get(self._folder(owner_id), owner_id)
         text = await self._menu_text(owner_id)
         keyboard = _menu_keyboard(
-            service.running, await self._lang(owner_id), await self._stuck_count(owner_id)
+            service.running,
+            await self._lang(owner_id),
+            await self._stuck_count(owner_id),
+            await self._folder_name(owner_id),
         )
         if update.callback_query:
             await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
@@ -292,7 +337,7 @@ class CopyBot:
         await query.answer()
         action = query.data or ""
         LOGGER.info("button %r from %s", action, owner_id)
-        service = await self._registry.get(owner_id)
+        service = await self._registry.get(self._folder(owner_id), owner_id)
 
         if action == "menu":
             await self._show_menu(update, owner_id)
@@ -350,7 +395,7 @@ class CopyBot:
         elif action == "change_master":
             if await self._refuse_while_running(update, owner_id):
                 return
-            master = await self._store.get_master(owner_id)
+            master = await self._store.get_master(self._folder(owner_id))
             if not master:
                 await self._show_accounts(update, owner_id)
                 return
@@ -362,6 +407,23 @@ class CopyBot:
                 ]),
                 parse_mode=ParseMode.HTML,
             )
+        elif action == "folders":
+            await self._show_folders(update, owner_id)
+        elif action.startswith("fsel:"):
+            folder_id = int(action.split(":", 1)[1])
+            folder = await self._store.get_folder(folder_id, owner_id)
+            if folder:
+                await self._store.set_active_folder(owner_id, folder_id)
+                self._folder_cache[owner_id] = folder_id
+                self._invalidate_balances(owner_id)
+                await update.callback_query.answer(
+                    t(await self._lang(owner_id), "folder_switched", name=folder.name).replace("<b>", "").replace("</b>", "")
+                )
+            await self._show_menu(update, owner_id)
+        elif action == "fdel":
+            await self._confirm_delete_folder(update, owner_id)
+        elif action == "fdel_ok":
+            await self._delete_folder(update, owner_id)
         elif action == "stuck":
             await self._show_stuck(update, owner_id)
         elif action.startswith("sg:"):
@@ -395,7 +457,7 @@ class CopyBot:
         elif action == "mode_copy":
             if await self._refuse_while_running(update, owner_id):
                 return
-            await self._store.set_mode(owner_id, MODE_COPY, None)
+            await self._store.set_mode(self._folder(owner_id), MODE_COPY, None)
             await self._show_mode(update, owner_id)
         elif action == "mode_reverse":
             if await self._refuse_while_running(update, owner_id):
@@ -407,9 +469,9 @@ class CopyBot:
             account_id = int(action.split(":", 1)[1])
             # Verified against this owner's own followers: a stale callback must not be able to
             # point the hedge at an account that is not theirs, or no longer exists.
-            followers = await self._store.list_accounts(owner_id, FOLLOWER)
+            followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
             if any(f.id == account_id for f in followers):
-                await self._store.set_mode(owner_id, MODE_REVERSE, account_id)
+                await self._store.set_mode(self._folder(owner_id), MODE_REVERSE, account_id)
             await self._show_mode(update, owner_id)
         elif action == "remove_menu":
             await self._show_remove_menu(update, owner_id)
@@ -438,12 +500,15 @@ class CopyBot:
         chat_id = self._chat_for(owner_id)
         if not (self._app and chat_id):
             return
-        service = await self._registry.get(owner_id)
+        service = await self._registry.get(self._folder(owner_id), owner_id)
         await self._app.bot.send_message(
             chat_id,
             await self._menu_text(owner_id),
             reply_markup=_menu_keyboard(
-                service.running, await self._lang(owner_id), await self._stuck_count(owner_id)
+                service.running,
+                await self._lang(owner_id),
+                await self._stuck_count(owner_id),
+                await self._folder_name(owner_id),
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -455,7 +520,7 @@ class CopyBot:
         master, with nothing to close it: the expected-position rows are keyed by side, so the old
         ones would simply be orphaned. Stopping first makes the change deliberate.
         """
-        service = await self._registry.get(owner_id)
+        service = await self._registry.get(self._folder(owner_id), owner_id)
         if not service.running:
             return False
         await update.callback_query.answer(
@@ -465,8 +530,8 @@ class CopyBot:
         return True
 
     async def _show_mode(self, update: Update, owner_id: int) -> None:
-        mode, reverse_id = await self._store.get_mode(owner_id)
-        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        mode, reverse_id = await self._store.get_mode(self._folder(owner_id))
+        followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
         chosen = next((f for f in followers if f.id == reverse_id), None)
         lang = await self._lang(owner_id)
         rows = []
@@ -487,7 +552,7 @@ class CopyBot:
         )
 
     async def _show_reverse_picker(self, update: Update, owner_id: int) -> None:
-        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
         if not followers:
             await update.callback_query.edit_message_text(
                 t(await self._lang(owner_id), "reverse_needs_follower"),
@@ -509,8 +574,8 @@ class CopyBot:
 
     async def _show_promote(self, update: Update, owner_id: int) -> None:
         lang = await self._lang(owner_id)
-        master = await self._store.get_master(owner_id)
-        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        master = await self._store.get_master(self._folder(owner_id))
+        followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
         if not master or not followers:
             await self._show_accounts(update, owner_id)
             return
@@ -529,17 +594,17 @@ class CopyBot:
 
     async def _do_promote(self, update: Update, owner_id: int, account_id: int) -> None:
         lang = await self._lang(owner_id)
-        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
         chosen = next((f for f in followers if f.id == account_id), None)
         # Checked against this owner's own followers: a stale callback must not be able to hand
         # the master role to an account that is not theirs, or no longer exists.
-        if not chosen or not await self._store.promote_follower(owner_id, account_id):
+        if not chosen or not await self._store.promote_follower(self._folder(owner_id), account_id):
             await self._show_accounts(update, owner_id)
             return
 
         # The service is holding the previous master's socket and position baseline, both of which
         # now describe a follower. START must build them again from the new master.
-        service = await self._registry.get(owner_id)
+        service = await self._registry.get(self._folder(owner_id), owner_id)
         if service.running:
             await service.stop()
         self._invalidate_balances(owner_id)
@@ -550,6 +615,120 @@ class CopyBot:
                 t(lang, "btn_back"), callback_data="accounts")]]),
             parse_mode=ParseMode.HTML,
         )
+
+    async def _folder_name(self, owner_id: int) -> str:
+        folder = await self._store.get_folder(self._folder(owner_id), owner_id)
+        return folder.name if folder else "—"
+
+    async def _show_folders(self, update: Update, owner_id: int) -> None:
+        lang = await self._lang(owner_id)
+        folders = await self._store.list_folders(owner_id)
+        active = self._folder(owner_id)
+        counts = {f.id: len(await self._store.list_accounts(f.id)) for f in folders}
+
+        rows = [
+            [InlineKeyboardButton(
+                f"{'▶️' if f.id == active else '📁'} {f.name}", callback_data=f"fsel:{f.id}"
+            )]
+            for f in folders
+        ]
+        rows.append([
+            InlineKeyboardButton(t(lang, "btn_new_folder"), callback_data="fnew"),
+            InlineKeyboardButton(t(lang, "btn_rename_folder"), callback_data="fren"),
+        ])
+        rows.append([InlineKeyboardButton(t(lang, "btn_delete_folder"), callback_data="fdel")])
+        rows.append([InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu")])
+
+        await update.callback_query.edit_message_text(
+            messages.folders_screen(folders, active, counts, lang),
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _confirm_delete_folder(self, update: Update, owner_id: int) -> None:
+        lang = await self._lang(owner_id)
+        folders = await self._store.list_folders(owner_id)
+        if len(folders) < 2:
+            # Deleting the only folder would leave nothing to switch to and nowhere to add an
+            # account, so the bot would have to invent one on the next tap anyway.
+            await update.callback_query.answer(t(lang, "folder_last_one"), show_alert=True)
+            return
+        folder_id = self._folder(owner_id)
+        service = await self._registry.get(folder_id, owner_id)
+        if service.running:
+            await update.callback_query.answer(t(lang, "folder_stop_first"), show_alert=True)
+            return
+        folder = await self._store.get_folder(folder_id, owner_id)
+        accounts = len(await self._store.list_accounts(folder_id))
+        await update.callback_query.edit_message_text(
+            t(lang, "folder_delete_warn", name=folder.name, accounts=accounts),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(t(lang, "btn_confirm_delete"), callback_data="fdel_ok")],
+                [InlineKeyboardButton(t(lang, "btn_back"), callback_data="folders")],
+            ]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _delete_folder(self, update: Update, owner_id: int) -> None:
+        lang = await self._lang(owner_id)
+        folder_id = self._folder(owner_id)
+        await self._store.delete_folder(folder_id, owner_id)
+        # Point the owner at whatever is left before anything tries to read the deleted one.
+        remaining = await self._store.list_folders(owner_id)
+        if remaining:
+            await self._store.set_active_folder(owner_id, remaining[0].id)
+        await self._resolve_folder(owner_id)
+        self._invalidate_balances(owner_id)
+        await update.callback_query.edit_message_text(
+            t(lang, "folder_deleted"),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                t(lang, "btn_back"), callback_data="folders")]]),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def _begin_folder_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        owner_id = await self._guard(update)
+        if owner_id is None:
+            return ConversationHandler.END
+        await update.callback_query.answer()
+        context.user_data["folder_action"] = update.callback_query.data  # fnew or fren
+        await update.callback_query.edit_message_text(
+            t(await self._lang(owner_id), "folder_name_ask"),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                t(self._lang_now(owner_id), "btn_cancel_x"), callback_data="folders")]]),
+        )
+        return ASK_FOLDER_NAME
+
+    async def _got_folder_name(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        owner_id = await self._guard(update)
+        if owner_id is None:
+            return ConversationHandler.END
+        lang = await self._lang(owner_id)
+        name = (update.message.text or "").strip()[:40]
+        if not name:
+            await update.message.reply_text(t(lang, "folder_name_ask"))
+            return ASK_FOLDER_NAME
+
+        action = context.user_data.pop("folder_action", "fnew")
+        if action == "fren":
+            await self._store.rename_folder(self._folder(owner_id), owner_id, name)
+            text = t(lang, "folder_renamed", name=name)
+        else:
+            folder_id = await self._store.create_folder(owner_id, name)
+            # A new folder is empty, so switching to it immediately is what anyone creating one
+            # was about to do anyway.
+            await self._store.set_active_folder(owner_id, folder_id)
+            self._folder_cache[owner_id] = folder_id
+            self._invalidate_balances(owner_id)
+            text = t(lang, "folder_created", name=name)
+
+        await update.effective_chat.send_message(
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                t(lang, "btn_back"), callback_data="folders")]]),
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
 
     async def _stuck_count(self, owner_id: int) -> int:
         return sum(len(g.members) for g in await self._store.list_stuck_groups(owner_id))
@@ -616,7 +795,7 @@ class CopyBot:
         """Actions on stranded accounts need an HTTP session. Borrow the running service's when
         there is one; otherwise these buttons must still work while copying is stopped, which is
         exactly when someone is most likely to be sorting a mess out."""
-        service = await self._registry.get(owner_id)
+        service = await self._registry.get(self._folder(owner_id), owner_id)
         session = getattr(service, "_session", None)
         if session is None or session.closed:
             session = aiohttp.ClientSession()
@@ -739,8 +918,8 @@ class CopyBot:
         return ConversationHandler.END
 
     async def _show_accounts(self, update: Update, owner_id: int) -> None:
-        master = await self._store.get_master(owner_id)
-        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        master = await self._store.get_master(self._folder(owner_id))
+        followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
         await update.callback_query.edit_message_text(
             messages.accounts_list(master, followers, await self._lang(owner_id)),
             reply_markup=_accounts_keyboard(
@@ -849,6 +1028,7 @@ class CopyBot:
         except Exception:  # noqa: BLE001
             pass
 
+        folder_id = self._folder(owner_id)
         status = await update.effective_chat.send_message(t(lang, "add_validating"))
 
         # Validate before storing: an account that cannot read its own balance will fail on the
@@ -863,7 +1043,7 @@ class CopyBot:
                 context.user_data.clear()
                 return ConversationHandler.END
 
-        master = await self._store.get_master(owner_id)
+        master = await self._store.get_master(self._folder(owner_id))
         warning = ""
         if kind == FOLLOWER and master and master.position_mode and mode != master.position_mode:
             # Hedge vs one-way changes what a side means; copying across a mismatch mirrors the
@@ -874,21 +1054,43 @@ class CopyBot:
                   masters="hedge" if master.position_mode == 1 else "one-way")
             )
 
-        followers = await self._store.list_accounts(owner_id, FOLLOWER)
+        followers = await self._store.list_accounts(folder_id, FOLLOWER)
         label = "Master" if kind == MASTER else f"Follower #{len(followers) + 1}"
+        replacing = kind == MASTER and master is not None
         try:
-            await self._store.add_account(
-                owner_id=owner_id,
-                label=label,
-                kind=kind,
-                api_key=api_key,
-                api_secret=secret,
-                position_mode=mode,
-            )
-        except Exception as err:  # noqa: BLE001 — most likely the one-master-per-owner constraint
+            if replacing:
+                # Swap rather than add: the schema permits one master per folder, so adding on top
+                # would simply be rejected. Done in a single transaction inside the store, because
+                # a delete that succeeded without its insert leaves the folder with no master and
+                # the old keys already gone.
+                await self._store.replace_master(
+                    owner_id=owner_id,
+                    folder_id=folder_id,
+                    api_key=api_key,
+                    api_secret=secret,
+                    position_mode=mode,
+                )
+            else:
+                await self._store.add_account(
+                    owner_id=owner_id,
+                    folder_id=folder_id,
+                    label=label,
+                    kind=kind,
+                    api_key=api_key,
+                    api_secret=secret,
+                    position_mode=mode,
+                )
+        except Exception as err:  # noqa: BLE001 — most likely the one-master-per-folder constraint
             await status.edit_text(t(lang, "add_cannot_save", error=err))
             context.user_data.clear()
             return ConversationHandler.END
+
+        if replacing:
+            # The service holds the previous master's socket and its position baseline, both of
+            # which describe an account that is no longer the master. START must rebuild them.
+            service = await self._registry.get(folder_id, owner_id)
+            if service.running:
+                await service.stop()
 
         self._invalidate_balances(owner_id)
 

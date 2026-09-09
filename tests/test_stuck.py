@@ -26,6 +26,8 @@ from mexc_copy_bot.core.service import CopyService  # noqa: E402
 from mexc_copy_bot.db.store import FOLLOWER, MODE_COPY, Account  # noqa: E402
 
 OWNER = 7
+# A service now belongs to a folder; the owner is only who gets told about it.
+FOLDER = 3
 
 
 def follower(n: int) -> Account:
@@ -40,13 +42,13 @@ class FakeStore:
         self._detached = set(detached)
         self._accounts = [follower(n) for n in accounts]
 
-    async def list_accounts(self, owner_id, kind=None):
+    async def list_accounts(self, folder_id, kind=None):
         return list(self._accounts)
 
     async def detached_account_ids(self, owner_id):
         return set(self._detached)
 
-    async def get_mode(self, owner_id):
+    async def get_mode(self, folder_id):
         return (MODE_COPY, None)
 
     async def get_credentials(self, account_id, owner_id):
@@ -54,7 +56,7 @@ class FakeStore:
 
 
 def service(monkeypatch, store, held: dict[int, float]):
-    svc = CopyService(store, OWNER)
+    svc = CopyService(store, FOLDER, OWNER)
 
     async def fake_held(follower_account, symbol):
         return held.get(follower_account.id, 0.0)

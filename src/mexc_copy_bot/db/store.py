@@ -53,6 +53,18 @@ class Account:
         return self.kind == MASTER
 
 
+@dataclass(frozen=True)
+class Folder:
+    """A self-contained trading setup: its own master, followers, mode and run state."""
+
+    id: int
+    owner_id: int
+    name: str
+    running: bool
+    mode: str
+    reverse_account_id: int | None
+
+
 KIND_ENTRY = "ENTRY"
 KIND_EXIT = "EXIT"
 
@@ -122,6 +134,7 @@ class Store:
         self,
         *,
         owner_id: int,
+        folder_id: int,
         label: str,
         kind: str,
         api_key: str,
@@ -132,11 +145,13 @@ class Store:
             return await conn.fetchval(
                 """
                 INSERT INTO copy_accounts
-                    (owner_id, label, kind, api_key_enc, api_secret_enc, api_key_hint, position_mode)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (owner_id, folder_id, label, kind, api_key_enc, api_secret_enc, api_key_hint,
+                     position_mode)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING id
                 """,
                 owner_id,
+                folder_id,
                 label,
                 kind,
                 self._cipher.encrypt(api_key),
@@ -145,8 +160,116 @@ class Store:
                 position_mode,
             )
 
+    # ── folders ─────────────────────────────────────────────────────────────────────────────
+    async def list_folders(self, owner_id: int) -> list[Folder]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, owner_id, name, running, mode, reverse_account_id"
+                " FROM copy_folders WHERE owner_id = $1 ORDER BY created_at, id",
+                owner_id,
+            )
+        return [Folder(**dict(r)) for r in rows]
+
+    async def get_folder(self, folder_id: int, owner_id: int) -> Folder | None:
+        """Scoped by owner as well as id: a folder belonging to somebody else must come back
+        empty rather than rely on a check the caller might forget."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, owner_id, name, running, mode, reverse_account_id"
+                " FROM copy_folders WHERE id = $1 AND owner_id = $2",
+                folder_id,
+                owner_id,
+            )
+        return Folder(**dict(row)) if row else None
+
+    async def create_folder(self, owner_id: int, name: str) -> int:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "INSERT INTO copy_folders (owner_id, name) VALUES ($1, $2) RETURNING id",
+                owner_id,
+                name.strip()[:40],
+            )
+
+    async def rename_folder(self, folder_id: int, owner_id: int, name: str) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE copy_folders SET name = $3, updated_at = now()"
+                " WHERE id = $1 AND owner_id = $2",
+                folder_id,
+                owner_id,
+                name.strip()[:40],
+            )
+        return result.endswith("1")
+
+    async def delete_folder(self, folder_id: int, owner_id: int) -> bool:
+        """Removes the folder and, by cascade, its accounts and their stored keys."""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM copy_folders WHERE id = $1 AND owner_id = $2", folder_id, owner_id
+            )
+        return result.endswith("1")
+
+    async def active_folder_id(self, owner_id: int) -> int | None:
+        """Which folder the owner is looking at, falling back to their first.
+
+        A missing selection is normal — a new owner has never chosen one — and answering with the
+        first folder is better than showing an empty screen that looks like data loss.
+        """
+        async with self._pool.acquire() as conn:
+            chosen = await conn.fetchval(
+                "SELECT active_folder_id FROM copy_state WHERE owner_id = $1", owner_id
+            )
+            if chosen and await conn.fetchval(
+                "SELECT 1 FROM copy_folders WHERE id = $1 AND owner_id = $2", chosen, owner_id
+            ):
+                return chosen
+            return await conn.fetchval(
+                "SELECT id FROM copy_folders WHERE owner_id = $1 ORDER BY created_at, id LIMIT 1",
+                owner_id,
+            )
+
+    async def set_active_folder(self, owner_id: int, folder_id: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO copy_state (owner_id, active_folder_id) VALUES ($1, $2)
+                ON CONFLICT (owner_id) DO UPDATE
+                SET active_folder_id = EXCLUDED.active_folder_id, updated_at = now()
+                """,
+                owner_id,
+                folder_id,
+            )
+
+    async def running_folders(self) -> list[Folder]:
+        """Folders left switched on — restored on boot, each independently of the others."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, owner_id, name, running, mode, reverse_account_id"
+                " FROM copy_folders WHERE running ORDER BY id"
+            )
+        return [Folder(**dict(r)) for r in rows]
+
+    async def set_folder_running(self, folder_id: int, running: bool) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE copy_folders SET running = $2, updated_at = now() WHERE id = $1",
+                folder_id,
+                running,
+            )
+
+    async def set_folder_mode(self, folder_id: int, mode: str, reverse_account_id: int | None) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE copy_folders SET mode = $2, reverse_account_id = $3, updated_at = now()"
+                " WHERE id = $1",
+                folder_id,
+                mode,
+                reverse_account_id,
+            )
+
     async def replace_master(
-        self, *, owner_id: int, api_key: str, api_secret: str, position_mode: int | None
+        self, *, owner_id: int, folder_id: int, api_key: str, api_secret: str,
+        position_mode: int | None,
     ) -> int:
         """Swap in a new master, removing the old one, as a single transaction.
 
@@ -161,16 +284,18 @@ class Store:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
-                    "DELETE FROM copy_accounts WHERE owner_id = $1 AND kind = $2", owner_id, MASTER
+                    "DELETE FROM copy_accounts WHERE folder_id = $1 AND kind = $2", folder_id, MASTER
                 )
                 return await conn.fetchval(
                     """
                     INSERT INTO copy_accounts
-                        (owner_id, label, kind, api_key_enc, api_secret_enc, api_key_hint, position_mode)
-                    VALUES ($1, 'Master', $2, $3, $4, $5, $6)
+                        (owner_id, folder_id, label, kind, api_key_enc, api_secret_enc,
+                         api_key_hint, position_mode)
+                    VALUES ($1, $2, 'Master', $3, $4, $5, $6, $7)
                     RETURNING id
                     """,
                     owner_id,
+                    folder_id,
                     MASTER,
                     self._cipher.encrypt(api_key),
                     self._cipher.encrypt(api_secret),
@@ -178,7 +303,7 @@ class Store:
                     position_mode,
                 )
 
-    async def promote_follower(self, owner_id: int, account_id: int) -> bool:
+    async def promote_follower(self, folder_id: int, account_id: int) -> bool:
         """Make one of this owner's followers the master, and the master a follower.
 
         A swap rather than a replacement: both accounts keep their keys, so nothing is lost and
@@ -192,8 +317,8 @@ class Store:
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 candidate = await conn.fetchrow(
-                    "SELECT label FROM copy_accounts WHERE id = $1 AND owner_id = $2 AND kind = $3",
-                    account_id, owner_id, FOLLOWER,
+                    "SELECT label FROM copy_accounts WHERE id = $1 AND folder_id = $2 AND kind = $3",
+                    account_id, folder_id, FOLLOWER,
                 )
                 if not candidate:
                     return False
@@ -202,8 +327,8 @@ class Store:
                 # numbering stays contiguous and unique instead of gaining a second "Follower #3".
                 await conn.execute(
                     "UPDATE copy_accounts SET kind = $2, label = $3, updated_at = now()"
-                    " WHERE owner_id = $1 AND kind = $4",
-                    owner_id, FOLLOWER, candidate["label"], MASTER,
+                    " WHERE folder_id = $1 AND kind = $4",
+                    folder_id, FOLLOWER, candidate["label"], MASTER,
                 )
                 await conn.execute(
                     "UPDATE copy_accounts SET kind = $2, label = 'Master', updated_at = now()"
@@ -212,20 +337,23 @@ class Store:
                 )
                 # A hedge account that has just become the master would be hedging itself.
                 await conn.execute(
-                    "UPDATE copy_state SET reverse_account_id = NULL"
-                    " WHERE owner_id = $1 AND reverse_account_id = $2",
-                    owner_id, account_id,
+                    "UPDATE copy_folders SET reverse_account_id = NULL"
+                    " WHERE id = $1 AND reverse_account_id = $2",
+                    folder_id, account_id,
                 )
         return True
 
-    async def list_accounts(self, owner_id: int, kind: str | None = None) -> list[Account]:
+    async def list_accounts(self, folder_id: int, kind: str | None = None) -> list[Account]:
+        """Accounts in one folder. Addressed by folder rather than by owner because an owner can
+        keep several setups, and mixing them is how a master ends up mirroring onto accounts that
+        belong to a different one."""
         query = """
             SELECT id, owner_id, label, kind, api_key_hint, size_multiplier, active, position_mode,
                    last_error
             FROM copy_accounts
-            WHERE owner_id = $1
+            WHERE folder_id = $1
         """
-        args: list[Any] = [owner_id]
+        args: list[Any] = [folder_id]
         if kind:
             query += " AND kind = $2"
             args.append(kind)
@@ -240,8 +368,8 @@ class Store:
             rows = await conn.fetch("SELECT DISTINCT owner_id FROM copy_accounts ORDER BY owner_id")
         return [r["owner_id"] for r in rows]
 
-    async def get_master(self, owner_id: int) -> Account | None:
-        accounts = await self.list_accounts(owner_id, MASTER)
+    async def get_master(self, folder_id: int) -> Account | None:
+        accounts = await self.list_accounts(folder_id, MASTER)
         return accounts[0] if accounts else None
 
     async def get_credentials(self, account_id: int, owner_id: int) -> tuple[str, str] | None:
@@ -260,7 +388,7 @@ class Store:
             return None
         return self._cipher.decrypt(row["api_key_enc"]), self._cipher.decrypt(row["api_secret_enc"])
 
-    async def get_credentials_for(self, owner_id: int) -> dict[int, tuple[str, str]]:
+    async def get_credentials_for(self, folder_id: int) -> dict[int, tuple[str, str]]:
         """Every one of this owner's accounts, decrypted, in a single round trip.
 
         The menu needs all ten at once to show balances. Asking per account turned one screen into
@@ -269,8 +397,8 @@ class Store:
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, api_key_enc, api_secret_enc FROM copy_accounts WHERE owner_id = $1",
-                owner_id,
+                "SELECT id, api_key_enc, api_secret_enc FROM copy_accounts WHERE folder_id = $1",
+                folder_id,
             )
         return {
             r["id"]: (self._cipher.decrypt(r["api_key_enc"]), self._cipher.decrypt(r["api_secret_enc"]))
@@ -312,46 +440,27 @@ class Store:
             )
 
     # ── run state ───────────────────────────────────────────────────────────────────────────
-    async def is_running(self, owner_id: int) -> bool:
+    async def is_running(self, folder_id: int) -> bool:
         async with self._pool.acquire() as conn:
-            return bool(await conn.fetchval("SELECT running FROM copy_state WHERE owner_id = $1", owner_id))
+            return bool(await conn.fetchval(
+                "SELECT running FROM copy_folders WHERE id = $1", folder_id
+            ))
 
-    async def set_running(self, owner_id: int, running: bool) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO copy_state (owner_id, running) VALUES ($1, $2)
-                ON CONFLICT (owner_id) DO UPDATE SET running = EXCLUDED.running, updated_at = now()
-                """,
-                owner_id,
-                running,
-            )
+    async def set_running(self, folder_id: int, running: bool) -> None:
+        await self.set_folder_running(folder_id, running)
 
-    async def get_mode(self, owner_id: int) -> tuple[str, int | None]:
-        """(mode, reverse account id). Defaults to plain copying for an owner with no row yet."""
+    async def get_mode(self, folder_id: int) -> tuple[str, int | None]:
+        """(mode, hedge account id) for one folder."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT mode, reverse_account_id FROM copy_state WHERE owner_id = $1", owner_id
+                "SELECT mode, reverse_account_id FROM copy_folders WHERE id = $1", folder_id
             )
         if not row:
             return MODE_COPY, None
         return row["mode"] or MODE_COPY, row["reverse_account_id"]
 
-    async def set_mode(self, owner_id: int, mode: str, reverse_account_id: int | None) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO copy_state (owner_id, mode, reverse_account_id)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (owner_id) DO UPDATE
-                SET mode = EXCLUDED.mode,
-                    reverse_account_id = EXCLUDED.reverse_account_id,
-                    updated_at = now()
-                """,
-                owner_id,
-                mode,
-                reverse_account_id,
-            )
+    async def set_mode(self, folder_id: int, mode: str, reverse_account_id: int | None) -> None:
+        await self.set_folder_mode(folder_id, mode, reverse_account_id)
 
     async def get_language(self, owner_id: int) -> str:
         async with self._pool.acquire() as conn:
@@ -529,12 +638,6 @@ class Store:
                 "DELETE FROM copy_mirrored_orders WHERE owner_id = $1 AND master_order_id = $2",
                 owner_id, master_order_id,
             )
-
-    async def running_owners(self) -> list[int]:
-        """Owners whose copying was left ON — restored on boot so a redeploy resumes each."""
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT owner_id FROM copy_state WHERE running ORDER BY owner_id")
-        return [r["owner_id"] for r in rows]
 
     # ── positions (expected state) ──────────────────────────────────────────────────────────
     async def get_positions(self, account_id: int) -> dict[tuple[str, int], PositionRow]:

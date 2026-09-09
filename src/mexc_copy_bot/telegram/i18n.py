@@ -35,6 +35,11 @@ STRINGS: dict[str, dict[str, str]] = {
     "btn_remove": {UK: "🗑 Видалити акаунт", EN: "🗑 Remove account"},
     "btn_change_master": {UK: "🔄 Змінити Master (нові ключі)", EN: "🔄 Change the Master (new keys)"},
     "btn_promote": {UK: "⬆️ Зробити Master з Follower", EN: "⬆️ Promote a Follower"},
+    "btn_folder": {UK: "📁 {name}", EN: "📁 {name}"},
+    "btn_new_folder": {UK: "➕ Нова папка", EN: "➕ New folder"},
+    "btn_rename_folder": {UK: "✏️ Перейменувати", EN: "✏️ Rename"},
+    "btn_delete_folder": {UK: "🗑 Видалити папку", EN: "🗑 Delete folder"},
+    "btn_confirm_delete": {UK: "✅ Так, видалити", EN: "✅ Yes, delete"},
     "btn_confirm_change": {UK: "✅ Так, змінити", EN: "✅ Yes, change it"},
     "btn_back": {UK: "« Назад", EN: "« Back"},
     "btn_cancel": {UK: "Скасувати", EN: "Cancel"},
@@ -238,6 +243,50 @@ STRINGS: dict[str, dict[str, str]] = {
     "promoted": {
         UK: "✅ <b>Ролі змінено</b>\n\nНовий Master: <b>{new}</b>\nСтарий Master тепер follower.",
         EN: "✅ <b>Roles swapped</b>\n\nNew Master: <b>{new}</b>\nThe old Master is now a follower.",
+    },
+
+    # ── folders ────────────────────────────────────────────────────────────
+    "folders_title": {UK: "📁 <b>ПАПКИ</b>", EN: "📁 <b>FOLDERS</b>"},
+    "folders_explain": {
+        UK: "Кожна папка — окремий набір: свій Master, свої followers, свій режим і свій "
+            "СТАРТ/СТОП.\n\nПапки працюють <b>незалежно</b>. Перемикання лише змінює те, "
+            "що ти бачиш — папка, яка копіює, копіює далі.",
+        EN: "Each folder is a separate setup: its own Master, followers, mode and START/STOP."
+            "\n\nFolders run <b>independently</b>. Switching only changes what you see — a "
+            "folder that is copying keeps copying.",
+    },
+    "folder_row": {
+        UK: "{mark} <b>{name}</b> — {accounts} акаунт(ів) · {state}",
+        EN: "{mark} <b>{name}</b> — {accounts} account(s) · {state}",
+    },
+    "folder_running": {UK: "🟢 працює", EN: "🟢 running"},
+    "folder_stopped": {UK: "🔴 зупинено", EN: "🔴 stopped"},
+    "folder_name_ask": {
+        UK: "Надішли назву папки повідомленням (до 40 символів).",
+        EN: "Send the folder name as a message (up to 40 characters).",
+    },
+    "folder_created": {
+        UK: "✅ Папку <b>{name}</b> створено й обрано.",
+        EN: "✅ Folder <b>{name}</b> created and selected.",
+    },
+    "folder_renamed": {UK: "✅ Тепер це <b>{name}</b>.", EN: "✅ Renamed to <b>{name}</b>."},
+    "folder_switched": {UK: "📁 Обрано <b>{name}</b>.", EN: "📁 Switched to <b>{name}</b>."},
+    "folder_delete_warn": {
+        UK: "🗑 <b>ВИДАЛИТИ ПАПКУ</b>\n\n<b>{name}</b> та всі її акаунти ({accounts}) "
+            "будуть видалені разом із ключами.\n\nПозиції на біржі <b>не закриваються</b> — "
+            "закрий їх до видалення, інакше вони лишаться без нагляду.",
+        EN: "🗑 <b>DELETE FOLDER</b>\n\n<b>{name}</b> and all {accounts} of its accounts "
+            "will be deleted, keys included.\n\nPositions on the exchange are <b>not "
+            "closed</b> — close them first, or they are left unattended.",
+    },
+    "folder_deleted": {UK: "🗑 Папку видалено.", EN: "🗑 Folder deleted."},
+    "folder_last_one": {
+        UK: "Це єдина папка — її не можна видалити. Створи іншу спершу.",
+        EN: "This is the only folder — it cannot be deleted. Create another first.",
+    },
+    "folder_stop_first": {
+        UK: "Спершу зупини копіювання в цій папці.",
+        EN: "Stop copying in this folder first.",
     },
 
     "reverse_pick": {

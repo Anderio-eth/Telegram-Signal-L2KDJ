@@ -23,6 +23,7 @@ BEGIN
         -- Pre-existing rows go to owner 0, which belongs to nobody: they stay invisible in the
         -- bot rather than silently becoming someone's accounts.
         ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS owner_id BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS folder_id BIGINT;
         -- The single-master index used to be global; it has to become per-owner.
         IF EXISTS (SELECT 1 FROM pg_indexes
                    WHERE indexname = 'copy_accounts_single_master' AND indexdef LIKE '%(kind)%') THEN
@@ -39,10 +40,12 @@ BEGIN
         ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS reverse_account_id BIGINT;
         ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS mirror_limits BOOLEAN NOT NULL DEFAULT FALSE;
         ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'uk';
+        ALTER TABLE copy_state ADD COLUMN IF NOT EXISTS active_folder_id BIGINT;
     END IF;
 
     IF to_regclass('public.copy_master_events') IS NOT NULL THEN
         ALTER TABLE copy_master_events ADD COLUMN IF NOT EXISTS owner_id BIGINT NOT NULL DEFAULT 0;
+        ALTER TABLE copy_master_events ADD COLUMN IF NOT EXISTS folder_id BIGINT;
         -- dedupe_key was globally unique, which would let one owner's event suppress another's
         -- identical one. Found by column rather than by name: Postgres named the old constraint
         -- itself, and guessing that name wrong leaves the bug silently in place.
@@ -69,10 +72,34 @@ BEGIN
     END IF;
 END $$;
 
+-- A folder is a self-contained trading setup: its own master, its own followers, its own mode and
+-- its own run state. One owner can keep several and switch between them.
+--
+-- Folders run independently of which one is on screen. Switching is a change of view, nothing
+-- more: a folder that was copying keeps copying, because stopping a live setup as a side effect of
+-- looking at a different one would leave real positions unattended by accident.
+--
+-- The settings live on this row rather than in a separate table — a folder IS its settings, and
+-- splitting them would only create a second thing to keep in step.
+CREATE TABLE IF NOT EXISTS copy_folders (
+    id                 BIGSERIAL   PRIMARY KEY,
+    owner_id           BIGINT      NOT NULL,
+    name               TEXT        NOT NULL,
+    running            BOOLEAN     NOT NULL DEFAULT FALSE,
+    mode               TEXT        NOT NULL DEFAULT 'COPY' CHECK (mode IN ('COPY', 'REVERSE')),
+    reverse_account_id BIGINT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS copy_folders_owner ON copy_folders (owner_id, created_at);
+
 CREATE TABLE IF NOT EXISTS copy_accounts (
     id                BIGSERIAL PRIMARY KEY,
     -- Telegram user id of the owner. Accounts are private to them.
     owner_id          BIGINT      NOT NULL,
+    -- Which folder this account belongs to. Everything a master does is scoped to its folder.
+    folder_id         BIGINT      REFERENCES copy_folders(id) ON DELETE CASCADE,
     label             TEXT        NOT NULL,
     -- 'MASTER' or 'FOLLOWER'. Exactly one master is enforced by the partial index below.
     kind              TEXT        NOT NULL CHECK (kind IN ('MASTER', 'FOLLOWER')),
@@ -93,9 +120,10 @@ CREATE TABLE IF NOT EXISTS copy_accounts (
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- One master PER OWNER, enforced by the database rather than by application checks that can race.
-CREATE UNIQUE INDEX IF NOT EXISTS copy_accounts_single_master
-    ON copy_accounts (owner_id) WHERE kind = 'MASTER';
+-- One master PER FOLDER, enforced by the database rather than by application checks that can
+-- race. It used to be per owner; folders are what a master belongs to now.
+CREATE UNIQUE INDEX IF NOT EXISTS copy_accounts_single_master_per_folder
+    ON copy_accounts (folder_id) WHERE kind = 'MASTER';
 
 CREATE INDEX IF NOT EXISTS copy_accounts_owner ON copy_accounts (owner_id);
 
@@ -120,6 +148,7 @@ CREATE TABLE IF NOT EXISTS copy_positions (
 CREATE TABLE IF NOT EXISTS copy_master_events (
     id             BIGSERIAL   PRIMARY KEY,
     owner_id       BIGINT      NOT NULL,
+    folder_id      BIGINT,
     -- Unique per owner, not globally: two masters can legitimately produce the same position
     -- version for the same symbol, and one owner's event must never suppress the other's.
     dedupe_key     TEXT        NOT NULL,
@@ -166,6 +195,7 @@ CREATE INDEX IF NOT EXISTS copy_mirrored_orders_owner ON copy_mirrored_orders (o
 CREATE TABLE IF NOT EXISTS copy_stuck_groups (
     id             BIGSERIAL   PRIMARY KEY,
     owner_id       BIGINT      NOT NULL,
+    folder_id      BIGINT,
     symbol         TEXT        NOT NULL,
     position_type  INTEGER     NOT NULL,
     -- ENTRY: the buy never filled, so there is no position and a limit is still resting.
@@ -243,9 +273,53 @@ CREATE TABLE IF NOT EXISTS copy_state (
     -- Interface language for this owner: 'uk' or 'en'. Per owner rather than global, since the
     -- two brothers do not have to agree on one.
     language     TEXT        NOT NULL DEFAULT 'uk',
+    -- Which folder this owner is currently looking at. Purely a view: it does not decide what
+    -- runs, only what the menu shows.
+    active_folder_id BIGINT,
     -- Unused. Limit mirroring is unconditional; this column is kept only so an older database
     -- does not need a destructive migration to drop it.
     mirror_limits BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- ── Move an existing single-setup owner into a folder ───────────────────────────────────────
+-- Everything that existed before folders belonged to one implicit setup per owner. That setup
+-- becomes a real folder, keeping its run state and mode, and every account and its settings move
+-- into it. Idempotent: an owner who already has a folder is skipped entirely.
+DO $$
+DECLARE
+    row record;
+    new_id BIGINT;
+BEGIN
+    IF to_regclass('public.copy_folders') IS NULL THEN
+        RETURN;
+    END IF;
+
+    FOR row IN
+        SELECT DISTINCT a.owner_id
+        FROM copy_accounts a
+        WHERE a.folder_id IS NULL
+          AND NOT EXISTS (SELECT 1 FROM copy_folders f WHERE f.owner_id = a.owner_id)
+    LOOP
+        INSERT INTO copy_folders (owner_id, name, running, mode, reverse_account_id)
+        SELECT row.owner_id,
+               'MEXC',
+               COALESCE(s.running, FALSE),
+               COALESCE(s.mode, 'COPY'),
+               s.reverse_account_id
+        FROM (SELECT 1) dummy
+        LEFT JOIN copy_state s ON s.owner_id = row.owner_id
+        RETURNING id INTO new_id;
+
+        UPDATE copy_accounts SET folder_id = new_id
+        WHERE owner_id = row.owner_id AND folder_id IS NULL;
+
+        UPDATE copy_state SET active_folder_id = new_id
+        WHERE owner_id = row.owner_id AND active_folder_id IS NULL;
+    END LOOP;
+
+    -- The old single-master index was per owner; folders own masters now.
+    IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'copy_accounts_single_master') THEN
+        DROP INDEX copy_accounts_single_master;
+    END IF;
+END $$;

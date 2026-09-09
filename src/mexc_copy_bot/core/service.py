@@ -7,10 +7,13 @@ Restart safety (spec §31): run state is persisted, and on boot the master's rea
 the baseline before monitoring resumes — otherwise the first push after a restart would look like
 the master had just opened everything from scratch, and every follower would copy it again.
 
-One instance per owner (see core/registry.py). Each has its own master socket, its own
-followers and its own run state, so one person starting, stopping or emergency-closing never
-reaches into somebody else's accounts. `owner_id` is passed to every store call rather than
-filtered afterwards.
+One instance per FOLDER (see core/registry.py). A folder is a self-contained setup — its own
+master, its own followers, its own mode and run state — and folders run independently of which one
+their owner happens to be looking at. Switching the view must never stop a live one.
+
+Account lookups are therefore scoped by `folder_id`, not by owner: an owner can keep several
+setups, and mixing them is how a master ends up mirroring onto accounts from a different one.
+`owner_id` is still carried, because that is who gets told what happened.
 """
 
 from __future__ import annotations
@@ -72,6 +75,7 @@ class CopyService:
     def __init__(
         self,
         store: Store,
+        folder_id: int,
         owner_id: int,
         *,
         retry_attempts: int = 3,
@@ -79,6 +83,7 @@ class CopyService:
         ws_reconnect_max_seconds: float = 30.0,
     ) -> None:
         self._store = store
+        self._folder_id = folder_id
         self._owner_id = owner_id
         self._retry_attempts = retry_attempts
         self._reconcile_seconds = reconcile_seconds
@@ -118,6 +123,10 @@ class CopyService:
     def owner_id(self) -> int:
         return self._owner_id
 
+    @property
+    def folder_id(self) -> int:
+        return self._folder_id
+
     # ── lifecycle ───────────────────────────────────────────────────────────────────────────
     @property
     def running(self) -> bool:
@@ -131,7 +140,7 @@ class CopyService:
         if self._ws:
             return "Вже працює."
 
-        master = await self._store.get_master(self._owner_id)
+        master = await self._store.get_master(self._folder_id)
         if not master:
             return "Master акаунт не додано."
 
@@ -154,7 +163,7 @@ class CopyService:
         self._ws.start()
         self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
         self._order_poll_task = asyncio.create_task(self._order_poll_loop(), name="orders")
-        await self._store.set_running(self._owner_id, True)
+        await self._store.set_running(self._folder_id, True)
 
         if await self._ws.wait_connected(CONNECT_TIMEOUT_SECONDS):
             return "✅ Копіювання запущено — майстер підключений."
@@ -178,7 +187,7 @@ class CopyService:
         if self._session:
             await self._session.close()
             self._session = None
-        await self._store.set_running(self._owner_id, False)
+        await self._store.set_running(self._folder_id, False)
         return "Копіювання зупинено. Відкриті позиції лишились як були."
 
     async def emergency_close_all(self) -> list[tuple[Account, str]]:
@@ -192,7 +201,7 @@ class CopyService:
         session = self._session or aiohttp.ClientSession()
         own_session = self._session is None
         try:
-            for follower in await self._store.list_accounts(self._owner_id, FOLLOWER):
+            for follower in await self._store.list_accounts(self._folder_id, FOLLOWER):
                 credentials = await self._store.get_credentials(follower.id, self._owner_id)
                 if not credentials:
                     outcomes.append((follower, "credentials missing"))
@@ -407,7 +416,7 @@ class CopyService:
         Called at connect and after every reconnect. Without this, the first push following a
         gap would be diffed against a stale size and copied as a phantom change.
         """
-        master = await self._store.get_master(self._owner_id)
+        master = await self._store.get_master(self._folder_id)
         if not master or not self._session:
             return
         credentials = await self._store.get_credentials(master.id, self._owner_id)
@@ -449,7 +458,7 @@ class CopyService:
         """
         if event.action is Action.CLOSE:
             return (None, None)
-        master = await self._store.get_master(self._owner_id)
+        master = await self._store.get_master(self._folder_id)
         if not master or not self._session:
             return (None, None)
         credentials = await self._store.get_credentials(master.id, self._owner_id)
@@ -478,7 +487,7 @@ class CopyService:
         """
         LOGGER.info("master stop-order frame on %s: %s", channel, data)
 
-        mode, _ = await self._store.get_mode(self._owner_id)
+        mode, _ = await self._store.get_mode(self._folder_id)
         if mode == MODE_REVERSE:
             # Deliberate: a hedge holds the opposite side, so the master's stop price sits on the
             # wrong side of its entry — it would close the hedge for a profit and let the loss run.
@@ -486,7 +495,7 @@ class CopyService:
             LOGGER.info("reverse mode: master stops are not mirrored")
             return
 
-        master = await self._store.get_master(self._owner_id)
+        master = await self._store.get_master(self._folder_id)
         if not master or not self._session:
             return
         credentials = await self._store.get_credentials(master.id, self._owner_id)
@@ -505,7 +514,7 @@ class CopyService:
             LOGGER.info("master has no active stops for %s", symbol or "any symbol")
             return
 
-        followers = [a for a in await self._store.list_accounts(self._owner_id, FOLLOWER) if a.active]
+        followers = [a for a in await self._store.list_accounts(self._folder_id, FOLLOWER) if a.active]
         results = await asyncio.gather(
             *(self._apply_stops_to(f, wanted) for f in followers), return_exceptions=True
         )
@@ -591,7 +600,7 @@ class CopyService:
                 asyncio.create_task(self._report_limit_fill(order))
 
     async def _master_client(self) -> MexcRestClient | None:
-        master = await self._store.get_master(self._owner_id)
+        master = await self._store.get_master(self._folder_id)
         if not master or not self._session:
             return None
         credentials = await self._store.get_credentials(master.id, self._owner_id)
@@ -704,7 +713,7 @@ class CopyService:
         )
         if not followers:
             return
-        mode, _ = await self._store.get_mode(self._owner_id)
+        mode, _ = await self._store.get_mode(self._folder_id)
         reverse = mode == MODE_REVERSE
         self._closing_intent[order.order_id] = closing_side
         vol_by_account: dict[int, float] | None = None
@@ -805,7 +814,7 @@ class CopyService:
         pairs = await self._store.get_mirrored_orders(self._owner_id, master_order_id)
         if not pairs:
             return
-        accounts = {a.id: a for a in await self._store.list_accounts(self._owner_id, FOLLOWER)}
+        accounts = {a.id: a for a in await self._store.list_accounts(self._folder_id, FOLLOWER)}
         todo = [(accounts[aid], oid) for aid, oid in pairs if aid in accounts]
 
         assert self._session is not None
@@ -836,7 +845,7 @@ class CopyService:
            gone, and it would be joining a trade half way through. It waits for the next one
            instead, which by definition starts with both of them flat.
         """
-        active = [a for a in await self._store.list_accounts(self._owner_id, FOLLOWER) if a.active]
+        active = [a for a in await self._store.list_accounts(self._folder_id, FOLLOWER) if a.active]
 
         detached = await self._store.detached_account_ids(self._owner_id)
         if detached:
@@ -844,7 +853,7 @@ class CopyService:
             active = [a for a in active if a.id not in detached]
             LOGGER.info("skipping detached accounts: %s", ", ".join(skipped))
 
-        mode, reverse_account_id = await self._store.get_mode(self._owner_id)
+        mode, reverse_account_id = await self._store.get_mode(self._folder_id)
         if mode == MODE_REVERSE:
             active = [a for a in active if a.id == reverse_account_id]
 
@@ -924,7 +933,7 @@ class CopyService:
             LOGGER.info("duplicate master event ignored: %s", event.dedupe_key)
             return
 
-        mode, _ = await self._store.get_mode(self._owner_id)
+        mode, _ = await self._store.get_mode(self._folder_id)
         reverse = mode == MODE_REVERSE
         followers = await self._eligible_followers(
             opening=event.action is not Action.CLOSE, symbol=event.symbol
@@ -982,7 +991,7 @@ class CopyService:
         if not self._session:
             return []
         drifts: list[Drift] = []
-        for follower in await self._store.list_accounts(self._owner_id, FOLLOWER):
+        for follower in await self._store.list_accounts(self._folder_id, FOLLOWER):
             credentials = await self._store.get_credentials(follower.id, self._owner_id)
             if not credentials:
                 continue

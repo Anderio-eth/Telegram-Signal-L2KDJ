@@ -29,23 +29,25 @@ from mexc_copy_bot.core.orders import (  # noqa: E402
 from mexc_copy_bot.core.service import CopyService  # noqa: E402
 
 OWNER = 42
+# A service now belongs to a folder; the owner is only who gets told about it.
+FOLDER = 3
 LONG = 1
 
 
 class FakeStore:
     """Only what the handlers touch."""
 
-    async def get_mode(self, owner_id): return ("COPY", None)
-    async def list_accounts(self, owner_id, kind=None): return []
+    async def get_mode(self, folder_id): return ("COPY", None)
+    async def list_accounts(self, folder_id, kind=None): return []
     async def record_mirrored_order(self, **kw): pass
     async def get_mirrored_orders(self, owner_id, mid): return []
     async def clear_mirrored_order(self, owner_id, mid): pass
-    async def get_master(self, owner_id): return None
+    async def get_master(self, folder_id): return None
     async def get_credentials(self, aid, oid): return None
 
 
 def service(monkeypatch):
-    svc = CopyService(FakeStore(), OWNER)
+    svc = CopyService(FakeStore(), FOLDER, OWNER)
     dispatched = []
 
     async def spy(event, raw):
