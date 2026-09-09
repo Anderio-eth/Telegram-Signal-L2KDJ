@@ -19,16 +19,24 @@ import pytest  # noqa: E402
 
 from mexc_copy_bot.core.copy_engine import OPPOSITE_SIDE, CopyEngine  # noqa: E402
 from mexc_copy_bot.core.events import Action, MasterEvent  # noqa: E402
-from mexc_copy_bot.db.store import FOLLOWER, Account, PositionRow  # noqa: E402
+from mexc_copy_bot.db.store import (  # noqa: E402
+    DIRECTION_COPY,
+    DIRECTION_REVERSE,
+    FOLLOWER,
+    Account,
+    PositionRow,
+)
 from mexc_copy_bot.mexc.rest import SIDE_OPEN_LONG, SIDE_OPEN_SHORT, Position  # noqa: E402
 
 LONG, SHORT = 1, 2
 
 
-def follower(n: int = 1) -> Account:
+def follower(n: int = 1, direction: str = DIRECTION_REVERSE) -> Account:
+    """Reversed by default: these tests are about the hedge, and spelling it out on every call
+    would bury the one case that differs."""
     return Account(
         id=n, owner_id=7, label=f"Follower #{n}", kind=FOLLOWER, api_key_hint="k",
-        size_multiplier=1.0, active=True, position_mode=1, last_error=None,
+        size_multiplier=1.0, active=True, position_mode=1, last_error=None, direction=direction,
     )
 
 
@@ -138,8 +146,12 @@ def test_master_short_makes_the_hedge_go_long():
     assert FakeClient.instances[0].orders[0]["side"] == SIDE_OPEN_LONG
 
 
-def test_copy_mode_is_untouched():
-    asyncio.run(run(Action.OPEN, LONG, reverse=False))
+def test_copy_mode_ignores_the_per_account_direction():
+    """In COPY mode everyone follows the master, so the setting survives switching modes rather
+    than being reset — and a reversed account does not quietly trade backwards."""
+    store = FakeStore()
+    engine = CopyEngine(store, session=None, retry_attempts=1)
+    asyncio.run(engine.execute(event(Action.OPEN, LONG), 1, [follower()], reverse=False))
     assert FakeClient.instances[0].orders[0]["side"] == SIDE_OPEN_LONG
 
 
@@ -191,3 +203,40 @@ def test_a_close_against_an_already_flat_account_is_not_an_error():
     assert results[0].error is None
     assert FakeClient.instances[0].closed == []       # nothing sent to the exchange
     assert store.deleted == [(1, "ADA_USDT", LONG)]   # bookkeeping still cleared
+
+
+def test_some_accounts_go_long_while_others_go_short():
+    """The point of per-account directions: one master move, both sides of the book."""
+    store = FakeStore()
+    engine = CopyEngine(store, session=None, retry_attempts=1)
+    crowd = [
+        follower(1, DIRECTION_COPY),
+        follower(2, DIRECTION_COPY),
+        follower(3, DIRECTION_REVERSE),
+        follower(4, DIRECTION_REVERSE),
+    ]
+    asyncio.run(engine.execute(event(Action.OPEN, LONG), 1, crowd, reverse=True))
+
+    sides = [c.orders[0]["side"] for c in FakeClient.instances]
+    assert sides == [SIDE_OPEN_LONG, SIDE_OPEN_LONG, SIDE_OPEN_SHORT, SIDE_OPEN_SHORT]
+
+
+def test_each_result_reports_the_side_that_account_actually_took():
+    """A report showing only the master's side would tell you everyone went long while half of
+    them went short."""
+    store = FakeStore()
+    engine = CopyEngine(store, session=None, retry_attempts=1)
+    crowd = [follower(1, DIRECTION_COPY), follower(2, DIRECTION_REVERSE)]
+    results = asyncio.run(engine.execute(event(Action.OPEN, LONG), 1, crowd, reverse=True))
+
+    assert [r.position_type for r in results] == [LONG, SHORT]
+
+
+def test_bookkeeping_follows_each_account_own_side():
+    store = FakeStore()
+    engine = CopyEngine(store, session=None, retry_attempts=1)
+    crowd = [follower(1, DIRECTION_COPY), follower(2, DIRECTION_REVERSE)]
+    asyncio.run(engine.execute(event(Action.OPEN, LONG), 1, crowd, reverse=True))
+
+    assert (1, "ADA_USDT", LONG) in store.positions
+    assert (2, "ADA_USDT", SHORT) in store.positions

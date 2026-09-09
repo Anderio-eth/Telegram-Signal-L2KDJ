@@ -34,6 +34,12 @@ STRINGS: dict[str, dict[str, str]] = {
     "btn_add_follower": {UK: "➕ Додати Follower акаунт", EN: "➕ Add Follower account"},
     "btn_remove": {UK: "🗑 Видалити акаунт", EN: "🗑 Remove account"},
     "btn_change_master": {UK: "🔄 Змінити Master (нові ключі)", EN: "🔄 Change the Master (new keys)"},
+    "btn_dir_copy": {UK: "📋 як майстер", EN: "📋 same as master"},
+    "btn_dir_reverse": {UK: "🔁 навпаки", EN: "🔁 opposite"},
+    "dir_pick": {
+        UK: "Тисни на акаунт, щоб змінити його напрям.",
+        EN: "Tap an account to change which way it trades.",
+    },
     "btn_promote": {UK: "⬆️ Зробити Master з Follower", EN: "⬆️ Promote a Follower"},
     "btn_folder": {UK: "📁 {name}", EN: "📁 {name}"},
     "btn_new_folder": {UK: "➕ Нова папка", EN: "➕ New folder"},
@@ -99,10 +105,11 @@ STRINGS: dict[str, dict[str, str]] = {
         EN: "📋 <b>Copy</b> — every follower opens the <i>same</i> side as the master.",
     },
     "mode_explain_reverse": {
-        UK: "🔁 <b>Реверс</b> — один обраний акаунт відкриває <i>протилежну</i>: майстер у LONG, "
-            "він у SHORT. Автоматичний хедж.",
-        EN: "🔁 <b>Reverse</b> — one chosen account opens the <i>opposite</i> side: master goes "
-            "LONG, it goes SHORT. An automatic hedge.",
+        UK: "🔁 <b>Реверс</b> — кожен follower має <i>свій</i> напрям. Позначені 📋 йдуть за майстром, "
+            "позначені 🔁 — у протилежну сторону. Майстер у LONG: перші в LONG, другі в SHORT.",
+        EN: "🔁 <b>Reverse</b> — each follower has <i>its own</i> direction. Those marked 📋 follow "
+            "the master, those marked 🔁 take the opposite side. Master goes LONG: the first go "
+            "LONG, the others SHORT.",
     },
     "mode_one_at_a_time": {UK: "Одночасно працює лише один режим.", EN: "Only one mode runs at a time."},
     "limits_title": {UK: "📌 <b>Лімітні ордери:</b> копіюються завжди", EN: "📌 <b>Limit orders:</b> always mirrored"},

@@ -853,9 +853,9 @@ class CopyService:
             active = [a for a in active if a.id not in detached]
             LOGGER.info("skipping detached accounts: %s", ", ".join(skipped))
 
-        mode, reverse_account_id = await self._store.get_mode(self._folder_id)
-        if mode == MODE_REVERSE:
-            active = [a for a in active if a.id == reverse_account_id]
+        # REVERSE no longer means "one nominated account and the rest idle": every active
+        # follower trades, each on the side it was set to. The mode only decides whether those
+        # per-account settings are honoured at all, which is settled where the trade is placed.
 
         if opening is None or symbol is None or not active:
             return active
@@ -938,17 +938,6 @@ class CopyService:
         followers = await self._eligible_followers(
             opening=event.action is not Action.CLOSE, symbol=event.symbol
         )
-        if reverse and not followers:
-            # Exactly one account hedges the master. If it was deleted, paused or stranded, do
-            # nothing and say so: quietly falling back to every follower would open positions on
-            # the same side as the master, the precise opposite of what reverse is for.
-            LOGGER.warning("reverse mode has no usable account for owner %s", self._owner_id)
-            await self._notify(
-                "⚠️ Увімкнено реверс, але його акаунт відсутній, на паузі або завис — "
-                "нічого не скопійовано."
-            )
-            return
-
         if not followers:
             LOGGER.info("no active followers for event %s", event_id)
             return

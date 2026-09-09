@@ -36,6 +36,10 @@ MODE_COPY = "COPY"
 MODE_REVERSE = "REVERSE"
 
 
+DIRECTION_COPY = "COPY"
+DIRECTION_REVERSE = "REVERSE"
+
+
 @dataclass(frozen=True)
 class Account:
     id: int
@@ -47,6 +51,11 @@ class Account:
     active: bool
     position_mode: int | None
     last_error: str | None
+    direction: str = DIRECTION_COPY
+
+    @property
+    def is_reversed(self) -> bool:
+        return self.direction == DIRECTION_REVERSE
 
     @property
     def is_master(self) -> bool:
@@ -349,7 +358,7 @@ class Store:
         belong to a different one."""
         query = """
             SELECT id, owner_id, label, kind, api_key_hint, size_multiplier, active, position_mode,
-                   last_error
+                   last_error, direction
             FROM copy_accounts
             WHERE folder_id = $1
         """
@@ -427,6 +436,21 @@ class Store:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "UPDATE copy_accounts SET last_error = $2, updated_at = now() WHERE id = $1", account_id, error
+            )
+
+    async def set_direction(self, account_id: int, folder_id: int, direction: str) -> None:
+        """Which way one account trades relative to the master.
+
+        Scoped by folder as well as id, like every other mutation here: an id from a stale
+        keyboard must match no row rather than reach into a setup it does not belong to.
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE copy_accounts SET direction = $3, updated_at = now()"
+                " WHERE id = $1 AND folder_id = $2",
+                account_id,
+                folder_id,
+                direction,
             )
 
     async def set_size_multiplier(self, account_id: int, owner_id: int, multiplier: float) -> None:

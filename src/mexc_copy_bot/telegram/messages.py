@@ -180,7 +180,12 @@ def event_report(
         if result.ok:
             ok += 1
             detail = t(lang, "closed") if event.action is Action.CLOSE else result.action.value
-            line = f"✅ {result.account.label} — {detail}"
+            # Named per account, not per master action: with per-account directions a single
+            # master move puts some accounts long and others short, and one shared heading would
+            # be wrong for half of them.
+            taken = result.position_type or event.position_type
+            marker = "" if taken == event.position_type else f" {side_name(taken)}"
+            line = f"✅ {result.account.label} — {detail}{marker}"
             if event.action is Action.CLOSE:
                 # An unknown settlement says so rather than printing a zero, which would read as
                 # "this trade broke even".
@@ -213,14 +218,18 @@ def mode_screen(
     lines = [t(lang, "mode_title"), ""]
     if mode == MODE_REVERSE:
         lines.append(t(lang, "mode_now_reverse"))
-        lines.append(
-            t(lang, "mode_hedging_on", label=reverse_account.label)
-            if reverse_account
-            else t(lang, "mode_no_hedge")
-        )
     else:
         lines.append(t(lang, "mode_now_copy"))
         lines.append(t(lang, "mode_mirroring_all", n=len(followers)))
+
+    if mode == MODE_REVERSE:
+        lines.append("")
+        for follower in followers:
+            arrow = "🔁" if follower.is_reversed else "📋"
+            paused = t(lang, "paused") if not follower.active else ""
+            lines.append(f"   {arrow} {follower.label}{paused}")
+        lines.append("")
+        lines.append(t(lang, "dir_pick"))
 
     lines += [
         "",

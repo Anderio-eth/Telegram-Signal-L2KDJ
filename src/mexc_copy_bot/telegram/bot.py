@@ -40,7 +40,16 @@ from ..core.copy_engine import FollowerResult
 from ..core.events import MasterEvent
 from ..core.registry import ServiceRegistry
 from ..core.stuck import StuckManager
-from ..db.store import FOLLOWER, MASTER, MODE_COPY, MODE_REVERSE, Account, Store
+from ..db.store import (
+    DIRECTION_COPY,
+    DIRECTION_REVERSE,
+    FOLLOWER,
+    MASTER,
+    MODE_COPY,
+    MODE_REVERSE,
+    Account,
+    Store,
+)
 from ..mexc.rest import MexcError, MexcRestClient, get_contract_specs, get_ticker_price
 from . import messages
 from .i18n import EN, UK, t
@@ -459,6 +468,20 @@ class CopyBot:
                 return
             await self._store.set_mode(self._folder(owner_id), MODE_COPY, None)
             await self._show_mode(update, owner_id)
+        elif action.startswith("dir:"):
+            if await self._refuse_while_running(update, owner_id):
+                return
+            account_id = int(action.split(":", 1)[1])
+            folder_id = self._folder(owner_id)
+            current = {a.id: a for a in await self._store.list_accounts(folder_id, FOLLOWER)}
+            account = current.get(account_id)
+            if account:
+                await self._store.set_direction(
+                    account_id,
+                    folder_id,
+                    DIRECTION_COPY if account.is_reversed else DIRECTION_REVERSE,
+                )
+            await self._show_mode(update, owner_id)
         elif action == "mode_reverse":
             if await self._refuse_while_running(update, owner_id):
                 return
@@ -535,7 +558,13 @@ class CopyBot:
         chosen = next((f for f in followers if f.id == reverse_id), None)
         lang = await self._lang(owner_id)
         rows = []
-        if mode != MODE_COPY:
+        if mode == MODE_REVERSE:
+            # One button per account, showing what it does now — tapping flips it.
+            for follower in followers:
+                arrow = t(lang, "btn_dir_reverse") if follower.is_reversed else t(lang, "btn_dir_copy")
+                rows.append([InlineKeyboardButton(
+                    f"{follower.label} — {arrow}", callback_data=f"dir:{follower.id}"
+                )])
             rows.append([InlineKeyboardButton(t(lang, "btn_to_copy"), callback_data="mode_copy")])
         rows.append(
             [InlineKeyboardButton(

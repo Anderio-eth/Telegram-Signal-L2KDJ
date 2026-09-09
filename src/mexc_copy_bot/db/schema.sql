@@ -24,6 +24,7 @@ BEGIN
         -- bot rather than silently becoming someone's accounts.
         ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS owner_id BIGINT NOT NULL DEFAULT 0;
         ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS folder_id BIGINT;
+        ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS direction TEXT NOT NULL DEFAULT 'COPY';
         -- The single-master index used to be global; it has to become per-owner.
         IF EXISTS (SELECT 1 FROM pg_indexes
                    WHERE indexname = 'copy_accounts_single_master' AND indexdef LIKE '%(kind)%') THEN
@@ -111,6 +112,10 @@ CREATE TABLE IF NOT EXISTS copy_accounts (
     -- Position size relative to the master: 1.0 = same size. Architecture supports it from day
     -- one even though the first version always copies 1:1 (spec §14).
     size_multiplier   DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+    -- Which way this account trades relative to the master, used when the folder is in REVERSE
+    -- mode: 'COPY' takes the master's side, 'REVERSE' takes the opposite. Ignored in COPY mode,
+    -- where everyone follows the master, so the setting survives switching modes back and forth.
+    direction         TEXT        NOT NULL DEFAULT 'COPY' CHECK (direction IN ('COPY', 'REVERSE')),
     active            BOOLEAN     NOT NULL DEFAULT TRUE,
     -- Cached from the exchange so mismatches can be spotted without an API call per event:
     -- a follower in one-way mode cannot correctly mirror a hedge-mode master.
@@ -317,6 +322,16 @@ BEGIN
         UPDATE copy_state SET active_folder_id = new_id
         WHERE owner_id = row.owner_id AND active_folder_id IS NULL;
     END LOOP;
+
+    -- Reverse used to mean one nominated account while the rest sat idle. That account becomes
+    -- the one marked REVERSE, so a folder set up the old way behaves the same after the upgrade.
+    UPDATE copy_accounts a
+    SET direction = 'REVERSE'
+    FROM copy_folders f
+    WHERE f.id = a.folder_id
+      AND f.mode = 'REVERSE'
+      AND f.reverse_account_id = a.id
+      AND a.direction = 'COPY';
 
     -- The old single-master index was per owner; folders own masters now.
     IF EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'copy_accounts_single_master') THEN

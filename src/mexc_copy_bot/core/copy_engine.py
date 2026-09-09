@@ -73,6 +73,19 @@ RATE_LIMIT_TEXT = ("too frequent", "rate limit", "too many requests")
 OPPOSITE_SIDE = {1: 2, 2: 1}
 
 
+def side_for(follower: Account, master_side: int, honour_direction: bool) -> int:
+    """Which side this account takes for a master action on `master_side`.
+
+    In COPY mode everyone follows the master and the per-account setting is ignored, so it
+    survives switching modes back and forth instead of being reset. In REVERSE mode each account
+    trades the way it was set, which is what lets five go long while three go short on the same
+    master move.
+    """
+    if honour_direction and follower.is_reversed:
+        return OPPOSITE_SIDE[master_side]
+    return master_side
+
+
 @dataclass
 class FollowerResult:
     account: Account
@@ -83,6 +96,10 @@ class FollowerResult:
     # Realised PnL for a close, straight from the exchange. None means "not known" — an open, or
     # a close whose settlement could not be read — and must never be shown as a zero.
     realized_pnl: float | None = None
+    # The side this account actually took. Worth carrying separately from the master's: with
+    # per-account directions they are not the same thing, and a report that showed only the
+    # master's would say every account went long while half of them went short.
+    position_type: int | None = None
 
 
 # How long to keep asking the exchange what a just-closed position settled at. Settlement is not
@@ -146,7 +163,9 @@ class CopyEngine:
     ) -> list[FollowerResult]:
         """Apply one master event to every follower, concurrently.
 
-        `reverse` flips the side each follower takes, turning the mirror into a hedge.
+        `reverse` means "honour each account's own direction" — in that mode a follower marked
+        REVERSE takes the opposite side and one marked COPY still follows the master, so a single
+        master move can put some accounts long and others short.
         `stops` are the master's (stop loss, take profit) to put on the opening order.
         """
         if not followers:
@@ -196,7 +215,7 @@ class CopyEngine:
                 return follower, None, "credentials missing"
             client = MexcRestClient(*credentials, session=self._session)
             side = order.side
-            if reverse:
+            if reverse and follower.is_reversed:
                 # Opposite side of the same book. Not a price change: both accounts want the same
                 # price, they just want opposite exposure at it.
                 side = {1: 4, 4: 1, 2: 3, 3: 2}[order.side]
@@ -308,7 +327,7 @@ class CopyEngine:
         stops: tuple[float | None, float | None] = (None, None),
     ) -> FollowerResult:
         vol = event.delta_vol * follower.size_multiplier
-        side = OPPOSITE_SIDE[event.position_type] if reverse else event.position_type
+        side = side_for(follower, event.position_type, reverse)
         external_oid = f"cp{event_id}-{follower.id}-{uuid.uuid4().hex[:8]}"
 
         task_id = await self._store.create_task(
@@ -326,12 +345,12 @@ class CopyEngine:
             # A task already exists for this (event, follower) — the duplicate guard from the
             # schema. Nothing to do, and definitely nothing to re-send.
             LOGGER.info("task already exists for event=%s follower=%s, skipping", event_id, follower.id)
-            return FollowerResult(follower, True, event.action, vol, None)
+            return FollowerResult(follower, True, event.action, vol, None, None, side)
 
         credentials = await self._store.get_credentials(follower.id, follower.owner_id)
         if not credentials:
             await self._store.finish_task(task_id, status="FAILED", attempts=0, error="credentials missing")
-            return FollowerResult(follower, False, event.action, vol, "credentials missing")
+            return FollowerResult(follower, False, event.action, vol, "credentials missing", None, side)
 
         api_key, secret = credentials
         client = MexcRestClient(api_key, secret, session=self._session)
@@ -348,7 +367,7 @@ class CopyEngine:
                 )
                 await self._store.set_account_error(follower.id, None)
                 await self._record_expected_position(event, follower, vol, side)
-                return FollowerResult(follower, True, event.action, vol, None, realized)
+                return FollowerResult(follower, True, event.action, vol, None, realized, side)
             except MexcError as err:
                 last_error = err.message or str(err)
                 if _is_blocked_contract(err):
@@ -374,7 +393,7 @@ class CopyEngine:
 
         await self._store.finish_task(task_id, status="FAILED", attempts=attempts, error=last_error)
         await self._store.set_account_error(follower.id, last_error)
-        return FollowerResult(follower, False, event.action, vol, last_error)
+        return FollowerResult(follower, False, event.action, vol, last_error, None, side)
 
     async def _apply(
         self,
