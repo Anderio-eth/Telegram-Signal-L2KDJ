@@ -78,3 +78,52 @@ def test_a_reversed_follower_is_sent_the_side_that_actually_opens_a_short():
 
     order_side = rest.SIDE_OPEN_LONG if taken == LONG else rest.SIDE_OPEN_SHORT
     assert order_side == 3, "a reversed follower must be sent side=3, the one that opens a short"
+
+
+# ── both modes, both master directions ──────────────────────────────────────
+def _follower(direction: str) -> Account:
+    return Account(
+        id=1, owner_id=1, label="F", kind=FOLLOWER, api_key_hint="k", size_multiplier=1.0,
+        active=True, position_mode=1, last_error=None, direction=direction,
+    )
+
+
+def _order_side(mode: str, direction: str, master_side: int) -> int:
+    """The number that actually goes to the venue, derived the way copy_engine derives it."""
+    taken = side_for(_follower(direction), master_side, honour_direction=(mode == "REVERSE"))
+    return rest.SIDE_OPEN_LONG if taken == LONG else rest.SIDE_OPEN_SHORT
+
+
+def test_every_mode_and_direction_sends_a_side_that_opens():
+    """The whole matrix, in one place.
+
+    Only two venue facts are needed, and both were measured: side=1 opened a LONG and side=3
+    opened a SHORT on a flat account. Everything else here is which of those two gets sent, which
+    is arithmetic — so this needs no live trade to be trustworthy.
+
+    Three of the four used to send side=4, the number that closes a long, and failed against a
+    flat account with [2009]. Only COPY on a LONG master was ever exercised, which is why the bot
+    looked like it worked.
+    """
+    cases = {
+        # (mode, follower direction, master side): (side the follower takes, number sent)
+        ("COPY", "COPY", LONG): (LONG, 1),
+        ("COPY", "COPY", SHORT): (SHORT, 3),
+        ("REVERSE", "REVERSE", LONG): (SHORT, 3),
+        ("REVERSE", "REVERSE", SHORT): (LONG, 1),
+        # A follower left on COPY inside a REVERSE folder still follows the master.
+        ("REVERSE", "COPY", LONG): (LONG, 1),
+        ("REVERSE", "COPY", SHORT): (SHORT, 3),
+    }
+    for (mode, direction, master_side), (expected_side, expected_number) in cases.items():
+        taken = side_for(_follower(direction), master_side, honour_direction=(mode == "REVERSE"))
+        assert taken == expected_side, f"{mode}/{direction}, master {master_side}"
+        got = _order_side(mode, direction, master_side)
+        assert got == expected_number, f"{mode}/{direction}, master {master_side}: sent {got}"
+        assert got in orders.OPENING_SIDES, f"{mode}/{direction} sends a side that does not open"
+
+
+def test_a_copy_folder_ignores_a_stray_reverse_setting():
+    """Directions are kept when the mode is switched back, so they must not leak into COPY."""
+    assert side_for(_follower("REVERSE"), LONG, honour_direction=False) == LONG
+    assert side_for(_follower("REVERSE"), SHORT, honour_direction=False) == SHORT
