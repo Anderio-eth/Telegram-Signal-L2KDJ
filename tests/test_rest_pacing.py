@@ -2,9 +2,10 @@
 
 Both facts here were learned by measuring a live account, not from the documentation:
 
-  · Private endpoints refuse above roughly 13 requests a second from one IP, whatever mix of
-    accounts they belong to. The pacing had been set to 16.6/s, so a lone follower on an
-    otherwise quiet account could still be told its requests were too frequent.
+  · The allowance belongs to the API KEY, not the address. Measured on ten live accounts:
+    one account sending 40 requests at 17/s had 17 refused, while ten accounts sending 7/s each —
+    47/s between them — had none. A single queue for the whole process therefore divided one
+    account's budget among all of them, and with ten followers each got 0.7 requests a second.
 
   · A signature carries a timestamp the venue checks. Slowing the pacing down made the queue long
     enough that requests signed on arrival went out already stale — 120 queued calls produced 48
@@ -25,16 +26,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from mexc_copy_bot.mexc import rest  # noqa: E402
 
 
-def test_private_pacing_stays_under_the_measured_limit():
-    """13/s is where the live account began refusing. Anything at or above it is a regression."""
-    rate = 1.0 / rest.PRIVATE_THROTTLE._min_interval
-    assert rate <= 9.0, f"pacing {rate:.1f}/s leaves no room under the ~13/s the venue allows"
+def test_private_pacing_stays_under_what_one_account_allows():
+    """A single account started refusing above ~13/s. Anything at or above that is a regression."""
+    rate = 1.0 / rest.PRIVATE_INTERVAL
+    assert rate <= 9.0, f"pacing {rate:.1f}/s leaves no room under the ~13/s one account allows"
+
+
+def test_every_account_gets_its_own_queue():
+    """The bug this replaced: one queue for the process meant ten accounts shared one account's
+    allowance, and an order that should take half a second took six."""
+    a, b = rest.throttle_for("KEY-A"), rest.throttle_for("KEY-B")
+    assert a is not b
+    assert rest.throttle_for("KEY-A") is a, "the same account must keep the same queue"
+
+
+def test_the_queues_are_not_keyed_by_the_key_itself():
+    """No process-wide dictionary of live API keys."""
+    rest.throttle_for("SECRET-LOOKING-KEY")
+    assert "SECRET-LOOKING-KEY" not in rest._ACCOUNT_THROTTLES
 
 
 def test_public_data_is_not_held_to_the_private_limit():
-    """Market data is on a far looser allowance — 30/s went through untouched — and must not be
-    made to queue behind the trading path."""
-    assert rest.PUBLIC_THROTTLE._min_interval < rest.PRIVATE_THROTTLE._min_interval
+    """Market data carries no key to attribute it to, so it really is per process — and it is on a
+    far looser allowance, 30/s having gone through untouched."""
+    assert rest.PUBLIC_THROTTLE._min_interval < rest.PRIVATE_INTERVAL
 
 
 def test_the_signature_is_taken_after_the_wait_not_before():
@@ -78,13 +93,13 @@ def test_the_signature_is_taken_after_the_wait_not_before():
         order.append("signed")
         return {}
 
-    original_throttle, original_sign = rest.PRIVATE_THROTTLE, rest.sign_rest
-    rest.PRIVATE_THROTTLE, rest.sign_rest = SlowSlot(), spy_sign
+    original_for, original_sign = rest.throttle_for, rest.sign_rest
+    rest.throttle_for, rest.sign_rest = (lambda _key: SlowSlot()), spy_sign
     try:
         client = rest.MexcRestClient("k", "s", session=Session())
         asyncio.run(client._request_once("GET", "/private/position/open_positions"))
     finally:
-        rest.PRIVATE_THROTTLE, rest.sign_rest = original_throttle, original_sign
+        rest.throttle_for, rest.sign_rest = original_for, original_sign
 
     assert order == ["waited", "signed"], f"signed before waiting: {order}"
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import random
 from dataclasses import dataclass
@@ -66,8 +67,36 @@ class _Throttle:
 # one, which is why a single follower on an otherwise idle account could still be told its
 # requests were too frequent. Public market data is on a separate, far looser allowance — 30/s
 # went through untouched — so it is paced separately instead of competing with the trading path.
-PRIVATE_THROTTLE = _Throttle(max_concurrent=3, min_interval=0.14)
+# Per ACCOUNT, not per process. Measured on ten live accounts at once:
+#
+#     one account,  40 requests at 17/s          ->  17 refused
+#     two accounts, 20 each, 19/s combined       ->   0 refused
+#     ten accounts, 7/s each, 47/s combined      ->   0 refused
+#
+# So the allowance belongs to the API key, and a single queue for the whole process was dividing
+# one account's budget among all of them: with ten followers each got 0.7 requests a second, and
+# an order that should take half a second took six. Ten accounts sharing nothing is the point of
+# having ten accounts.
+PRIVATE_INTERVAL = 0.14
+PRIVATE_CONCURRENCY = 3
+_ACCOUNT_THROTTLES: dict[str, _Throttle] = {}
+
+# Public market data carries no key to attribute it to, so this one really is per process.
 PUBLIC_THROTTLE = _Throttle(max_concurrent=6, min_interval=0.03)
+
+
+def throttle_for(api_key: str) -> _Throttle:
+    """The queue belonging to one account.
+
+    Keyed by a hash rather than the key itself, so a process-wide dictionary of live API keys does
+    not exist. Created on first use and kept: there is one per account and accounts are few.
+    """
+    fingerprint = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+    throttle = _ACCOUNT_THROTTLES.get(fingerprint)
+    if throttle is None:
+        throttle = _Throttle(max_concurrent=PRIVATE_CONCURRENCY, min_interval=PRIVATE_INTERVAL)
+        _ACCOUNT_THROTTLES[fingerprint] = throttle
+    return throttle
 
 # MEXC's code for "Requests are too frequent". It refuses the request before acting on it, so a
 # retry cannot duplicate an order — and orders carry an externalOid besides.
@@ -301,7 +330,7 @@ class MexcRestClient:
         # checks, so a request stamped and then held in the queue goes out already stale — under
         # the slower pacing a queue of 120 calls turned into "Confirming signature failed" on the
         # ones that waited longest. The wait has to happen first, then the clock is read.
-        async with PRIVATE_THROTTLE.slot():
+        async with throttle_for(self._api_key).slot():
             headers = sign_rest(self._api_key, self._secret, params=params, body=body)
             async with self._session.request(
                 method, url, params=params, data=data, headers=headers, timeout=self._timeout
