@@ -134,6 +134,17 @@ def _is_rate_limit(err: MexcError) -> bool:
     return err.is_rate_limited
 
 
+# "Balance insufficient" on its own says nothing: not how much was needed, not how much was there,
+# not which of MEXC's several balance figures it was measured against. That ambiguity cost an
+# afternoon of arguing about leverage and fees while the numbers were one request away.
+SHORT_OF_MONEY_TEXT = ("insufficient", "not enough", "balance is low")
+
+
+def _is_short_of_money(err: MexcError) -> bool:
+    text = (err.message or "").lower()
+    return any(phrase in text for phrase in SHORT_OF_MONEY_TEXT)
+
+
 def _is_blocked_contract(err: MexcError) -> bool:
     text = (err.message or "").lower()
     return any(word in text for word in BLOCKED_CONTRACT_TEXT)
@@ -382,6 +393,8 @@ class CopyEngine:
                     LOGGER.warning("follower %s: %s", follower.id, last_error)
                     break
                 if _is_permanent(err):
+                    if _is_short_of_money(err):
+                        last_error = await self._money_detail(client, event, follower, vol, last_error)
                     LOGGER.warning("follower %s permanent failure: %s", follower.id, last_error)
                     break
                 rate_limited = _is_rate_limit(err)
@@ -399,6 +412,47 @@ class CopyEngine:
         await self._store.finish_task(task_id, status="FAILED", attempts=attempts, error=last_error)
         await self._store.set_account_error(follower.id, last_error)
         return FollowerResult(follower, False, event.action, vol, last_error, None, side)
+
+    async def _money_detail(
+        self, client: MexcRestClient, event: MasterEvent, follower: Account, vol: float, message: str
+    ) -> str:
+        """Turn "Balance insufficient" into the three numbers that settle it.
+
+        Read at the moment of the refusal rather than before every order: on the path that works
+        this would be one more round trip per follower per trade, and it tells you nothing there.
+        Here it is the whole answer — and it is captured while it is still true, so a wallet
+        emptied later does not take the evidence with it.
+
+        The requirement comes from the master's own initial margin, scaled by this follower's
+        multiplier. That is the venue's own figure for this exact position rather than a
+        re-derivation, so it cannot drift from how MEXC actually computes it.
+        """
+        needed: float | None = None
+        raw = event.raw or {}
+        master_margin = raw.get("im") or raw.get("oim")
+        if master_margin:
+            try:
+                needed = float(master_margin) * follower.size_multiplier
+            except (TypeError, ValueError):
+                needed = None
+
+        try:
+            balance = await client.get_usdt_snapshot()
+        except (MexcError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+            LOGGER.info("could not read %s's balance after a refusal: %s", follower.label, err)
+            return message
+
+        parts = [message]
+        if needed:
+            parts.append(f"треба ~${needed:,.2f} маржі")
+        parts.append(balance.detail())
+        if balance.bonus and balance.openable < (needed or 0):
+            # The trap this was written for: the wallet reads full, but part of it is bonus credit
+            # the venue will not open a position against.
+            parts.append("частина балансу — бонус, під позицію не йде")
+        detail = " | ".join(parts)
+        LOGGER.warning("follower %s refused: %s", follower.id, detail)
+        return detail
 
     async def _apply(
         self,

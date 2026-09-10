@@ -73,7 +73,12 @@ class Balance:
     """
 
     equity: float | None = None
+    # What a new position can actually be opened against — MEXC's availableOpen, not the wallet
+    # figure. They are usually the same; when they are not, the wallet figure is the one that
+    # makes a refused order look inexplicable.
     available: float | None = None
+    # The wallet figure, kept only to show the gap when there is one.
+    wallet: float | None = None
     error: str | None = None
 
     def line(self, lang: str = DEFAULT) -> str:
@@ -81,7 +86,12 @@ class Balance:
             return f"❌ {self.error}"
         if self.equity is None:
             return "…"
-        return t(lang, "available", equity=money(self.equity), available=money(self.available or 0.0))
+        line = t(lang, "available", equity=money(self.equity), available=money(self.available or 0.0))
+        # Only when they disagree. Printing two identical numbers on every account would bury the
+        # one case that matters under nine that do not.
+        if self.wallet is not None and self.available is not None and self.wallet - self.available > 0.01:
+            line += t(lang, "not_openable", amount=money(self.wallet - self.available))
+        return line
 
 
 def main_menu(

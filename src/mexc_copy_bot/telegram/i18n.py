@@ -81,6 +81,12 @@ STRINGS: dict[str, dict[str, str]] = {
     "total": {UK: "     <b>Разом:</b> {amount}{suffix}", EN: "     <b>Total:</b> {amount}{suffix}"},
     "reporting_suffix": {UK: " (відповіли {n}/{total})", EN: " (of {n}/{total} reporting)"},
     "available": {UK: "{equity} (вільно {available})", EN: "{equity} (available {available})"},
+    # Shown only when part of the wallet cannot back a position — bonus credit, usually. Without
+    # it the menu reads "there is money" while every order is refused.
+    "not_openable": {
+        UK: "  ⚠️ {amount} не йде під позицію",
+        EN: "  ⚠️ {amount} cannot back a position",
+    },
 
     # ── trade reports ──────────────────────────────────────────────────────
     "act_open": {UK: "ПОЗИЦІЮ ВІДКРИТО", EN: "POSITION OPENED"},

@@ -298,8 +298,12 @@ class CopyBot:
                 if not credentials:
                     return messages.Balance(error="credentials could not be read")
                 try:
-                    equity, available = await MexcRestClient(*credentials, session=session).get_usdt_balance()
-                    return messages.Balance(equity=equity, available=available)
+                    snapshot = await MexcRestClient(*credentials, session=session).get_usdt_snapshot()
+                    return messages.Balance(
+                        equity=snapshot.equity,
+                        available=snapshot.openable,
+                        wallet=snapshot.available,
+                    )
                 except MexcError as err:
                     return messages.Balance(error=err.message or "unavailable")
                 except Exception:  # noqa: BLE001 — a network blip must not hide the menu

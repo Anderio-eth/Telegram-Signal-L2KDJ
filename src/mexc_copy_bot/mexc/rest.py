@@ -146,6 +146,48 @@ def _opt_float(value: Any) -> float | None:
 
 
 @dataclass(frozen=True)
+class AccountBalance:
+    """The USDT futures wallet, in full.
+
+    `available` is the wallet figure; `available_open` is what the venue lets you open against.
+    Which one is right depends on the question, so both are kept rather than one being chosen here.
+    """
+
+    equity: float = 0.0
+    available: float = 0.0
+    available_open: float = 0.0
+    bonus: float = 0.0
+    cash: float = 0.0
+    position_margin: float = 0.0
+    frozen: float = 0.0
+    unrealized: float = 0.0
+
+    @property
+    def openable(self) -> float:
+        """What a new position can actually be opened against.
+
+        Falls back to `available` when the venue reports no `availableOpen` at all: some accounts
+        omit it, and treating a missing field as zero would report every one of them as broke.
+        """
+        return self.available_open or self.available
+
+    def detail(self) -> str:
+        """Every figure on one line, for the moment an order is refused."""
+        parts = [
+            f"equity ${self.equity:,.2f}",
+            f"available ${self.available:,.2f}",
+            f"openable ${self.openable:,.2f}",
+        ]
+        if self.bonus:
+            parts.append(f"bonus ${self.bonus:,.2f}")
+        if self.position_margin:
+            parts.append(f"in positions ${self.position_margin:,.2f}")
+        if self.frozen:
+            parts.append(f"frozen ${self.frozen:,.2f}")
+        return ", ".join(parts)
+
+
+@dataclass(frozen=True)
 class Position:
     position_id: int
     symbol: str
@@ -282,12 +324,35 @@ class MexcRestClient:
     async def get_assets(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/private/account/assets") or []
 
-    async def get_usdt_balance(self) -> tuple[float, float]:
-        """(equity, availableBalance) in USDT."""
+    async def get_usdt_snapshot(self) -> "AccountBalance":
+        """Every number MEXC reports for the USDT futures wallet, not just one of them.
+
+        There are several, and they are not the same. `availableBalance` is what a wallet screen
+        shows; `availableOpen` is what the venue measures a new position against. They can differ —
+        bonus credit is the usual reason — and when they do, a menu showing the first while orders
+        are refused against the second reads as "there is plenty of money, why will it not open".
+
+        Reported together so that question is answered by looking, rather than argued about.
+        """
         for asset in await self.get_assets():
             if asset.get("currency") == "USDT":
-                return float(asset.get("equity", 0)), float(asset.get("availableBalance", 0))
-        return 0.0, 0.0
+                num = lambda key: float(asset.get(key) or 0)  # noqa: E731
+                return AccountBalance(
+                    equity=num("equity"),
+                    available=num("availableBalance"),
+                    available_open=num("availableOpen"),
+                    bonus=num("bonus"),
+                    cash=num("cashBalance"),
+                    position_margin=num("positionMargin"),
+                    frozen=num("frozenBalance"),
+                    unrealized=num("unrealized"),
+                )
+        return AccountBalance()
+
+    async def get_usdt_balance(self) -> tuple[float, float]:
+        """(equity, what can actually be used to open) in USDT."""
+        snapshot = await self.get_usdt_snapshot()
+        return snapshot.equity, snapshot.openable
 
     async def get_open_positions_raw(self, symbol: str | None = None) -> list[dict[str, Any]]:
         """Open positions exactly as the venue sends them.
