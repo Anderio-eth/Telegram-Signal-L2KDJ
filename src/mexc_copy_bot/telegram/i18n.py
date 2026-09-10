@@ -83,6 +83,10 @@ STRINGS: dict[str, dict[str, str]] = {
     "available": {UK: "{equity} (вільно {available})", EN: "{equity} (available {available})"},
     # Shown only when part of the wallet cannot back a position — bonus credit, usually. Without
     # it the menu reads "there is money" while every order is refused.
+    "menu_button_hint": {
+        UK: "Кнопка «Menu» тепер завжди під рукою — над полем вводу.",
+        EN: "The Menu button now sits above the message box, always within reach.",
+    },
     "btn_close_column": {UK: "✖ Закрити всі", EN: "✖ Close all"},
     "closed_column": {
         UK: "✖ <b>ЗАКРИТО НАПРЯМОК: {side}</b>",

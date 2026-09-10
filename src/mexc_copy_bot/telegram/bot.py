@@ -23,7 +23,13 @@ import logging
 import time
 
 import aiohttp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -68,6 +74,19 @@ ASK_FOLDER_NAME = 101
 # Written out rather than inlined: patching this file has twice turned an escaped newline into
 # a real one, which is a syntax error that only shows up at import time.
 NEWLINE = chr(10)
+
+# The one button that lives above the message box, so the menu is always one press away instead of
+# something to scroll back and find. Its text is fixed rather than translated: it is matched
+# against what Telegram sends back, and a menu opened in one language must still work after the
+# language is switched.
+MENU_BUTTON = "☰ Menu"
+MENU_FILTER = filters.Regex(f"^{MENU_BUTTON}$")
+
+# Attached to a SENT message only — Telegram cannot add one while editing — so it goes on whatever
+# the bot sends first and then simply stays there.
+PERSISTENT_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton(MENU_BUTTON)]], resize_keyboard=True, is_persistent=True
+)
 
 # How long a balance reading stays good enough to reuse. Tapping around the menu should not fire
 # ten exchange calls per screen; five seconds is under the time it takes to read the menu, so what
@@ -185,6 +204,9 @@ class CopyBot:
         # bring the lights and balances up to date without waiting for someone to press Refresh —
         # which is the whole point of a light.
         self._menu_message: dict[int, tuple[int, int]] = {}
+        # Who already has the Menu button above their message box. Sent once per process rather
+        # than on every menu, which would be a stray message each time.
+        self._menu_button_shown: set[int] = set()
 
         registry.configure_callbacks(on_report=self._report_for, on_notice=self._notice_for)
 
@@ -195,12 +217,15 @@ class CopyBot:
         add_conversation = ConversationHandler(
             entry_points=[CallbackQueryHandler(self._begin_add, pattern="^add_(master|follower)$")],
             states={
-                ASK_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_key)],
-                ASK_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_secret)],
+                ASK_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, self._got_key)],
+                ASK_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, self._got_secret)],
             },
             fallbacks=[
                 CommandHandler("cancel", self._cancel_add),
                 CommandHandler("start", self._restart_from_conversation),
+                # Pressing Menu mid-flow means "get me out of here", exactly as pressing any other
+                # button does. Without it the flow would read the word "Menu" as an API key.
+                MessageHandler(MENU_FILTER, self._restart_from_conversation),
                 # Any other button pressed mid-flow abandons the flow and does what was asked.
                 # Without this the conversation is a trap: its states only accept text, so every
                 # button silently falls through to a handler with no branch for it and the bot
@@ -215,9 +240,10 @@ class CopyBot:
 
         price_conversation = ConversationHandler(
             entry_points=[CallbackQueryHandler(self._begin_price, pattern=r"^sme:\d+$")],
-            states={ASK_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_price)]},
+            states={ASK_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, self._got_price)]},
             fallbacks=[
                 CommandHandler("cancel", self._cancel_add),
+                MessageHandler(MENU_FILTER, self._restart_from_conversation),
                 CallbackQueryHandler(self._abandon_and_dispatch),
             ],
             allow_reentry=True,
@@ -228,11 +254,12 @@ class CopyBot:
             entry_points=[CallbackQueryHandler(self._begin_folder_name, pattern="^f(new|ren)$")],
             states={
                 ASK_FOLDER_NAME: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_folder_name)
+                    MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, self._got_folder_name)
                 ]
             },
             fallbacks=[
                 CommandHandler("cancel", self._cancel_add),
+                MessageHandler(MENU_FILTER, self._restart_from_conversation),
                 CallbackQueryHandler(self._abandon_and_dispatch),
             ],
             allow_reentry=True,
@@ -240,6 +267,7 @@ class CopyBot:
         )
 
         app.add_handler(CommandHandler("start", self._cmd_start))
+        app.add_handler(MessageHandler(MENU_FILTER, self._cmd_start))
         app.add_handler(add_conversation)
         app.add_handler(price_conversation)
         app.add_handler(folder_conversation)
@@ -371,6 +399,22 @@ class CopyBot:
         would look like the change had not taken."""
         self._balance_cache.pop(owner_id, None)
 
+    async def _ensure_menu_button(self, chat_id: int, owner_id: int) -> None:
+        """Put the Menu button above the message box, once per chat.
+
+        Telegram attaches a reply keyboard to a message being SENT and has no way to add one while
+        editing, so it cannot ride along with the menu itself — the menu is usually an edit. It is
+        sent once, on its own, and then stays until someone removes it.
+        """
+        if owner_id in self._menu_button_shown or not self._app:
+            return
+        self._menu_button_shown.add(owner_id)
+        with contextlib.suppress(Exception):
+            await self._app.bot.send_message(
+                chat_id, t(await self._lang(owner_id), "menu_button_hint"),
+                reply_markup=PERSISTENT_KEYBOARD,
+            )
+
     async def _menu_columns(self, owner_id: int) -> tuple[list, list] | None:
         """The two legs, or None when this folder is not in REVERSE.
 
@@ -411,6 +455,9 @@ class CopyBot:
             self._menu_message[owner_id] = (message.chat_id, message.message_id)
             await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         elif update.message:
+            # The inline keyboard belongs to the message; the Menu button belongs to the chat. Both
+            # cannot ride on one send, so the persistent one goes out first and then stays put.
+            await self._ensure_menu_button(update.effective_chat.id, owner_id)
             sent = await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
             self._menu_message[owner_id] = (sent.chat_id, sent.message_id)
 

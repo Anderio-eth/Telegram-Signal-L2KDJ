@@ -86,3 +86,38 @@ def test_start_and_cancel_both_break_out(conversation):
     commands = {c for h in handlers if isinstance(h, CommandHandler) for c in h.commands}
     assert {"cancel", "start"} <= commands
     assert any(isinstance(h, CallbackQueryHandler) for h in handlers)
+
+
+# ── the Menu button above the message box ───────────────────────────────────
+def _text(body: str) -> Update:
+    user = User(id=USER_ID, first_name="Tester", is_bot=False)
+    chat = Chat(id=CHAT_ID, type=Chat.PRIVATE)
+    message = Message(message_id=2, date=None, chat=chat, from_user=user, text=body)
+    return Update(update_id=2, message=message)
+
+
+def test_the_menu_button_is_not_read_as_an_api_key(conversation):
+    """The add flow accepts free text, so without an exclusion the word on the button would be
+    stored as somebody's API key — the way out of a flow becoming the way into a broken account."""
+    from mexc_copy_bot.telegram.bot import ASK_SECRET, MENU_BUTTON
+
+    press = _text(MENU_BUTTON)
+    for state in (ASK_KEY, ASK_SECRET):
+        handler = conversation.states[state][0]
+        # A rejecting MessageHandler answers False, an accepting one a truthy match.
+        assert not handler.check_update(press), f"state {state} would swallow the Menu press"
+
+
+def test_a_real_api_key_still_reaches_the_flow(conversation):
+    """The exclusion must be narrow: only the button's exact text, not text in general."""
+    handler = conversation.states[ASK_KEY][0]
+    assert handler.check_update(_text("mx0vglTHISLOOKSLIKEAKEY"))
+
+
+def test_pressing_menu_mid_flow_gets_you_out(conversation):
+    from mexc_copy_bot.telegram.bot import MENU_BUTTON
+
+    press = _text(MENU_BUTTON)
+    assert any(h.check_update(press) for h in conversation.fallbacks), (
+        "nothing in the fallbacks answers the Menu button, so the flow would stay stuck"
+    )
