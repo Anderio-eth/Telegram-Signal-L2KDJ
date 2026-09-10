@@ -77,10 +77,14 @@ POSITION_POLL_SECONDS = 2.0
 # How often every account is checked in REVERSE, where any of them can be the one that moved.
 #
 # Faster than the master-only poll because it carries two jobs at once: noticing an entry to copy,
-# and noticing a leg that has been liquidated. Affordable now that each account has its own
-# request allowance — ten accounts once a second is one request a second EACH, against roughly ten
-# that each of them allows. It used to be unaffordable only because one queue was being shared.
-GROUP_POLL_SECONDS = 1.0
+# and noticing a leg that has been liquidated.
+#
+# The wait for the next pass is the largest part of the delay between somebody opening a position
+# and the copies existing — a single call to the venue takes about 0.3s, so a one-second poll was
+# spending most of the budget doing nothing. Affordable because each account has its own
+# allowance: ten accounts at this rate is under three requests a second EACH, against roughly ten
+# that each of them permits. It was only ever unaffordable while one queue was shared by all.
+GROUP_POLL_SECONDS = 0.35
 
 # How long a copy the bot placed stays recognisable as its own work. Long enough for a slow
 # venue to get round to reporting it, short enough that a real trade by hand on the same account
@@ -987,6 +991,7 @@ class CopyService:
             return
 
         self._copying = True
+        started = asyncio.get_running_loop().time()
         try:
             LOGGER.info(
                 "%s (group %s) opened %s %s x%s — copying to %d account(s)",
@@ -1019,6 +1024,14 @@ class CopyService:
                 return
 
             results = await engine.execute_groups(event, event_id, others, trigger.group)
+            # Logged rather than estimated: how long this takes depends on the round trip to the
+            # venue from wherever the bot happens to be running, and that is not something to
+            # guess at from a laptop.
+            LOGGER.info(
+                "copied %s to %d/%d account(s) in %.2fs",
+                event.symbol, sum(1 for r in results if r.ok), len(results),
+                asyncio.get_running_loop().time() - started,
+            )
             if self.on_report:
                 with contextlib.suppress(Exception):
                     await self.on_report(event, results)

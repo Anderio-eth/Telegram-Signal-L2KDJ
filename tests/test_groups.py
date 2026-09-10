@@ -245,3 +245,18 @@ def test_watching_keeps_every_light_current():
     holdings[1] = []
     asyncio.run(svc._poll_groups_once())
     assert svc.account_status[1] is False, "a liquidated or hand-closed leg must go dark"
+
+
+def test_watching_stays_within_one_accounts_allowance():
+    """Every account is read once per pass, and each has its own allowance of roughly ten requests
+    a second. The poll interval is the largest part of the delay before a copy exists, so it is
+    kept short — but not so short that watching starves the orders it exists to trigger."""
+    from mexc_copy_bot.core.service import GROUP_POLL_SECONDS
+    from mexc_copy_bot.mexc.rest import PRIVATE_INTERVAL
+
+    per_account = 1.0 / GROUP_POLL_SECONDS
+    allowed = 1.0 / PRIVATE_INTERVAL
+    assert per_account < allowed / 2, (
+        f"watching alone would use {per_account:.1f} of the {allowed:.1f} requests a second each "
+        f"account allows, leaving too little for the orders"
+    )
