@@ -47,8 +47,15 @@ class Client:
         return list(self.closed_rows)
 
 
+class CopyModeStore:
+    """The master path is a COPY folder; REVERSE is watched by the group poller instead."""
+
+    async def get_mode(self, folder_id):
+        return ("COPY", None)
+
+
 def service(client) -> tuple[CopyService, list]:
-    svc = CopyService(store=None, folder_id=1, owner_id=1)
+    svc = CopyService(store=CopyModeStore(), folder_id=1, owner_id=1)
     seen = []
 
     async def dispatch(event, raw):
@@ -145,12 +152,9 @@ def test_the_report_receives_an_event_that_carries_the_frame():
 
     reported = []
 
-    class Store:
+    class Store(CopyModeStore):
         async def record_event(self, **kw):
             return 1
-
-        async def get_mode(self, folder_id):
-            return ("COPY", None)
 
     class Engine:
         def __init__(self, *a, **kw):
@@ -196,7 +200,7 @@ async def _remember(sink, event):
 def test_the_menu_counts_rest_as_being_connected():
     """Keyed to the socket alone, the menu said "reconnecting" forever on a network where the
     socket cannot connect, while every trade was being copied correctly."""
-    svc = CopyService(store=None, folder_id=1, owner_id=1)
+    svc = CopyService(store=CopyModeStore(), folder_id=1, owner_id=1)
 
     async def check():
         assert svc.master_connected is False, "nothing seen yet"

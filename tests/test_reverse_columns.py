@@ -46,9 +46,11 @@ def test_the_master_sits_with_the_accounts_trading_its_way():
     assert [c.account_id for c in right] == [2]
 
 
-def test_the_master_is_named_master_and_takes_no_followers_number():
+def test_the_master_is_numbered_like_everyone_else():
+    """In this mode it holds no authority — only whichever leg somebody put it in — so calling it
+    "Master" on the screen would suggest a rank it does not have."""
     left, _ = reverse_columns(MASTER_ACC, [account(1), account(2)], {}, {})
-    assert [c.label for c in left] == ["Master", "as master 1", "as master 2"]
+    assert [c.label for c in left] == ["1.1", "1.2", "1.3"]
 
 
 def test_each_leg_numbers_from_one():
@@ -57,20 +59,20 @@ def test_each_leg_numbers_from_one():
         [account(1), account(2, direction="REVERSE"), account(3, direction="REVERSE"), account(4)],
         {}, {},
     )
-    assert [c.label for c in left] == ["Master", "as master 1", "as master 2"]
-    assert [c.label for c in right] == ["opposite 1", "opposite 2"]
+    assert [c.label for c in left] == ["1.1", "1.2", "1.3"]
+    assert [c.label for c in right] == ["2.1", "2.2"]
 
 
 def test_a_folder_with_no_master_still_shows_its_legs():
     left, right = reverse_columns(None, [account(1), account(2, direction="REVERSE")], {}, {})
-    assert [c.label for c in left] == ["as master 1"]
-    assert [c.label for c in right] == ["opposite 1"]
+    assert [c.label for c in left] == ["1.1"]
+    assert [c.label for c in right] == ["2.1"]
 
 
 # ── what a cell says ───────────────────────────────────────────────────────
 def test_a_cell_carries_the_name_the_balance_and_the_light():
     left, _ = reverse_columns(None, [account(1)], {1: Balance(equity=120.0, available=100.0)}, {1: True})
-    assert left[0].text() == "as master 1  $100  🟢"
+    assert left[0].text() == "1.1  $100  🟢"
 
 
 def test_an_account_with_nothing_open_shows_red():
@@ -95,6 +97,8 @@ def test_cents_are_dropped_above_a_dollar_and_kept_below_it():
     assert compact_money(1247.38) == "$1,247"
     assert compact_money(0.42) == "$0.42"
     assert compact_money(0.0) == "$0", "an empty wallet reads better as $0 than $0.00"
+    # The venue returns rounding dust rather than a clean zero on an emptied account.
+    assert compact_money(6e-09) == "$0"
     assert compact_money(None) == "—"
 
 
@@ -221,3 +225,30 @@ def test_only_the_named_accounts_are_touched():
     client = Client(positions=[Position("SILVER_USDT", 100.0)])
     (closed, _, _), _ = run_close([account(1), account(2, direction="REVERSE")], [client], [1])
     assert closed == ["Follower 1"]
+
+
+# ── the headings ───────────────────────────────────────────────────────────
+def test_a_leg_with_nothing_open_is_just_its_name():
+    """Which way a leg trades is decided by whoever opens first, so with nothing open there is
+    nothing truthful to add."""
+    from mexc_copy_bot.telegram.messages import group_title
+
+    left, _ = reverse_columns(None, [account(1), account(2)], {}, {})
+    assert group_title(left, {}, "Група 1") == "Група 1"
+
+
+def test_a_leg_reports_the_side_it_is_actually_holding():
+    from mexc_copy_bot.telegram.messages import group_title
+
+    left, right = reverse_columns(None, [account(1), account(2, direction="REVERSE")], {}, {})
+    sides = {1: 1, 2: 2}
+    assert group_title(left, sides, "Група 1") == "Група 1 — LONG"
+    assert group_title(right, sides, "Група 2") == "Група 2 — SHORT"
+
+
+def test_a_leg_that_disagrees_with_itself_claims_nothing():
+    """Half closed by hand, or half liquidated. Naming one side then would be a guess."""
+    from mexc_copy_bot.telegram.messages import group_title
+
+    left, _ = reverse_columns(None, [account(1), account(2)], {}, {})
+    assert group_title(left, {1: 1, 2: 2}, "Група 1") == "Група 1"

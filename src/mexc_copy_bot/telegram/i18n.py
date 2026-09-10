@@ -34,11 +34,16 @@ STRINGS: dict[str, dict[str, str]] = {
     "btn_add_follower": {UK: "➕ Додати Follower акаунт", EN: "➕ Add Follower account"},
     "btn_remove": {UK: "🗑 Видалити акаунт", EN: "🗑 Remove account"},
     "btn_change_master": {UK: "🔄 Змінити Master (нові ключі)", EN: "🔄 Change the Master (new keys)"},
-    "btn_dir_copy": {UK: "📋 як майстер", EN: "📋 same as master"},
-    "btn_dir_reverse": {UK: "🔁 навпаки", EN: "🔁 opposite"},
+    "btn_dir_copy": {UK: "1️⃣ Група 1", EN: "1️⃣ Group 1"},
+    "btn_dir_reverse": {UK: "2️⃣ Група 2", EN: "2️⃣ Group 2"},
+    # The legs are numbered rather than named after a direction, because which way each one trades
+    # is decided by whoever opens first — it is not a property of the group.
+    "group_one": {UK: "Група 1", EN: "Group 1"},
+    "group_two": {UK: "Група 2", EN: "Group 2"},
+    "group_side": {UK: "{name} — {side}", EN: "{name} — {side}"},
     "dir_pick": {
-        UK: "Тисни на акаунт, щоб змінити його напрям.",
-        EN: "Tap an account to change which way it trades.",
+        UK: "Тисни на акаунт, щоб перекинути його в іншу групу.",
+        EN: "Tap an account to move it to the other group.",
     },
     "btn_promote": {UK: "⬆️ Зробити Master з Follower", EN: "⬆️ Promote a Follower"},
     "btn_folder": {UK: "📁 {name}", EN: "📁 {name}"},
@@ -67,12 +72,12 @@ STRINGS: dict[str, dict[str, str]] = {
     # but the menu still read the old nominated-account field — which is now always empty, so it
     # permanently warned "no account chosen" about a setting that no longer exists.
     "menu_mode_reverse_split": {
-        UK: "Режим: 🔁 <b>РЕВЕРС</b> — {reverse} навпаки, {copy} як майстер",
-        EN: "Mode: 🔁 <b>REVERSE</b> — {reverse} opposite, {copy} same as master",
+        UK: "Режим: 🔁 <b>ГРУПИ</b> — {copy} у групі 1, {reverse} у групі 2",
+        EN: "Mode: 🔁 <b>GROUPS</b> — {copy} in group 1, {reverse} in group 2",
     },
     "menu_mode_reverse_none": {
-        UK: "Режим: 🔁 <b>РЕВЕРС</b> — ще нема followers",
-        EN: "Mode: 🔁 <b>REVERSE</b> — no followers yet",
+        UK: "Режим: 🔁 <b>ГРУПИ</b> — ще нема акаунтів",
+        EN: "Mode: 🔁 <b>GROUPS</b> — no accounts yet",
     },
     "master_not_set": {UK: "👤 <b>Master:</b> не додано", EN: "👤 <b>Master:</b> not set"},
     "master_mode": {UK: "     Режим: {mode}", EN: "     Mode: {mode}"},
@@ -92,8 +97,8 @@ STRINGS: dict[str, dict[str, str]] = {
         UK: "✖ <b>ЗАКРИТО НАПРЯМОК: {side}</b>",
         EN: "✖ <b>CLOSED THE {side} LEG</b>",
     },
-    "column_as_master": {UK: "за майстром", EN: "as master"},
-    "column_opposite": {UK: "навпаки", EN: "opposite"},
+    "column_as_master": {UK: "група 1", EN: "group 1"},
+    "column_opposite": {UK: "група 2", EN: "group 2"},
     "column_nothing_open": {
         UK: "У цьому напрямку немає жодної відкритої позиції — нічого не відправлено.",
         EN: "Nothing is open on this leg — nothing was sent.",
@@ -122,7 +127,7 @@ STRINGS: dict[str, dict[str, str]] = {
 
     # ── mode screen ────────────────────────────────────────────────────────
     "mode_title": {UK: "⚙️ <b>РЕЖИМ</b>", EN: "⚙️ <b>MODE</b>"},
-    "mode_now_reverse": {UK: "Зараз: 🔁 <b>РЕВЕРС</b>", EN: "Currently: 🔁 <b>REVERSE</b>"},
+    "mode_now_reverse": {UK: "Зараз: 🔁 <b>ГРУПИ</b>", EN: "Currently: 🔁 <b>GROUPS</b>"},
     "mode_now_copy": {UK: "Зараз: 📋 <b>КОПІЮВАННЯ</b>", EN: "Currently: 📋 <b>COPY</b>"},
     "mode_hedging_on": {UK: "Хеджує на: <b>{label}</b>", EN: "Hedging on: <b>{label}</b>"},
     "mode_no_hedge": {
@@ -138,11 +143,13 @@ STRINGS: dict[str, dict[str, str]] = {
         EN: "📋 <b>Copy</b> — every follower opens the <i>same</i> side as the master.",
     },
     "mode_explain_reverse": {
-        UK: "🔁 <b>Реверс</b> — кожен follower має <i>свій</i> напрям. Позначені 📋 йдуть за майстром, "
-            "позначені 🔁 — у протилежну сторону. Майстер у LONG: перші в LONG, другі в SHORT.",
-        EN: "🔁 <b>Reverse</b> — each follower has <i>its own</i> direction. Those marked 📋 follow "
-            "the master, those marked 🔁 take the opposite side. Master goes LONG: the first go "
-            "LONG, the others SHORT.",
+        UK: "🔁 <b>Групи</b> — майстра немає. Хто перший відкриє позицію руками, той і задає напрям: "
+            "його група заходить так само, друга — у протилежний бік. Токен, розмір і плече однакові. "
+            "Закриття не копіюється — руками або кнопкою під колонкою.",
+        EN: "🔁 <b>Groups</b> — there is no master. Whoever opens a position by hand sets the "
+            "direction: their group takes the same side, the other group takes the opposite, at "
+            "the same symbol, size and leverage. Exits are never copied — by hand, or with the "
+            "button under a column.",
     },
     "mode_one_at_a_time": {UK: "Одночасно працює лише один режим.", EN: "Only one mode runs at a time."},
     "limits_title": {UK: "📌 <b>Лімітні ордери:</b> копіюються завжди", EN: "📌 <b>Limit orders:</b> always mirrored"},

@@ -74,6 +74,16 @@ RATE_LIMIT_DELAYS = (1.5, 4.0, 8.0)
 OPPOSITE_SIDE = {1: 2, 2: 1}
 
 
+def side_for_group(account: Account, trigger_group: int, trigger_side: int) -> int:
+    """Which side one account takes when an account in `trigger_group` opened `trigger_side`.
+
+    There is no master here. Whichever account is traded by hand sets the direction for its own
+    leg; the other leg takes the opposite. So the answer depends only on whether this account
+    shares a leg with whoever moved — which is why it needs no knowledge of who that was.
+    """
+    return trigger_side if account.group == trigger_group else OPPOSITE_SIDE[trigger_side]
+
+
 def side_for(follower: Account, master_side: int, honour_direction: bool) -> int:
     """Which side this account takes for a master action on `master_side`.
 
@@ -209,6 +219,38 @@ class CopyEngine:
                 out.append(FollowerResult(follower, False, event.action, 0.0, str(result)[:200]))
         return out
 
+    async def execute_groups(
+        self, event: MasterEvent, event_id: int, accounts: list[Account], trigger_group: int
+    ) -> list[FollowerResult]:
+        """Apply one account's entry to both legs at once.
+
+        No stops are carried across. The two legs face opposite ways, so a level that protects one
+        of them sits on the wrong side of the other — mirroring it would close the hedge for a
+        small profit and leave the loss running.
+        """
+        if not accounts:
+            return []
+
+        blocked = await self._blocked_contract_reason(event)
+        if blocked:
+            LOGGER.warning("skipping %s: %s", event.symbol, blocked)
+            return [FollowerResult(a, False, event.action, 0.0, blocked) for a in accounts]
+
+        async def one(account: Account) -> FollowerResult:
+            side = side_for_group(account, trigger_group, event.position_type)
+            return await self._run_follower(event, event_id, account, reverse=False, stops=(None, None), side=side)
+
+        results = await asyncio.gather(*(one(a) for a in accounts), return_exceptions=True)
+
+        out: list[FollowerResult] = []
+        for account, result in zip(accounts, results, strict=True):
+            if isinstance(result, FollowerResult):
+                out.append(result)
+            else:
+                LOGGER.exception("account %s crashed", account.id, exc_info=result)
+                out.append(FollowerResult(account, False, event.action, 0.0, str(result)[:200]))
+        return out
+
     async def mirror_resting_order(
         self,
         order: MasterOrder,
@@ -341,9 +383,13 @@ class CopyEngine:
         follower: Account,
         reverse: bool = False,
         stops: tuple[float | None, float | None] = (None, None),
+        side: int | None = None,
     ) -> FollowerResult:
         vol = event.delta_vol * follower.size_multiplier
-        side = side_for(follower, event.position_type, reverse)
+        # `side` is given outright by the two-leg path, where it comes from group membership
+        # rather than from a master this account is following.
+        if side is None:
+            side = side_for(follower, event.position_type, reverse)
         external_oid = f"cp{event_id}-{follower.id}-{uuid.uuid4().hex[:8]}"
 
         task_id = await self._store.create_task(

@@ -37,8 +37,15 @@ from ..db.store import (
 )
 from ..mexc.rest import MexcError, MexcRestClient, PositionStops
 from ..mexc.websocket import MasterWebSocket
-from .copy_engine import CopyEngine, FollowerResult, _is_already_flat
-from .events import Action, MasterEvent, MasterPositionTracker, PositionSnapshot, parse_position
+from .copy_engine import CopyEngine, FollowerResult, _is_already_flat, side_for_group
+from .events import (
+    STATE_CLOSED,
+    Action,
+    MasterEvent,
+    MasterPositionTracker,
+    PositionSnapshot,
+    parse_position,
+)
 from .orders import MasterOrderTracker, OrderAction, parse_order, reduces_position
 
 LOGGER = logging.getLogger(__name__)
@@ -66,6 +73,19 @@ ORDER_POLL_SECONDS = 1.0
 # same parser, the same tracker and the same dedupe key serve both, and whichever notices a change
 # first, it is copied exactly once.
 POSITION_POLL_SECONDS = 2.0
+
+# How often every account is checked in REVERSE, where any of them can be the one that moved.
+#
+# Faster than the master-only poll because it carries two jobs at once: noticing an entry to copy,
+# and noticing a leg that has been liquidated. Affordable now that each account has its own
+# request allowance — ten accounts once a second is one request a second EACH, against roughly ten
+# that each of them allows. It used to be unaffordable only because one queue was being shared.
+GROUP_POLL_SECONDS = 1.0
+
+# How long a copy the bot placed stays recognisable as its own work. Long enough for a slow
+# venue to get round to reporting it, short enough that a real trade by hand on the same account
+# and the same side is not swallowed hours later.
+EXPECTED_COPY_SECONDS = 30.0
 
 # How long a successful REST poll keeps counting as "the master is being watched". A few missed
 # polls are a blip; beyond this the reader should be told something is wrong.
@@ -145,6 +165,21 @@ class CopyService:
         # position on this account", which is what someone watching a hedge needs to know, and a
         # position opened by hand in the app is still a position.
         self._account_status: dict[int, bool] = {}
+        # account id -> the side it is holding (1 long, 2 short), for the heading over each leg.
+        # Absent means flat, or holding both sides at once, which no heading can honestly name.
+        self._account_sides: dict[int, int] = {}
+        # One tracker per account. In REVERSE there is no master, so any account can be the one
+        # that moved, and each needs its own memory of what it was holding a moment ago.
+        self._group_trackers: dict[int, MasterPositionTracker] = {}
+        # Raised while a copy is being placed. Everything the bot opens is itself a position
+        # change, and without this the poller would read its own work as five more accounts having
+        # just been traded by hand — and copy those, and copy the copies, without end.
+        self._copying = False
+        # What the bot itself has just placed, per account: (symbol, side) -> [volume, deadline].
+        # Reseeding the trackers after a copy is not enough on its own, because the venue does not
+        # always report a new position the instant the order returns. Anything the bot placed is
+        # written down BEFORE it is sent, so the change is recognised whenever it does show up.
+        self._expected_copies: dict[int, dict[tuple[str, int], list[float]]] = {}
         # Master order ids currently resting in the book, as of the last poll.
         self._resting: set[str] = set()
         # None until the socket first reports in, so the initial connect can stay quiet.
@@ -676,6 +711,11 @@ class CopyService:
 
     # ── what each account is holding ────────────────────────────────────────────────────────
     @property
+    def account_sides(self) -> dict[int, int]:
+        """Which way each account is currently facing. A copy, like `account_status`."""
+        return dict(self._account_sides)
+
+    @property
     def account_status(self) -> dict[int, bool]:
         """Last known "is this account holding something", by account id.
 
@@ -726,6 +766,11 @@ class CopyService:
         while True:
             await asyncio.sleep(STATUS_POLL_SECONDS)
             try:
+                mode, _ = await self._store.get_mode(self._folder_id)
+                if mode == MODE_REVERSE:
+                    # Already refreshed every second by the group poll; asking again would be the
+                    # same question at a worse moment.
+                    continue
                 await self.refresh_account_status()
             except asyncio.CancelledError:
                 raise
@@ -795,6 +840,206 @@ class CopyService:
         await asyncio.gather(*(one(a) for a in accounts), return_exceptions=True)
         return closed, failed, skipped
 
+    # ── two legs, no master ─────────────────────────────────────────────────────────────────
+    async def _group_accounts(self) -> list[Account]:
+        """Every account that takes part, master row included.
+
+        In REVERSE the master is not special: it is one more account in whichever leg it was put.
+        Its own trade triggers the others exactly as anyone else's would, and its own exit moves
+        nobody.
+        """
+        master = await self._store.get_master(self._folder_id)
+        accounts = ([master] if master else []) + await self._store.list_accounts(
+            self._folder_id, FOLLOWER
+        )
+        return [a for a in accounts if a.active]
+
+    async def _read_snapshots(self, account: Account) -> list[PositionSnapshot] | None:
+        """What this account is holding, or None if it could not be asked."""
+        credentials = await self._store.get_credentials(account.id, self._owner_id)
+        if not credentials or not self._session:
+            return None
+        client = MexcRestClient(*credentials, session=self._session)
+        try:
+            rows = await client.get_open_positions_raw()
+        except (MexcError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+            LOGGER.info("could not read %s: %s", account.label, err)
+            return None
+        parsed = [parse_position(row) for row in rows]
+        return [p for p in parsed if p and p.hold_vol > 0]
+
+    def _remember_side(self, account_id: int, snapshots: list[PositionSnapshot]) -> None:
+        sides = {s.position_type for s in snapshots}
+        if len(sides) == 1:
+            self._account_sides[account_id] = sides.pop()
+        else:
+            # Flat, or holding both ways at once. Neither has a single direction to report.
+            self._account_sides.pop(account_id, None)
+
+    def _expect(self, account_id: int, symbol: str, side: int, vol: float) -> None:
+        """Write down that the bot is about to open `vol` on this account, so the change it causes
+        is not read back as somebody trading by hand."""
+        deadline = asyncio.get_running_loop().time() + EXPECTED_COPY_SECONDS
+        pending = self._expected_copies.setdefault(account_id, {})
+        entry = pending.get((symbol, side))
+        if entry:
+            entry[0] += vol
+            entry[1] = deadline
+        else:
+            pending[(symbol, side)] = [vol, deadline]
+
+    def _was_expected(self, account_id: int, event: MasterEvent) -> bool:
+        """Is this change the bot's own doing? Consumes the expectation if so.
+
+        Matched on symbol, side and size rather than "anything on this account for a while",
+        because a real trade opened by hand during the window still deserves to be copied. The
+        deadline is only a backstop for an order that was placed and never arrived.
+        """
+        pending = self._expected_copies.get(account_id)
+        if not pending:
+            return False
+        key = (event.symbol, event.position_type)
+        entry = pending.get(key)
+        if not entry:
+            return False
+        vol, deadline = entry
+        if asyncio.get_running_loop().time() > deadline:
+            pending.pop(key, None)
+            return False
+        # Sizes are rounded to whole contracts by the venue, so an exact match is not guaranteed.
+        if event.delta_vol > vol * 1.05 + 1:
+            return False
+        remaining = vol - event.delta_vol
+        if remaining > 1e-9:
+            entry[0] = remaining
+        else:
+            pending.pop(key, None)
+        return True
+
+    def _fold(self, account_id: int, snapshots: list[PositionSnapshot]) -> list[MasterEvent]:
+        """Diff one account against what it held last time.
+
+        Only entries come back. A position that has gone is folded into the baseline in silence:
+        exits are never copied here — that is the whole point of the mode — and emitting a close
+        nobody acts on would only invite someone to act on it later.
+        """
+        tracker = self._group_trackers.setdefault(account_id, MasterPositionTracker())
+        events: list[MasterEvent] = []
+        live = {s.key for s in snapshots}
+
+        for snapshot in snapshots:
+            event = tracker.apply(snapshot)
+            if not event or event.action not in (Action.OPEN, Action.INCREASE):
+                continue
+            if self._was_expected(account_id, event):
+                LOGGER.debug("%s: %s is the bot's own copy, not a trigger", account_id, event.dedupe_key)
+                continue
+            events.append(event)
+
+        for key, previous in tracker.snapshot().items():
+            if key not in live:
+                tracker.apply(replace(previous, hold_vol=0.0, state=STATE_CLOSED))
+        return events
+
+    async def _poll_groups_once(self) -> None:
+        """Watch every account, and copy the first entry any of them makes.
+
+        All of them are read at once: each account has its own request allowance, so ten accounts
+        cost the same wall-clock time as one, and the whole point is to notice quickly.
+        """
+        if self._copying:
+            # A copy is being placed. Every account is about to change because of it, and none of
+            # those changes is news.
+            return
+
+        accounts = await self._group_accounts()
+        if len(accounts) < 2:
+            return
+
+        readings = await asyncio.gather(
+            *(self._read_snapshots(a) for a in accounts), return_exceptions=True
+        )
+
+        trigger: tuple[Account, MasterEvent] | None = None
+        for account, snapshots in zip(accounts, readings, strict=True):
+            if not isinstance(snapshots, list):
+                continue
+            self._account_status[account.id] = bool(snapshots)
+            self._remember_side(account.id, snapshots)
+            events = self._fold(account.id, snapshots)
+            if events and trigger is None:
+                # First one wins. Two accounts opened by hand within the same second would
+                # otherwise each instruct the other, and the two instructions would fight.
+                trigger = (account, events[0])
+
+        if trigger:
+            await self._copy_across_groups(*trigger)
+
+    async def _copy_across_groups(self, trigger: Account, event: MasterEvent) -> None:
+        """Repeat one account's entry across both legs.
+
+        Its own leg takes the same side; the other leg takes the opposite. Same symbol, same size,
+        same leverage either way — the two legs are meant to be the same trade seen from both
+        ends.
+        """
+        others = [a for a in await self._group_accounts() if a.id != trigger.id]
+        if not others or not self._session:
+            return
+
+        self._copying = True
+        try:
+            LOGGER.info(
+                "%s (group %s) opened %s %s x%s — copying to %d account(s)",
+                trigger.label, trigger.group, event.symbol,
+                "LONG" if event.position_type == 1 else "SHORT", event.leverage, len(others),
+            )
+            for account in others:
+                self._expect(
+                    account.id,
+                    event.symbol,
+                    side_for_group(account, trigger.group, event.position_type),
+                    event.delta_vol * account.size_multiplier,
+                )
+
+            engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts)
+            event_id = await self._store.record_event(
+                owner_id=self._owner_id,
+                dedupe_key=f"g{trigger.id}:{event.dedupe_key}",
+                symbol=event.symbol,
+                position_type=event.position_type,
+                action=event.action.value,
+                master_vol=event.master_vol,
+                delta_vol=event.delta_vol,
+                leverage=event.leverage,
+                open_type=event.open_type,
+                raw=event.raw,
+            )
+            if event_id is None:
+                LOGGER.warning("group event dropped as a duplicate: %s", event.dedupe_key)
+                return
+
+            results = await engine.execute_groups(event, event_id, others, trigger.group)
+            if self.on_report:
+                with contextlib.suppress(Exception):
+                    await self.on_report(event, results)
+        finally:
+            # Whatever happened, the other accounts now hold what the bot just gave them. Their
+            # trackers are moved to reality WITHOUT emitting, so the next pass sees no news —
+            # this is the line between "copied once" and "copying forever".
+            await self._reseed_group_trackers()
+            self._copying = False
+
+    async def _reseed_group_trackers(self) -> None:
+        accounts = await self._group_accounts()
+        readings = await asyncio.gather(
+            *(self._read_snapshots(a) for a in accounts), return_exceptions=True
+        )
+        for account, snapshots in zip(accounts, readings, strict=True):
+            if isinstance(snapshots, list):
+                self._group_trackers.setdefault(account.id, MasterPositionTracker()).resync(snapshots)
+                self._account_status[account.id] = bool(snapshots)
+                self._remember_side(account.id, snapshots)
+
     async def _skip_reverse_close(self, event: MasterEvent) -> None:
         """In REVERSE the master's exit is not the hedge's exit.
 
@@ -841,9 +1086,16 @@ class CopyService:
                 LOGGER.info("seeded with %d open master position(s)", len(self._seen_positions))
 
         while True:
-            await asyncio.sleep(POSITION_POLL_SECONDS)
+            mode, _ = await self._store.get_mode(self._folder_id)
+            grouped = mode == MODE_REVERSE
+            await asyncio.sleep(GROUP_POLL_SECONDS if grouped else POSITION_POLL_SECONDS)
             try:
-                await self._poll_positions_once()
+                # Two legs and no master means watching everybody; a copy folder has one account
+                # worth watching and nine that only ever follow.
+                if grouped:
+                    await self._poll_groups_once()
+                else:
+                    await self._poll_positions_once()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — polling must never kill the service
@@ -1268,6 +1520,12 @@ class CopyService:
     async def _handle_position(self, data: dict) -> None:
         snapshot = parse_position(data)
         if not snapshot:
+            return
+
+        mode, _ = await self._store.get_mode(self._folder_id)
+        if mode == MODE_REVERSE:
+            # Two legs and no master: the group poller reads every account, this one included, and
+            # owns the decision. Letting a socket frame in as well would copy the same entry twice.
             return
 
         async with self._lock:

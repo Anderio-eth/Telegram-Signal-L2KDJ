@@ -266,9 +266,9 @@ def mode_screen(
     if mode == MODE_REVERSE:
         lines.append("")
         for follower in followers:
-            arrow = "🔁" if follower.is_reversed else "📋"
+            group = "2️⃣" if follower.is_reversed else "1️⃣"
             paused = t(lang, "paused") if not follower.active else ""
-            lines.append(f"   {arrow} {follower.label}{paused}")
+            lines.append(f"   {group} {follower.label}{paused}")
         lines.append("")
         lines.append(t(lang, "dir_pick"))
 
@@ -398,7 +398,11 @@ def compact_money(value: float | None) -> str:
     """
     if value is None:
         return "—"
-    if abs(value) >= 1 or value == 0:
+    # An emptied wallet comes back as 6e-09 rather than 0 — the venue's own rounding dust. Printed
+    # faithfully it reads "$0.00", which looks like a balance that is merely small.
+    if abs(value) < 0.005:
+        return "$0"
+    if abs(value) >= 1:
         return f"${value:,.0f}"
     return f"${value:.2f}"
 
@@ -416,6 +420,22 @@ class Cell:
         # The light goes last so the eye can run down the right-hand edge of a column and see
         # which accounts are in and which are not, without reading a single name.
         return f"{self.label}  {compact_money(self.balance)}  {'🟢' if self.holding else '🔴'}"
+
+
+def group_title(cells: list[Cell], sides: dict[int, int], name: str) -> str:
+    """A leg's heading: its name, and the way it is currently facing.
+
+    Which way a leg trades is not a property of the leg — it is decided by whoever opens first —
+    so the name alone is what it says while nothing is open. Once a position exists the heading
+    reports the side actually held, and goes back to the bare name when everything is closed.
+    """
+    held = [sides.get(cell.account_id) for cell in cells]
+    facing = {side for side in held if side}
+    if len(facing) != 1:
+        # Nothing open, or the leg disagrees with itself — which can happen while somebody is
+        # closing it by hand. Claiming a single direction then would be a guess.
+        return name
+    return f"{name} — {side_name(facing.pop())}"
 
 
 def reverse_columns(
@@ -444,16 +464,18 @@ def reverse_columns(
     right: list[Cell] = []
 
     if master:
-        left.append(Cell(master.id, "Master", balance_of(master), holding.get(master.id, False)))
+        # Numbered with everyone else. In this mode it is one more account in whichever leg it was
+        # put, and calling it "Master" on the screen would suggest an authority it does not have.
+        left.append(Cell(master.id, "1.1", balance_of(master), holding.get(master.id, False)))
 
     for account in followers:
         column = right if account.is_reversed else left
-        side = "opposite" if account.is_reversed else "as master"
+        side = "2." if account.is_reversed else "1."
         # Counted over the accounts already placed in this column under the same heading, so the
         # master sitting at the top of the left one does not consume a follower's number.
-        index = sum(1 for c in column if c.label.startswith(side)) + 1
+        index = len(column) + 1
         column.append(
-            Cell(account.id, f"{side} {index}", balance_of(account), holding.get(account.id, False))
+            Cell(account.id, f"{side}{index}", balance_of(account), holding.get(account.id, False))
         )
 
     return left, right

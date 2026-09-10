@@ -36,8 +36,18 @@ MODE_COPY = "COPY"
 MODE_REVERSE = "REVERSE"
 
 
+# Which of the two legs an account belongs to in REVERSE mode.
+#
+# Stored in a column called `direction`, whose values predate groups: it used to mean "does this
+# account trade the master's way or against it", and the master is gone. The values map one to one
+# onto the legs, so the column stays rather than a migration that would rewrite every row to say
+# the same thing in different words.
 DIRECTION_COPY = "COPY"
 DIRECTION_REVERSE = "REVERSE"
+
+GROUP_ONE = 1
+GROUP_TWO = 2
+GROUP_TO_DIRECTION = {GROUP_ONE: DIRECTION_COPY, GROUP_TWO: DIRECTION_REVERSE}
 
 
 @dataclass(frozen=True)
@@ -56,6 +66,16 @@ class Account:
     @property
     def is_reversed(self) -> bool:
         return self.direction == DIRECTION_REVERSE
+
+    @property
+    def group(self) -> int:
+        """Which leg this account is in: 1 or 2.
+
+        There is no first-among-equals. Whichever account opens a position sets the direction for
+        its own leg, and the other leg takes the opposite — so these numbers name the two sides of
+        a hedge, not a rank.
+        """
+        return GROUP_TWO if self.is_reversed else GROUP_ONE
 
     @property
     def is_master(self) -> bool:
@@ -437,6 +457,10 @@ class Store:
             await conn.execute(
                 "UPDATE copy_accounts SET last_error = $2, updated_at = now() WHERE id = $1", account_id, error
             )
+
+    async def set_group(self, account_id: int, folder_id: int, group: int) -> None:
+        """Move one account to leg 1 or leg 2."""
+        await self.set_direction(account_id, folder_id, GROUP_TO_DIRECTION[group])
 
     async def set_direction(self, account_id: int, folder_id: int, direction: str) -> None:
         """Which way one account trades relative to the master.

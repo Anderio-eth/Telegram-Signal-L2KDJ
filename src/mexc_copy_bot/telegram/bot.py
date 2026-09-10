@@ -95,7 +95,9 @@ PERSISTENT_KEYBOARD = ReplyKeyboardMarkup(
 BALANCE_TTL_SECONDS = 5.0
 
 
-def _column_rows(left: list, right: list, lang: str) -> list[list[InlineKeyboardButton]]:
+def _column_rows(
+    left: list, right: list, lang: str, titles: tuple[str, str] | None = None
+) -> list[list[InlineKeyboardButton]]:
     """The two legs, side by side, one account per cell.
 
     Buttons rather than text because a keyboard aligns its columns and a message does not: the
@@ -108,6 +110,8 @@ def _column_rows(left: list, right: list, lang: str) -> list[list[InlineKeyboard
     """
     rows: list[list[InlineKeyboardButton]] = []
     blank = InlineKeyboardButton(" ", callback_data="noop")
+    if titles:
+        rows.append([InlineKeyboardButton(title, callback_data="noop") for title in titles])
     for index in range(max(len(left), len(right))):
         row = []
         row.append(
@@ -133,7 +137,7 @@ def _menu_keyboard(
     lang: str,
     stuck: int = 0,
     folder: str = "",
-    columns: tuple[list, list] | None = None,
+    columns: tuple[list, list, tuple[str, str]] | None = None,
 ) -> InlineKeyboardMarkup:
     control = (
         InlineKeyboardButton(t(lang, "btn_stop"), callback_data="stop")
@@ -141,7 +145,7 @@ def _menu_keyboard(
         else InlineKeyboardButton(t(lang, "btn_start"), callback_data="start")
     )
     # The legs sit directly under Refresh, because Refresh is what updates the balances in them.
-    legs = _column_rows(*columns, lang) if columns else []
+    legs = _column_rows(columns[0], columns[1], lang, columns[2]) if columns else []
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(t(lang, "btn_positions"), callback_data="positions"),
@@ -415,7 +419,7 @@ class CopyBot:
                 reply_markup=PERSISTENT_KEYBOARD,
             )
 
-    async def _menu_columns(self, owner_id: int) -> tuple[list, list] | None:
+    async def _menu_columns(self, owner_id: int) -> tuple[list, list, tuple[str, str]] | None:
         """The two legs, or None when this folder is not in REVERSE.
 
         Only REVERSE has legs to show. In COPY every account does the same thing, so a column per
@@ -431,8 +435,14 @@ class CopyBot:
             return None
         service = await self._registry.get(folder_id, owner_id)
         accounts = ([master] if master else []) + followers
-        return messages.reverse_columns(
+        left, right = messages.reverse_columns(
             master, followers, await self._balances(owner_id, accounts), service.account_status
+        )
+        lang = await self._lang(owner_id)
+        sides = service.account_sides
+        return left, right, (
+            messages.group_title(left, sides, t(lang, "group_one")),
+            messages.group_title(right, sides, t(lang, "group_two")),
         )
 
     async def _menu_view(self, owner_id: int) -> tuple[str, InlineKeyboardMarkup]:

@@ -124,11 +124,11 @@ def test_reverse_mode_reports_the_split_not_a_missing_account():
         ],
     )
     assert "не обрано" not in text
-    assert "2 навпаки" in text
-    assert "1 як майстер" in text
+    assert "1 у групі 2" in text or "2 у групі 2" in text
+    assert "групі 1" in text
 
 
 def test_reverse_mode_with_no_followers_says_so_without_warning():
     text = render(mode=MODE_REVERSE, followers=[])
     assert "не обрано" not in text
-    assert "РЕВЕРС" in text
+    assert "ГРУПИ" in text
