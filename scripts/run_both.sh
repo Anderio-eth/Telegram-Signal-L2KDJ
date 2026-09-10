@@ -36,18 +36,40 @@ run_forever() {
 
 PIDS=()
 
+# Shut down the whole tree, not just the wrappers.
+#
+# `kill $wrapper_pid` stops the run_forever loop but leaves the python it launched running as an
+# orphan. Two copy bots on one Telegram token means Telegram hands updates to whichever asks
+# first — but far worse, both are watching the master and both would mirror the same trade. So the
+# python children are killed by name from the array, and the wrappers with them.
+shutdown() {
+  log "shutting down"
+  for pid in "${PIDS[@]}"; do
+    # Negative pid = the whole process group started by that wrapper, children included.
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  done
+  wait
+  exit 0
+}
+
 if [ "${SIGNAL_BOT_ENABLED:-false}" = "true" ]; then
+  set -m
   run_forever "signal-bot" python -m telegram_signal_k2 &
   PIDS+=("$!")
+  set +m
 else
   log "signal-bot disabled (set SIGNAL_BOT_ENABLED=true to run it)"
 fi
 
+# Job control on, so this wrapper and its python get their own process group and can be signalled
+# as one. Without it the kill above reaches the wrapper only.
+set -m
 run_forever "copy-bot" python -m mexc_copy_bot &
 PIDS+=("$!")
+set +m
 
 # Forward Render's shutdown signal, so a redeploy stops things cleanly instead of killing the copy
-# bot mid-order.
-trap 'log "shutting down"; kill "${PIDS[@]}" 2>/dev/null; wait; exit 0' SIGTERM SIGINT
+# bot mid-order — and, just as importantly, leaves nothing behind that would keep trading.
+trap shutdown SIGTERM SIGINT
 
 wait

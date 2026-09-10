@@ -75,6 +75,10 @@ POSITION_POLL_STALE_SECONDS = 15.0
 # real one, which is a syntax error that only surfaces at import.
 NEWLINE = chr(10)
 
+# What counts as the master getting OUT. A DECREASE is a partial exit and is the same thing for
+# this purpose: in REVERSE the hedge is not unwound just because the master trimmed.
+CLOSING_ACTIONS = frozenset({Action.CLOSE, Action.DECREASE})
+
 ReportCallback = Callable[[MasterEvent, list[FollowerResult]], Awaitable[None]]
 NoticeCallback = Callable[[str], Awaitable[None]]
 
@@ -653,6 +657,30 @@ class CopyService:
             return None
         return MexcRestClient(*credentials, session=self._session)
 
+    async def _skip_reverse_close(self, event: MasterEvent) -> None:
+        """In REVERSE the master's exit is not the hedge's exit.
+
+        A hedge is held against the master's position, not alongside it, so following the master
+        out closes the very thing that was protecting it. The accounts stay in, and are closed by
+        hand when the person who put them there decides to.
+
+        Said out loud rather than done quietly: after this the accounts hold something the master
+        does not, which is exactly the state worth knowing you are in.
+        """
+        side = "LONG" if event.position_type == 1 else "SHORT"
+        pnl = event.realized_pnl
+        lines = [
+            "🔁 <b>РЕВЕРС — ЗАКРИТТЯ НЕ КОПІЮЄТЬСЯ</b>",
+            "",
+            f"Майстер вийшов з <b>{event.symbol}</b> {side}"
+            + (f" ({'+' if pnl >= 0 else '−'}${abs(pnl):,.2f})" if pnl is not None else "")
+            + ".",
+            "",
+            "Реверсні позиції лишаються відкритими — закривай вручну.",
+        ]
+        LOGGER.info("reverse mode: not mirroring the master's exit from %s", event.symbol)
+        await self._notify(NEWLINE.join(lines))
+
     async def _position_poll_loop(self) -> None:
         """Read the master's positions over REST, continuously.
 
@@ -853,13 +881,31 @@ class CopyService:
             )
             return
 
+        mode, _ = await self._store.get_mode(self._folder_id)
+        reverse = mode == MODE_REVERSE
+
+        # Same rule as a market exit: in REVERSE the master leaving does not take the hedge with
+        # it. Checked before anything is placed, not after.
+        if reverse and closing_side is not None:
+            LOGGER.info("reverse mode: not mirroring the master's exit limit on %s", order.symbol)
+            await self._notify(
+                NEWLINE.join(
+                    [
+                        "🔁 <b>РЕВЕРС — ЛІМІТКА НА ВИХІД НЕ КОПІЮЄТЬСЯ</b>",
+                        "",
+                        f"Майстер виставив вихід з <b>{order.symbol}</b> @ {order.price:g}.",
+                        "",
+                        "Реверсні позиції лишаються відкритими.",
+                    ]
+                )
+            )
+            return
+
         followers = await self._eligible_followers(
             opening=closing_side is None, symbol=order.symbol
         )
         if not followers:
             return
-        mode, _ = await self._store.get_mode(self._folder_id)
-        reverse = mode == MODE_REVERSE
         self._closing_intent[order.order_id] = closing_side
         vol_by_account: dict[int, float] | None = None
         skipped: list[str] = []
@@ -1139,6 +1185,11 @@ class CopyService:
 
         mode, _ = await self._store.get_mode(self._folder_id)
         reverse = mode == MODE_REVERSE
+
+        if reverse and event.action in CLOSING_ACTIONS:
+            await self._skip_reverse_close(event)
+            return
+
         followers, skipped = await self._eligibility(
             opening=event.action is not Action.CLOSE, symbol=event.symbol
         )

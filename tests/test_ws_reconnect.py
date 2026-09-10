@@ -88,3 +88,59 @@ def test_a_session_that_lasted_starts_over_from_a_short_delay():
 def test_an_exception_still_backs_off_as_it_always_did():
     slept = drive(session_lifetime=0.0, rounds=4, outcome="raise")
     assert slept and slept == sorted(slept) and slept[-1] > slept[0]
+
+
+# ── a network that refuses the socket outright ──────────────────────────────
+def drive_blocked(rounds: int, detail: str = "403, message='Invalid response status'"):
+    slept: list[float] = []
+    sessions = {"n": 0}
+
+    async def ignore(*args, **kwargs):
+        return None
+
+    ws = MasterWebSocket("k", "s", on_position=ignore, reconnect_max_seconds=30.0)
+    ws._running = True
+
+    async def refused():
+        sessions["n"] += 1
+        if sessions["n"] > rounds:
+            ws._running = False
+        raise RuntimeError(detail)
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    ws._session_loop = refused
+
+    async def run():
+        original = asyncio.sleep
+        asyncio.sleep = fake_sleep
+        try:
+            await ws._run()
+        finally:
+            asyncio.sleep = original
+
+    asyncio.run(run())
+    return ws, slept
+
+
+def test_a_blocked_network_waits_the_full_interval_immediately():
+    """A 403 on the handshake is this network being refused, not a dropped connection. Climbing
+    1, 2, 4, 8 to get there just spends the first minute retrying something that cannot succeed."""
+    _, slept = drive_blocked(rounds=4)
+    assert slept and all(s == 30.0 for s in slept), slept
+
+
+def test_the_explanation_is_given_once_not_every_retry():
+    """Every thirty seconds forever is how a log stops being read."""
+    ws, _ = drive_blocked(rounds=5)
+    assert ws._reported_block is True
+
+
+def test_an_ordinary_drop_after_a_block_backs_off_normally_again():
+    """The block can lift. When it does, the socket must behave like a socket again."""
+    ws, _ = drive_blocked(rounds=2)
+    assert ws._reported_block is True
+    _, slept = drive_blocked(rounds=3, detail="socket error")
+    assert slept != [30.0, 30.0, 30.0], "a normal failure must still climb from a short wait"
+    assert slept[0] < 30.0

@@ -40,6 +40,13 @@ LOGIN_TIMEOUT = 10.0
 # only thing that stops it becoming a hot loop.
 HEALTHY_SESSION_SECONDS = 60.0
 
+# A 403 on the handshake is not a dropped connection, it is this network being refused. MEXC
+# blocks contract.mexc.com at the CDN for some address ranges — the REST client already works
+# around the same block by using api.mexc.com, and the socket host has no alternative. Retrying is
+# still right in case the block lifts, but saying so every thirty seconds fills the log with a
+# line that carries no new information and buries the ones that do.
+BLOCKED_MARKERS = ("403", "invalid response status")
+
 # MEXC's own docs disagree with what the socket actually sends: the position channel is
 # `push.personal.position`, while the docs name the stop channel `push.stop.order`. Both spellings
 # are accepted rather than betting on either — the same class of documentation error already cost
@@ -81,6 +88,9 @@ class MasterWebSocket:
         self._on_resync = on_resync
         self._on_status = on_status
         self._reconnect_max = reconnect_max_seconds
+        # Whether the "this network is blocked" explanation has already been given, so it is said
+        # once rather than on every retry.
+        self._reported_block = False
         self._task: asyncio.Task[None] | None = None
         self._running = False
         self._connected = False
@@ -160,10 +170,30 @@ class MasterWebSocket:
 
             if asyncio.get_running_loop().time() - started >= HEALTHY_SESSION_SECONDS:
                 backoff = 1.0
-            LOGGER.warning("master ws dropped: %s (retry in %.0fs)", detail, backoff)
+
+            blocked = any(marker in detail.lower() for marker in BLOCKED_MARKERS)
+            if blocked:
+                # Nothing here will change on its own, so go straight to the longest wait rather
+                # than climbing to it, and say it once. Positions come over REST regardless.
+                backoff = self._reconnect_max
+                if not self._reported_block:
+                    self._reported_block = True
+                    LOGGER.warning(
+                        "master ws refused by the venue from this network (%s). "
+                        "This is a CDN block on contract.mexc.com, not a credentials problem. "
+                        "Copying continues over REST; retrying quietly every %.0fs.",
+                        detail, backoff,
+                    )
+                else:
+                    LOGGER.debug("master ws still refused (%s)", detail)
+            else:
+                self._reported_block = False
+                LOGGER.warning("master ws dropped: %s (retry in %.0fs)", detail, backoff)
+
             await self._status(False, detail)
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, self._reconnect_max)
+            if not blocked:
+                backoff = min(backoff * 2, self._reconnect_max)
 
     async def _session_loop(self) -> None:
         async with aiohttp.ClientSession() as session:

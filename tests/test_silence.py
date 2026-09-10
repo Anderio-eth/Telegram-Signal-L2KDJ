@@ -20,7 +20,7 @@ import pytest  # noqa: E402
 
 from mexc_copy_bot.core.events import Action, MasterEvent  # noqa: E402
 from mexc_copy_bot.core.service import CopyService  # noqa: E402
-from mexc_copy_bot.db.store import FOLLOWER, MODE_REVERSE, Account  # noqa: E402
+from mexc_copy_bot.db.store import FOLLOWER, MODE_COPY, MODE_REVERSE, Account  # noqa: E402
 
 OWNER, FOLDER = 7, 3
 
@@ -33,9 +33,10 @@ def follower(n: int, active: bool = True) -> Account:
 
 
 class FakeStore:
-    def __init__(self, accounts, detached=()):
+    def __init__(self, accounts, detached=(), mode=MODE_COPY):
         self._accounts = accounts
         self._detached = set(detached)
+        self._mode = mode
         self.events = []
 
     async def list_accounts(self, folder_id, kind=None):
@@ -45,7 +46,7 @@ class FakeStore:
         return set(self._detached)
 
     async def get_mode(self, folder_id):
-        return (MODE_REVERSE, None)
+        return (self._mode, None)
 
     async def record_event(self, **kwargs):
         self.events.append(kwargs)
@@ -118,3 +119,58 @@ def test_nothing_extra_is_said_when_accounts_do_act():
         # getting that far is itself the proof that the "nobody acted" branch was not taken.
         asyncio.run(svc._dispatch(event(), {}))
     assert sent == []
+
+
+# ── reverse: the master's exit is not the hedge's exit ──────────────────────
+def test_reverse_does_not_mirror_the_masters_close():
+    """A hedge is held AGAINST the master's position. Following the master out would close the
+    very thing that was protecting it, so the accounts stay in and are closed by hand."""
+    store = FakeStore([follower(1)], mode=MODE_REVERSE)
+    sent = run(store, held={1: 20.0}, action=Action.CLOSE)
+    assert sent, "the master left and nothing was said"
+    assert "НЕ КОПІЮЄТЬСЯ" in sent[0]
+    assert "SILVER_USDT" in sent[0]
+
+
+def test_the_reverse_skip_says_the_positions_are_still_open():
+    """After this the accounts hold something the master does not, which is the whole point of
+    being told about it."""
+    sent = run(FakeStore([follower(1)], mode=MODE_REVERSE), held={1: 20.0}, action=Action.CLOSE)
+    assert "лишаються відкритими" in sent[0]
+
+
+def test_reverse_still_mirrors_an_opening():
+    """Only the exit is dropped. An entry is the whole reason the mode exists, and reaching the
+    engine — which needs a session this test does not build — proves it was not skipped."""
+    import pytest as _pytest
+
+    store = FakeStore([follower(1)], mode=MODE_REVERSE)
+    svc = CopyService(store, FOLDER, OWNER)
+    sent: list[str] = []
+    svc.on_notice = lambda text: _record(sent, text)
+
+    async def flat(account, symbol):
+        return 0.0
+
+    svc._held_any = flat
+    with _pytest.raises(AssertionError):
+        asyncio.run(svc._dispatch(event(Action.OPEN), {}))
+    assert sent == [], "an entry must not be reported as skipped"
+
+
+def test_copy_mode_still_mirrors_a_close():
+    """The rule is about REVERSE only; a copy folder must keep following the master out."""
+    import pytest as _pytest
+
+    store = FakeStore([follower(1)], mode=MODE_COPY)
+    svc = CopyService(store, FOLDER, OWNER)
+    sent: list[str] = []
+    svc.on_notice = lambda text: _record(sent, text)
+
+    async def holding(account, symbol):
+        return 20.0
+
+    svc._held_any = holding
+    with _pytest.raises(AssertionError):
+        asyncio.run(svc._dispatch(event(Action.CLOSE), {}))
+    assert sent == [], "a copy folder's close must reach the engine, not be skipped"
