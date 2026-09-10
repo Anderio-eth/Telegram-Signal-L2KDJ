@@ -92,6 +92,10 @@ class Folder:
     running: bool
     mode: str
     reverse_account_id: int | None
+    # None means "never renamed", so the screen can show a translated default rather than the
+    # database holding one language's words for everybody.
+    group_one_name: str | None = None
+    group_two_name: str | None = None
 
 
 KIND_ENTRY = "ENTRY"
@@ -193,7 +197,8 @@ class Store:
     async def list_folders(self, owner_id: int) -> list[Folder]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, owner_id, name, running, mode, reverse_account_id"
+                "SELECT id, owner_id, name, running, mode, reverse_account_id,"
+                " group_one_name, group_two_name"
                 " FROM copy_folders WHERE owner_id = $1 ORDER BY created_at, id",
                 owner_id,
             )
@@ -204,12 +209,35 @@ class Store:
         empty rather than rely on a check the caller might forget."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, owner_id, name, running, mode, reverse_account_id"
+                "SELECT id, owner_id, name, running, mode, reverse_account_id,"
+                " group_one_name, group_two_name"
                 " FROM copy_folders WHERE id = $1 AND owner_id = $2",
                 folder_id,
                 owner_id,
             )
         return Folder(**dict(row)) if row else None
+
+    async def rename_group(self, folder_id: int, owner_id: int, group: int, name: str) -> None:
+        """Name one of the two legs. Scoped by owner, like every other mutation here."""
+        column = "group_one_name" if group == GROUP_ONE else "group_two_name"
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                f"UPDATE copy_folders SET {column} = $3, updated_at = now()"
+                " WHERE id = $1 AND owner_id = $2",
+                folder_id,
+                owner_id,
+                name.strip()[:20] or None,
+            )
+
+    async def rename_account(self, account_id: int, owner_id: int, label: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE copy_accounts SET label = $3, updated_at = now()"
+                " WHERE id = $1 AND owner_id = $2",
+                account_id,
+                owner_id,
+                label.strip()[:24],
+            )
 
     async def create_folder(self, owner_id: int, name: str) -> int:
         async with self._pool.acquire() as conn:
@@ -273,7 +301,8 @@ class Store:
         """Folders left switched on — restored on boot, each independently of the others."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, owner_id, name, running, mode, reverse_account_id"
+                "SELECT id, owner_id, name, running, mode, reverse_account_id,"
+                " group_one_name, group_two_name"
                 " FROM copy_folders WHERE running ORDER BY id"
             )
         return [Folder(**dict(r)) for r in rows]

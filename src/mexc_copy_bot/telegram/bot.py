@@ -70,6 +70,7 @@ ASK_KEY, ASK_SECRET = range(2)
 # key/secret flow, which is waiting for text of a completely different kind.
 ASK_PRICE = 100
 ASK_FOLDER_NAME = 101
+ASK_RENAME = 102
 
 # Written out rather than inlined: patching this file has twice turned an escaped newline into
 # a real one, which is a syntax error that only shows up at import time.
@@ -79,6 +80,10 @@ NEWLINE = chr(10)
 # something to scroll back and find. Its text is fixed rather than translated: it is matched
 # against what Telegram sends back, and a menu opened in one language must still work after the
 # language is switched.
+# A trade can produce a report and a notice in the same breath; moving the menu for each would
+# leave a trail of dead menus up the chat.
+MENU_MOVE_COOLDOWN = 3.0
+
 MENU_BUTTON = "☰ Menu"
 MENU_FILTER = filters.Regex(f"^{MENU_BUTTON}$")
 
@@ -211,6 +216,8 @@ class CopyBot:
         # Who already has the Menu button above their message box. Sent once per process rather
         # than on every menu, which would be a stray message each time.
         self._menu_button_shown: set[int] = set()
+        # When the menu was last moved to the bottom, per owner.
+        self._menu_moved: dict[int, float] = {}
 
         registry.configure_callbacks(on_report=self._report_for, on_notice=self._notice_for)
 
@@ -254,6 +261,22 @@ class CopyBot:
             per_message=False,
         )
 
+        rename_conversation = ConversationHandler(
+            entry_points=[CallbackQueryHandler(self._begin_rename, pattern="^ren:[ga]:[0-9]+$")],
+            states={
+                ASK_RENAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, self._got_rename)
+                ]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self._cancel_add),
+                MessageHandler(MENU_FILTER, self._restart_from_conversation),
+                CallbackQueryHandler(self._abandon_and_dispatch),
+            ],
+            allow_reentry=True,
+            per_message=False,
+        )
+
         folder_conversation = ConversationHandler(
             entry_points=[CallbackQueryHandler(self._begin_folder_name, pattern="^f(new|ren)$")],
             states={
@@ -275,6 +298,7 @@ class CopyBot:
         app.add_handler(add_conversation)
         app.add_handler(price_conversation)
         app.add_handler(folder_conversation)
+        app.add_handler(rename_conversation)
         app.add_handler(CallbackQueryHandler(self._on_button))
         self._app = app
         return app
@@ -403,6 +427,19 @@ class CopyBot:
         would look like the change had not taken."""
         self._balance_cache.pop(owner_id, None)
 
+    async def _group_names(self, owner_id: int) -> tuple[str, str]:
+        """What the two legs are called here, falling back to a translated default.
+
+        The default is not stored, so a folder that has never been renamed follows the language
+        switch instead of being stuck with whichever language it was created in.
+        """
+        lang = await self._lang(owner_id)
+        folder = await self._store.get_folder(self._folder(owner_id), owner_id)
+        return (
+            (folder.group_one_name if folder and folder.group_one_name else t(lang, "group_one")),
+            (folder.group_two_name if folder and folder.group_two_name else t(lang, "group_two")),
+        )
+
     async def _ensure_menu_button(self, chat_id: int, owner_id: int) -> None:
         """Put the Menu button above the message box, once per chat.
 
@@ -438,11 +475,11 @@ class CopyBot:
         left, right = messages.reverse_columns(
             master, followers, await self._balances(owner_id, accounts), service.account_status
         )
-        lang = await self._lang(owner_id)
+        one, two = await self._group_names(owner_id)
         sides = service.account_sides
         return left, right, (
-            messages.group_title(left, sides, t(lang, "group_one")),
-            messages.group_title(right, sides, t(lang, "group_two")),
+            messages.group_title(left, sides, one),
+            messages.group_title(right, sides, two),
         )
 
     async def _menu_view(self, owner_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -623,8 +660,9 @@ class CopyBot:
                 return
             account_id = int(action.split(":", 1)[1])
             folder_id = self._folder(owner_id)
-            current = {a.id: a for a in await self._store.list_accounts(folder_id, FOLLOWER)}
-            account = current.get(account_id)
+            master = await self._store.get_master(folder_id)
+            everyone = ([master] if master else []) + await self._store.list_accounts(folder_id, FOLLOWER)
+            account = next((a for a in everyone if a.id == account_id), None)
             if account:
                 await self._store.set_direction(
                     account_id,
@@ -670,15 +708,31 @@ class CopyBot:
             if leg == "opposite"
             else ([master] if master else []) + [a for a in followers if not a.is_reversed]
         )
-        side = t(lang, "column_opposite" if leg == "opposite" else "column_as_master")
+        one, two = await self._group_names(owner_id)
+        side = two if leg == "opposite" else one
 
         closed, failed, skipped = await service.close_accounts([a.id for a in wanted])
 
         lines = [t(lang, "closed_column", side=side), ""]
         if not closed and not failed:
             lines.append(t(lang, "column_nothing_open"))
-        lines += [f"✅ {label}" for label in closed]
+        for label, pnl in closed:
+            # An unread settlement says so rather than printing a zero, which would read as
+            # "this one broke even".
+            amount = messages.signed_money(pnl) if pnl is not None else t(lang, "pnl_pending")
+            lines.append(f"✅ {label}  {amount}")
         lines += [f"❌ {label} — {error}" for label, error in failed]
+
+        known = [pnl for _, pnl in closed if pnl is not None]
+        if known:
+            suffix = (
+                ""
+                if len(known) == len(closed)
+                else t(lang, "counted_suffix", n=len(known), total=len(closed))
+            )
+            lines.append("")
+            lines.append(t(lang, "total_pnl", amount=messages.signed_money(sum(known)), suffix=suffix))
+
         if skipped:
             lines.append("")
             lines.append(t(lang, "column_skipped", names=", ".join(skipped)))
@@ -734,12 +788,26 @@ class CopyBot:
         lang = await self._lang(owner_id)
         rows = []
         if mode == MODE_REVERSE:
-            # One button per account, showing what it does now — tapping flips it.
-            for follower in followers:
-                arrow = t(lang, "btn_dir_reverse") if follower.is_reversed else t(lang, "btn_dir_copy")
-                rows.append([InlineKeyboardButton(
-                    f"{follower.label} — {arrow}", callback_data=f"dir:{follower.id}"
-                )])
+            # Every account, master included: in this mode it is one more member of a leg, and
+            # leaving it off would make the one account you cannot move the invisible one.
+            master = await self._store.get_master(self._folder(owner_id))
+            for account in ([master] if master else []) + followers:
+                group = t(lang, "btn_dir_reverse") if account.is_reversed else t(lang, "btn_dir_copy")
+                rows.append([
+                    InlineKeyboardButton(f"{account.label} — {group}", callback_data=f"dir:{account.id}"),
+                    InlineKeyboardButton("✏️", callback_data=f"ren:a:{account.id}"),
+                ])
+            folder = await self._store.get_folder(self._folder(owner_id), owner_id)
+            rows.append([
+                InlineKeyboardButton(
+                    "✏️ " + (folder.group_one_name if folder and folder.group_one_name else t(lang, "group_one")),
+                    callback_data="ren:g:1",
+                ),
+                InlineKeyboardButton(
+                    "✏️ " + (folder.group_two_name if folder and folder.group_two_name else t(lang, "group_two")),
+                    callback_data="ren:g:2",
+                ),
+            ])
             rows.append([InlineKeyboardButton(t(lang, "btn_to_copy"), callback_data="mode_copy")])
         else:
             # Only offered when it would change something. In REVERSE the accounts are already
@@ -754,6 +822,44 @@ class CopyBot:
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
         )
+
+    async def _begin_rename(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Ask for a new name — for one of the two legs, or for a single account."""
+        owner_id = await self._guard(update)
+        if owner_id is None:
+            return ConversationHandler.END
+        query = update.callback_query
+        await query.answer()
+        _, kind, target = (query.data or "").split(":")
+        context.user_data["rename"] = (kind, int(target))
+
+        lang = await self._lang(owner_id)
+        if kind == "g":
+            prompt = t(lang, "rename_group_prompt", n=target)
+        else:
+            folder_id = self._folder(owner_id)
+            master = await self._store.get_master(folder_id)
+            everyone = ([master] if master else []) + await self._store.list_accounts(folder_id, FOLLOWER)
+            current = next((a for a in everyone if a.id == int(target)), None)
+            prompt = t(lang, "rename_account_prompt", name=current.label if current else "?")
+        await query.edit_message_text(prompt, parse_mode=ParseMode.HTML)
+        return ASK_RENAME
+
+    async def _got_rename(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        owner_id = await self._guard(update)
+        if owner_id is None:
+            return ConversationHandler.END
+        target = context.user_data.pop("rename", None)
+        name = (update.message.text or "").strip()
+        if target and name:
+            kind, target_id = target
+            if kind == "g":
+                await self._store.rename_group(self._folder(owner_id), owner_id, target_id, name)
+            else:
+                # Scoped by owner in SQL, so a stale keyboard from somebody else matches no row.
+                await self._store.rename_account(target_id, owner_id, name)
+        await self._show_menu_message(owner_id)
+        return ConversationHandler.END
 
     async def _show_promote(self, update: Update, owner_id: int) -> None:
         lang = await self._lang(owner_id)
@@ -1353,8 +1459,73 @@ class CopyBot:
                 # HTML. Losing a trade report to a formatting character is the worse outcome, so
                 # it goes out unformatted rather than not at all.
                 await self._app.bot.send_message(chat_id, text)
+            await self._refresh_menu(owner_id)
 
         return notice
+
+    async def _report_event(self, owner_id: int, event: MasterEvent, results: list[FollowerResult]) -> None:
+        chat_id = self._chat_for(owner_id)
+        if not (self._app and chat_id):
+            return
+        notional = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                specs = await get_contract_specs(session, event.symbol)
+                price = await get_ticker_price(session, event.symbol)
+            spec = specs.get(event.symbol)
+            if spec and price:
+                notional = spec.notional(event.delta_vol, price)
+        except Exception:  # noqa: BLE001 — a missing price must not suppress the trade report
+            LOGGER.debug("could not compute notional for %s", event.symbol)
+
+        text = messages.event_report(event, results, notional, await self._lang(owner_id))
+        try:
+            await self._app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        except BadRequest:
+            # Same reasoning as _notice_for: these lines carry exchange text, and one stray "<"
+            # in an error message would otherwise cost the whole trade report.
+            await self._app.bot.send_message(chat_id, text)
+        await self._refresh_menu(owner_id)
+
+    async def _refresh_menu(self, owner_id: int) -> None:
+        """Move the menu to the bottom of the chat, brought up to date.
+
+        Telegram has no way to pin a message to the bottom, so the only way to keep the menu in
+        front of you is to send it again below whatever just arrived and remove the old copy. The
+        new one goes out BEFORE the old one is deleted, so there is never an instant with no menu
+        on screen.
+
+        Everything here is best-effort: the trade has already happened, and failing to redraw a
+        keyboard must never surface as an error about it.
+        """
+        if not self._app:
+            return
+
+        now = time.monotonic()
+        if now - self._menu_moved.get(owner_id, 0.0) < MENU_MOVE_COOLDOWN:
+            # A trade can produce a report and a notice within the same second. Moving the menu
+            # for each would leave a trail of them up the chat.
+            return
+        self._menu_moved[owner_id] = now
+
+        previous = self._menu_message.get(owner_id)
+        chat_id = previous[0] if previous else self._chat_for(owner_id)
+        try:
+            service = await self._registry.get(self._folder(owner_id), owner_id)
+            await service.refresh_account_status()
+            self._invalidate_balances(owner_id)
+            text, keyboard = await self._menu_view(owner_id)
+            sent = await self._app.bot.send_message(
+                chat_id, text, reply_markup=keyboard, parse_mode=ParseMode.HTML
+            )
+            self._menu_message[owner_id] = (sent.chat_id, sent.message_id)
+        except Exception:  # noqa: BLE001 — a redraw must not report itself as a trade failure
+            LOGGER.info("could not move the menu for %s", owner_id, exc_info=True)
+            return
+
+        if previous:
+            with contextlib.suppress(Exception):
+                await self._app.bot.delete_message(chat_id=previous[0], message_id=previous[1])
 
     async def _report_event(self, owner_id: int, event: MasterEvent, results: list[FollowerResult]) -> None:
         chat_id = self._chat_for(owner_id)

@@ -781,12 +781,43 @@ class CopyService:
             except Exception:  # noqa: BLE001 — a status light must never kill the service
                 LOGGER.exception("account status poll failed")
 
+    async def _settled(
+        self, client: MexcRestClient, ids_by_symbol: dict[str, list[int]]
+    ) -> float | None:
+        """What the positions just closed actually made, summed.
+
+        The venue's own figure rather than one derived from prices here: it is net of fees, and it
+        is the number that moved the balance. None unless every position is accounted for — a
+        partial sum presented as "the PnL" looks authoritative while quietly omitting a leg.
+        """
+        outstanding = {pid for ids in ids_by_symbol.values() for pid in ids}
+        if not outstanding:
+            return None
+        total = 0.0
+        for delay in (0.0, 0.6, 1.5):
+            if delay:
+                await asyncio.sleep(delay)
+            for symbol in ids_by_symbol:
+                try:
+                    finished = await client.get_closed_positions(symbol)
+                except (MexcError, aiohttp.ClientError, asyncio.TimeoutError):
+                    continue
+                for position in finished:
+                    if position.position_id in outstanding:
+                        total += position.realised
+                        outstanding.discard(position.position_id)
+            if not outstanding:
+                return total
+        return None
+
     async def close_accounts(
         self, account_ids: list[int]
-    ) -> tuple[list[str], list[tuple[str, str]], list[str]]:
+    ) -> tuple[list[tuple[str, float | None]], list[tuple[str, str]], list[str]]:
         """Close everything on the named accounts, at market.
 
-        Returns (closed, failed, skipped-because-already-flat).
+        Returns (closed, failed, skipped-because-already-flat), where each closed entry carries
+        what the position actually settled at — read back from the venue, not computed here, and
+        None when it had not settled in time to be read.
 
         Each account is read before it is touched, and the flat ones are left completely alone.
         This is the point of the whole method rather than a nicety: on MEXC an order on the
@@ -810,7 +841,7 @@ class CopyService:
             if a.id in wanted
         ]
 
-        closed: list[str] = []
+        closed: list[tuple[str, float | None]] = []
         failed: list[tuple[str, str]] = []
         skipped: list[str] = []
 
@@ -830,6 +861,19 @@ class CopyService:
                 skipped.append(account.label)
                 self._account_status[account.id] = False
                 return
+            # Read the ids first: settlement history is per symbol, and matching on "most recent"
+            # would pick up an unrelated close from earlier on the same pair.
+            try:
+                ids_by_symbol = {
+                    symbol: [
+                        p.position_id
+                        for p in await client.get_open_positions(symbol)
+                        if p.hold_vol > 0
+                    ]
+                    for symbol in symbols
+                }
+            except MexcError:
+                ids_by_symbol = {}
             for symbol in symbols:
                 try:
                     await client.close_all(symbol)
@@ -837,7 +881,8 @@ class CopyService:
                     if not _is_already_flat(err):
                         failed.append((account.label, err.message or "не вдалося закрити"))
                         return
-            closed.append(account.label)
+            realized = await self._settled(client, ids_by_symbol)
+            closed.append((account.label, realized))
             self._account_status[account.id] = False
             await self._clear_expected_positions(account.id)
 

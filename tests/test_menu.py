@@ -132,3 +132,16 @@ def test_reverse_mode_with_no_followers_says_so_without_warning():
     text = render(mode=MODE_REVERSE, followers=[])
     assert "не обрано" not in text
     assert "ГРУПИ" in text
+
+
+def test_the_group_counts_include_the_master():
+    """It stands in one of the columns, so leaving it out of the number above them made a folder
+    of five and five report four and five."""
+    text = render(
+        mode=MODE_REVERSE,
+        master=account(1, MASTER, "Master", "AA00"),
+        followers=[account(i, FOLLOWER, f"F{i}", "BB11") for i in (2, 3, 4, 5)]
+        + [account(i, FOLLOWER, f"F{i}", "CC22", direction="REVERSE") for i in (6, 7, 8, 9, 10)],
+    )
+    assert "5 у групі 1" in text
+    assert "5 у групі 2" in text

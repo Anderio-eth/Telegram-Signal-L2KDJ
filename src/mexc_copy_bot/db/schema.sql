@@ -93,6 +93,9 @@ CREATE TABLE IF NOT EXISTS copy_folders (
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE copy_folders ADD COLUMN IF NOT EXISTS group_one_name TEXT;
+ALTER TABLE copy_folders ADD COLUMN IF NOT EXISTS group_two_name TEXT;
+
 CREATE INDEX IF NOT EXISTS copy_folders_owner ON copy_folders (owner_id, created_at);
 
 CREATE TABLE IF NOT EXISTS copy_accounts (

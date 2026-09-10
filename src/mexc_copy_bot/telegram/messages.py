@@ -127,17 +127,15 @@ def main_menu(
     lines = ["🤖 <b>MEXC COPY BOT</b>", "", t(lang, "menu_status", status=status)]
 
     if mode == MODE_REVERSE:
-        # Each account carries its own direction, so the headline is a count of both sides rather
-        # than one nominated account — with nine followers split five/four, naming one of them
-        # would describe almost nothing about what the folder is going to do.
-        reversed_count = sum(1 for f in followers if f.is_reversed)
+        # Counted over every account in the folder, master included. It was counting followers
+        # only, so a folder of five and five reported four and five — the master was standing in
+        # the left column and missing from the number above it.
+        everyone = ([master] if master else []) + followers
+        in_two = sum(1 for a in everyone if a.is_reversed)
         lines.append(
             t(lang, "menu_mode_reverse_none")
-            if not followers
-            else t(
-                lang, "menu_mode_reverse_split",
-                reverse=reversed_count, copy=len(followers) - reversed_count,
-            )
+            if not everyone
+            else t(lang, "menu_mode_reverse_split", reverse=in_two, copy=len(everyone) - in_two)
         )
     else:
         lines.append(t(lang, "menu_mode_copy"))

@@ -14,6 +14,8 @@ same thing by different names.
 
 from __future__ import annotations
 
+BREAK = chr(10) * 2
+
 UK = "uk"
 EN = "en"
 LANGUAGES = (UK, EN)
@@ -38,6 +40,14 @@ STRINGS: dict[str, dict[str, str]] = {
     "btn_dir_reverse": {UK: "2️⃣ Група 2", EN: "2️⃣ Group 2"},
     # The legs are numbered rather than named after a direction, because which way each one trades
     # is decided by whoever opens first — it is not a property of the group.
+    "rename_group_prompt": {
+        UK: "✏️ Нова назва для групи {n}?" + BREAK + "Надішли її повідомленням. /cancel — скасувати.",
+        EN: "✏️ New name for group {n}?" + BREAK + "Send it as a message. /cancel to abort.",
+    },
+    "rename_account_prompt": {
+        UK: "✏️ Нова назва для <b>{name}</b>?" + BREAK + "Надішли її повідомленням. /cancel — скасувати.",
+        EN: "✏️ New name for <b>{name}</b>?" + BREAK + "Send it as a message. /cancel to abort.",
+    },
     "group_one": {UK: "Група 1", EN: "Group 1"},
     "group_two": {UK: "Група 2", EN: "Group 2"},
     "group_side": {UK: "{name} — {side}", EN: "{name} — {side}"},

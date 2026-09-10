@@ -134,20 +134,29 @@ def test_cells_do_nothing_when_pressed():
 
 # ── closing one leg ────────────────────────────────────────────────────────
 class Position:
-    def __init__(self, symbol, hold_vol):
-        self.symbol, self.hold_vol = symbol, hold_vol
+    def __init__(self, symbol, hold_vol, position_id=1):
+        self.symbol, self.hold_vol, self.position_id = symbol, hold_vol, position_id
+
+
+class Settled:
+    def __init__(self, position_id, realised):
+        self.position_id, self.realised = position_id, realised
 
 
 class Client:
-    def __init__(self, positions, fail=None):
+    def __init__(self, positions, fail=None, settled=()):
         self.positions = positions
         self.fail = fail
+        self.settled = list(settled)
         self.closed = []
 
     async def get_open_positions(self, symbol=None):
         if isinstance(self.positions, Exception):
             raise self.positions
         return list(self.positions)
+
+    async def get_closed_positions(self, symbol=None, *, page_size=50):
+        return list(self.settled)
 
     async def close_all(self, symbol=None):
         if self.fail:
@@ -200,7 +209,7 @@ def test_an_account_already_flat_is_never_sent_an_order():
 def test_an_account_holding_something_is_closed():
     client = Client(positions=[Position("SILVER_USDT", 100.0)])
     (closed, failed, skipped), _ = run_close([account(1)], [client], [1])
-    assert closed == ["Follower 1"]
+    assert [label for label, _ in closed] == ["Follower 1"]
     assert not failed and not skipped
     assert client.closed == ["SILVER_USDT"]
 
@@ -224,7 +233,7 @@ def test_only_the_named_accounts_are_touched():
     """Close all under one leg must not reach into the other."""
     client = Client(positions=[Position("SILVER_USDT", 100.0)])
     (closed, _, _), _ = run_close([account(1), account(2, direction="REVERSE")], [client], [1])
-    assert closed == ["Follower 1"]
+    assert [label for label, _ in closed] == ["Follower 1"]
 
 
 # ── the headings ───────────────────────────────────────────────────────────
@@ -252,3 +261,30 @@ def test_a_leg_that_disagrees_with_itself_claims_nothing():
 
     left, _ = reverse_columns(None, [account(1), account(2)], {}, {})
     assert group_title(left, {1: 1, 2: 2}, "Група 1") == "Група 1"
+
+
+def test_a_closed_account_reports_what_it_settled_at():
+    """Read back from the venue rather than derived from prices here: that figure is net of fees
+    and is the one that moved the balance."""
+    client = Client(
+        positions=[Position("SILVER_USDT", 100.0, position_id=77)],
+        settled=[Settled(77, 12.34)],
+    )
+    (closed, _, _), _ = run_close([account(1)], [client], [1])
+    assert closed == [("Follower 1", 12.34)]
+
+
+def test_a_settlement_that_never_arrives_is_none_not_zero():
+    """Zero would read as "this one broke even", which is a claim about money nobody verified."""
+    client = Client(positions=[Position("SILVER_USDT", 100.0, position_id=77)], settled=[])
+    (closed, _, _), _ = run_close([account(1)], [client], [1])
+    assert closed == [("Follower 1", None)]
+
+
+# ── names ──────────────────────────────────────────────────────────────────
+def test_a_renamed_leg_keeps_its_direction_in_the_heading():
+    from mexc_copy_bot.telegram.messages import group_title
+
+    left, _ = reverse_columns(None, [account(1)], {}, {})
+    assert group_title(left, {1: 1}, "ЛОНГИ") == "ЛОНГИ — LONG"
+    assert group_title(left, {}, "ЛОНГИ") == "ЛОНГИ"
