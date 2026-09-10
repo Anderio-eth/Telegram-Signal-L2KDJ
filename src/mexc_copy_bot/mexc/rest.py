@@ -289,6 +289,26 @@ class MexcRestClient:
                 return float(asset.get("equity", 0)), float(asset.get("availableBalance", 0))
         return 0.0, 0.0
 
+    async def get_open_positions_raw(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        """Open positions exactly as the venue sends them.
+
+        The rows carry the same fields the websocket's position frames do — positionId, version,
+        state, realised — so they can go through the same parser and produce the same events. That
+        is what lets the bot keep working on a network where the socket host is blocked.
+        """
+        params = {"symbol": symbol} if symbol else None
+        rows = await self._request("GET", "/private/position/open_positions", params=params) or []
+        return [row for row in rows if isinstance(row, dict)]
+
+    async def get_closed_positions_raw(self, symbol: str | None = None, *, page_size: int = 50) -> list[dict[str, Any]]:
+        """Finished positions, unparsed. A settled row reads holdVol 0, state 3 and its realised
+        PnL — the same shape as the socket's closing frame."""
+        params: dict[str, Any] = {"page_num": 1, "page_size": page_size}
+        if symbol:
+            params["symbol"] = symbol
+        rows = await self._request("GET", "/private/position/list/history_positions", params=params) or []
+        return [row for row in rows if isinstance(row, dict)]
+
     async def get_open_positions(self, symbol: str | None = None) -> list[Position]:
         params = {"symbol": symbol} if symbol else None
         rows = await self._request("GET", "/private/position/open_positions", params=params) or []

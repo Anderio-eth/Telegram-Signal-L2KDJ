@@ -54,6 +54,23 @@ CONNECT_TIMEOUT_SECONDS = 12.0
 # It is one request per second against an endpoint that has no per-order cost.
 ORDER_POLL_SECONDS = 1.0
 
+# How often the master's POSITIONS are re-read over REST.
+#
+# The websocket is the fast path, but it is not a dependency. Its host, contract.mexc.com, is the
+# one MEXC blocks at the CDN for some networks — the REST client has pointed at api.mexc.com for
+# exactly that reason since order submission there returned 403 — and from Render the socket now
+# gets "403 Invalid response status" on every attempt, forever. With positions arriving only over
+# that socket, the whole bot went quiet while its logs filled with reconnects.
+#
+# The REST rows carry the same fields the frames do: positionId, version, state, realised. So the
+# same parser, the same tracker and the same dedupe key serve both, and whichever notices a change
+# first, it is copied exactly once.
+POSITION_POLL_SECONDS = 2.0
+
+# How long a successful REST poll keeps counting as "the master is being watched". A few missed
+# polls are a blip; beyond this the reader should be told something is wrong.
+POSITION_POLL_STALE_SECONDS = 15.0
+
 # Named rather than inlined: patching this file has repeatedly turned an escaped newline into a
 # real one, which is a syntax error that only surfaces at import.
 NEWLINE = chr(10)
@@ -100,6 +117,14 @@ class CopyService:
         self._filled_by_limit: dict[tuple[str, int], float] = {}
         self._reconcile_task: asyncio.Task[None] | None = None
         self._order_poll_task: asyncio.Task[None] | None = None
+        self._position_poll_task: asyncio.Task[None] | None = None
+        # (symbol, position type) -> position id, as of the last REST poll. A closed position
+        # simply stops being listed, so the only way to notice a close over REST is to remember
+        # what was there a moment ago.
+        self._seen_positions: dict[tuple[str, int], int] = {}
+        # When the REST poll last succeeded, so the menu can tell "being watched over REST" from
+        # "not being watched at all".
+        self._last_position_poll: float | None = None
         # Master order ids currently resting in the book, as of the last poll.
         self._resting: set[str] = set()
         # None until the socket first reports in, so the initial connect can stay quiet.
@@ -134,7 +159,19 @@ class CopyService:
 
     @property
     def master_connected(self) -> bool:
-        return bool(self._ws and self._ws.connected)
+        """Whether the master is actually being watched, by either route.
+
+        Not "is the socket up". The socket is the fast path, not the only one, and on a network
+        where its host is blocked it never comes up at all — a menu keyed to it alone would have
+        said "reconnecting" forever while every trade was being copied correctly over REST. What
+        the reader needs to know is whether the master is being seen, so that is what this answers.
+        """
+        if self._ws and self._ws.connected:
+            return True
+        if self._last_position_poll is None:
+            return False
+        age = asyncio.get_running_loop().time() - self._last_position_poll
+        return age <= POSITION_POLL_STALE_SECONDS
 
     async def start(self) -> str:
         if self._ws:
@@ -163,18 +200,25 @@ class CopyService:
         self._ws.start()
         self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
         self._order_poll_task = asyncio.create_task(self._order_poll_loop(), name="orders")
+        self._position_poll_task = asyncio.create_task(self._position_poll_loop(), name="positions")
         await self._store.set_running(self._folder_id, True)
 
         if await self._ws.wait_connected(CONNECT_TIMEOUT_SECONDS):
             return "✅ Копіювання запущено — майстер підключений."
-        # Not an error: the socket keeps retrying on its own. But reporting a flat "started" while
-        # nothing is listening to the master is the kind of half-truth that gets noticed only
-        # after a missed trade.
-        return "⚠️ Копіювання запущено, але майстер ще не підключився — пробую далі."
+        # No socket. That used to mean nothing was watching the master; it no longer does, because
+        # positions are polled over REST as well. Which of the two is true matters to whoever just
+        # pressed START, so they are told apart rather than both reported as a warning.
+        if self.master_connected:
+            return (
+                "✅ Копіювання запущено — майстер читається через REST."
+                + NEWLINE
+                + "(Вебсокет недоступний з цієї мережі, копіювання це не спиняє.)"
+            )
+        return "⚠️ Копіювання запущено, але майстра ще не видно — пробую далі."
 
     async def stop(self) -> str:
         """Stop copying NEW actions. Existing follower positions are left untouched (spec §7)."""
-        for name in ("_reconcile_task", "_order_poll_task"):
+        for name in ("_reconcile_task", "_order_poll_task", "_position_poll_task"):
             task = getattr(self, name)
             if task:
                 task.cancel()
@@ -405,7 +449,8 @@ class CopyService:
                         "",
                         detail or "звʼязок втрачено",
                         "",
-                        "Копіювання призупинено, перепідключаюсь автоматично.",
+                        "Копіювання триває — позиції читаються через REST. "
+                        "Перепідключаюсь автоматично.",
                     ]
                 )
             )
@@ -607,6 +652,86 @@ class CopyService:
         if not credentials:
             return None
         return MexcRestClient(*credentials, session=self._session)
+
+    async def _position_poll_loop(self) -> None:
+        """Read the master's positions over REST, continuously.
+
+        Runs alongside the websocket rather than instead of it. The socket is faster when it is
+        available; this is what keeps the bot working when it is not, which on Render is always —
+        contract.mexc.com answers the socket with 403 there, the same CDN block that already forced
+        REST onto api.mexc.com.
+
+        Nothing is emitted for the first pass. Positions already open when copying starts belong to
+        before the bot's time, and announcing them would copy a trade whose entry price is long
+        gone.
+        """
+        client = await self._master_client()
+        if client:
+            with contextlib.suppress(Exception):
+                for position in await client.get_open_positions():
+                    if position.hold_vol > 0:
+                        self._seen_positions[(position.symbol, position.position_type)] = position.position_id
+                self._last_position_poll = asyncio.get_running_loop().time()
+                LOGGER.info("seeded with %d open master position(s)", len(self._seen_positions))
+
+        while True:
+            await asyncio.sleep(POSITION_POLL_SECONDS)
+            try:
+                await self._poll_positions_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — polling must never kill the service
+                LOGGER.exception("position poll failed")
+
+    async def _poll_positions_once(self) -> None:
+        client = await self._master_client()
+        if not client:
+            return
+        try:
+            rows = await client.get_open_positions_raw()
+        except MexcError as err:
+            LOGGER.info("could not read master positions: %s", err)
+            return
+
+        self._last_position_poll = asyncio.get_running_loop().time()
+
+        live: dict[tuple[str, int], int] = {}
+        for row in rows:
+            snapshot = parse_position(row)
+            if not snapshot or snapshot.hold_vol <= 0:
+                continue
+            live[snapshot.key] = snapshot.position_id or 0
+            await self._handle_position(row)
+
+        # Anything held a moment ago and not listed now has been closed. Over REST a close is an
+        # absence, so it has to be looked up: the finished row carries holdVol 0, state 3 and the
+        # realised PnL, which is the same shape the socket's close frame has and therefore produces
+        # the same event.
+        for key, position_id in list(self._seen_positions.items()):
+            if key in live:
+                continue
+            symbol, _ = key
+            closed_row = await self._closed_row(client, symbol, position_id)
+            if closed_row is None:
+                # Not settled yet. Left in place so the next pass tries again rather than
+                # forgetting a close ever happened.
+                continue
+            await self._handle_position(closed_row)
+            self._seen_positions.pop(key, None)
+
+        self._seen_positions.update(live)
+
+    async def _closed_row(self, client: MexcRestClient, symbol: str, position_id: int) -> dict | None:
+        """The finished position, exactly as the venue reports it."""
+        try:
+            rows = await client.get_closed_positions_raw(symbol)
+        except MexcError as err:
+            LOGGER.info("could not read the settled position for %s: %s", symbol, err)
+            return None
+        for row in rows:
+            if int(row.get("positionId") or 0) == position_id:
+                return row
+        return None
 
     async def _order_poll_loop(self) -> None:
         """Read the master's resting orders over REST, continuously.
@@ -987,6 +1112,10 @@ class CopyService:
             await self._dispatch(event, data)
 
     async def _dispatch(self, event: MasterEvent, raw: dict) -> None:
+        # The tracker builds the event from a diff and has no frame to attach, so the frame is
+        # attached here — before anything reads it. Without this the master's realised PnL is
+        # always missing, because the only place it exists is the frame.
+        event = replace(event, raw=raw)
         event_id = await self._store.record_event(
             owner_id=self._owner_id,
             dedupe_key=event.dedupe_key,
