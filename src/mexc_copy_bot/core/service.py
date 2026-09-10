@@ -37,7 +37,7 @@ from ..db.store import (
 )
 from ..mexc.rest import MexcError, MexcRestClient, PositionStops
 from ..mexc.websocket import MasterWebSocket
-from .copy_engine import CopyEngine, FollowerResult
+from .copy_engine import CopyEngine, FollowerResult, _is_already_flat
 from .events import Action, MasterEvent, MasterPositionTracker, PositionSnapshot, parse_position
 from .orders import MasterOrderTracker, OrderAction, parse_order, reduces_position
 
@@ -70,6 +70,17 @@ POSITION_POLL_SECONDS = 2.0
 # How long a successful REST poll keeps counting as "the master is being watched". A few missed
 # polls are a blip; beyond this the reader should be told something is wrong.
 POSITION_POLL_STALE_SECONDS = 15.0
+
+# How often every account in the folder is checked for whether it is holding anything.
+#
+# The master alone is not enough here. A follower can be liquidated, or closed by hand in the app,
+# and nothing about that reaches this process — the position simply stops existing on an account
+# nobody is reading. The REVERSE screen shows a light per account, and a light that only tells the
+# truth after you press refresh is worse than no light.
+#
+# Ten accounts three times a minute is half a request a second against an allowance of seven, so
+# it costs nothing worth counting.
+STATUS_POLL_SECONDS = 20.0
 
 # Named rather than inlined: patching this file has repeatedly turned an escaped newline into a
 # real one, which is a syntax error that only surfaces at import.
@@ -122,6 +133,7 @@ class CopyService:
         self._reconcile_task: asyncio.Task[None] | None = None
         self._order_poll_task: asyncio.Task[None] | None = None
         self._position_poll_task: asyncio.Task[None] | None = None
+        self._status_poll_task: asyncio.Task[None] | None = None
         # (symbol, position type) -> position id, as of the last REST poll. A closed position
         # simply stops being listed, so the only way to notice a close over REST is to remember
         # what was there a moment ago.
@@ -129,6 +141,10 @@ class CopyService:
         # When the REST poll last succeeded, so the menu can tell "being watched over REST" from
         # "not being watched at all".
         self._last_position_poll: float | None = None
+        # account id -> is it holding anything at all. Any symbol counts: this answers "is there a
+        # position on this account", which is what someone watching a hedge needs to know, and a
+        # position opened by hand in the app is still a position.
+        self._account_status: dict[int, bool] = {}
         # Master order ids currently resting in the book, as of the last poll.
         self._resting: set[str] = set()
         # None until the socket first reports in, so the initial connect can stay quiet.
@@ -205,6 +221,7 @@ class CopyService:
         self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
         self._order_poll_task = asyncio.create_task(self._order_poll_loop(), name="orders")
         self._position_poll_task = asyncio.create_task(self._position_poll_loop(), name="positions")
+        self._status_poll_task = asyncio.create_task(self._status_poll_loop(), name="status")
         await self._store.set_running(self._folder_id, True)
 
         if await self._ws.wait_connected(CONNECT_TIMEOUT_SECONDS):
@@ -222,7 +239,7 @@ class CopyService:
 
     async def stop(self) -> str:
         """Stop copying NEW actions. Existing follower positions are left untouched (spec §7)."""
-        for name in ("_reconcile_task", "_order_poll_task", "_position_poll_task"):
+        for name in ("_reconcile_task", "_order_poll_task", "_position_poll_task", "_status_poll_task"):
             task = getattr(self, name)
             if task:
                 task.cancel()
@@ -656,6 +673,127 @@ class CopyService:
         if not credentials:
             return None
         return MexcRestClient(*credentials, session=self._session)
+
+    # ── what each account is holding ────────────────────────────────────────────────────────
+    @property
+    def account_status(self) -> dict[int, bool]:
+        """Last known "is this account holding something", by account id.
+
+        A copy, so a screen rendering it cannot be caught mid-update by the poller.
+        """
+        return dict(self._account_status)
+
+    async def refresh_account_status(self) -> dict[int, bool]:
+        """Ask every account in the folder whether it is holding anything.
+
+        Concurrent, because ten sequential round trips between pressing a button and seeing the
+        answer is the difference between a screen that feels live and one that does not. Failures
+        are per account: one revoked key must not blank out everybody else's light — the previous
+        answer is kept instead, which is closer to the truth than inventing "flat".
+        """
+        if not self._session:
+            return self.account_status
+
+        master = await self._store.get_master(self._folder_id)
+        accounts = ([master] if master else []) + await self._store.list_accounts(
+            self._folder_id, FOLLOWER
+        )
+        if not accounts:
+            return {}
+
+        async def holding(account: Account) -> tuple[int, bool | None]:
+            credentials = await self._store.get_credentials(account.id, self._owner_id)
+            if not credentials:
+                return account.id, None
+            client = MexcRestClient(*credentials, session=self._session)
+            try:
+                positions = await client.get_open_positions()
+            except (MexcError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+                LOGGER.info("could not read %s's positions: %s", account.label, err)
+                return account.id, None
+            return account.id, any(p.hold_vol > 0 for p in positions)
+
+        for account_id, held in await asyncio.gather(*(holding(a) for a in accounts)):
+            if held is not None:
+                self._account_status[account_id] = held
+
+        # Accounts that have since been deleted must not keep a light on the screen.
+        live = {a.id for a in accounts}
+        self._account_status = {k: v for k, v in self._account_status.items() if k in live}
+        return self.account_status
+
+    async def _status_poll_loop(self) -> None:
+        while True:
+            await asyncio.sleep(STATUS_POLL_SECONDS)
+            try:
+                await self.refresh_account_status()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — a status light must never kill the service
+                LOGGER.exception("account status poll failed")
+
+    async def close_accounts(
+        self, account_ids: list[int]
+    ) -> tuple[list[str], list[tuple[str, str]], list[str]]:
+        """Close everything on the named accounts, at market.
+
+        Returns (closed, failed, skipped-because-already-flat).
+
+        Each account is read before it is touched, and the flat ones are left completely alone.
+        This is the point of the whole method rather than a nicety: on MEXC an order on the
+        opposite side of a flat account OPENS a position instead of closing one, so a blanket
+        "close them all" sent to an account someone had already closed by hand would put it
+        straight back in, facing the other way. close_all on a flat account is the same hazard
+        wearing a safer name — it returns an error the caller would report as a failure — so the
+        read comes first either way.
+
+        Deliberately not scoped to a symbol: this answers "get me out of this leg", and a leg is
+        held in whatever the master has been trading.
+        """
+        if not self._session or not account_ids:
+            return [], [], []
+
+        wanted = set(account_ids)
+        master = await self._store.get_master(self._folder_id)
+        accounts = [
+            a
+            for a in (([master] if master else []) + await self._store.list_accounts(self._folder_id, FOLLOWER))
+            if a.id in wanted
+        ]
+
+        closed: list[str] = []
+        failed: list[tuple[str, str]] = []
+        skipped: list[str] = []
+
+        async def one(account: Account) -> None:
+            credentials = await self._store.get_credentials(account.id, self._owner_id)
+            if not credentials:
+                failed.append((account.label, "немає ключів"))
+                return
+            client = MexcRestClient(*credentials, session=self._session)
+            try:
+                symbols = {p.symbol for p in await client.get_open_positions() if p.hold_vol > 0}
+            except MexcError as err:
+                # Unknown is not "flat". Reported, so nobody reads silence as "already closed".
+                failed.append((account.label, err.message or "не вдалося прочитати позиції"))
+                return
+            if not symbols:
+                skipped.append(account.label)
+                self._account_status[account.id] = False
+                return
+            for symbol in symbols:
+                try:
+                    await client.close_all(symbol)
+                except MexcError as err:
+                    if not _is_already_flat(err):
+                        failed.append((account.label, err.message or "не вдалося закрити"))
+                        return
+            closed.append(account.label)
+            self._account_status[account.id] = False
+            await self._clear_expected_positions(account.id)
+
+        await asyncio.gather(*(one(a) for a in accounts), return_exceptions=True)
+        return closed, failed, skipped
 
     async def _skip_reverse_close(self, event: MasterEvent) -> None:
         """In REVERSE the master's exit is not the hedge's exit.

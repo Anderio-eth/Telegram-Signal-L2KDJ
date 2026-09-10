@@ -18,6 +18,7 @@ because the store requires the owner too.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 
@@ -75,12 +76,53 @@ NEWLINE = chr(10)
 BALANCE_TTL_SECONDS = 5.0
 
 
-def _menu_keyboard(running: bool, lang: str, stuck: int = 0, folder: str = "") -> InlineKeyboardMarkup:
+def _column_rows(left: list, right: list, lang: str) -> list[list[InlineKeyboardButton]]:
+    """The two legs, side by side, one account per cell.
+
+    Buttons rather than text because a keyboard aligns its columns and a message does not: the
+    balances and the lights line up under each other, so the whole folder reads at a glance
+    instead of being counted. The cells do nothing when pressed — they are a display that happens
+    to be made of buttons.
+
+    The shorter column is padded with blanks, or Telegram would slide the remaining cells of the
+    longer one across into the wrong leg.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    blank = InlineKeyboardButton(" ", callback_data="noop")
+    for index in range(max(len(left), len(right))):
+        row = []
+        row.append(
+            InlineKeyboardButton(left[index].text(), callback_data="noop") if index < len(left) else blank
+        )
+        row.append(
+            InlineKeyboardButton(right[index].text(), callback_data="noop") if index < len(right) else blank
+        )
+        rows.append(row)
+
+    if left or right:
+        rows.append([
+            InlineKeyboardButton(t(lang, "btn_close_column"), callback_data="closecol:master")
+            if left else blank,
+            InlineKeyboardButton(t(lang, "btn_close_column"), callback_data="closecol:opposite")
+            if right else blank,
+        ])
+    return rows
+
+
+def _menu_keyboard(
+    running: bool,
+    lang: str,
+    stuck: int = 0,
+    folder: str = "",
+    columns: tuple[list, list] | None = None,
+) -> InlineKeyboardMarkup:
     control = (
         InlineKeyboardButton(t(lang, "btn_stop"), callback_data="stop")
         if running
         else InlineKeyboardButton(t(lang, "btn_start"), callback_data="start")
     )
+    # The legs sit directly under Refresh, because Refresh is what updates the balances in them.
+    legs = _column_rows(*columns, lang) if columns else []
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(t(lang, "btn_positions"), callback_data="positions"),
@@ -90,6 +132,9 @@ def _menu_keyboard(running: bool, lang: str, stuck: int = 0, folder: str = "") -
             [InlineKeyboardButton(t(lang, "btn_folder", name=folder), callback_data="folders")],
             [InlineKeyboardButton(t(lang, "btn_refresh"), callback_data="menu"),
              InlineKeyboardButton(t(lang, "btn_lang"), callback_data="lang")],
+        ]
+        + legs
+        + [
             [control],
             [InlineKeyboardButton(t(lang, "btn_emergency"), callback_data="emergency")],
         ]
@@ -136,6 +181,10 @@ class CopyBot:
         self._folder_cache: dict[int, int] = {}
         # Sessions opened for stuck-account work while copying is stopped, closed on shutdown.
         self._own_sessions: list[aiohttp.ClientSession] = []
+        # owner id -> (chat, message) of the menu currently on screen. Kept so a trade report can
+        # bring the lights and balances up to date without waiting for someone to press Refresh —
+        # which is the whole point of a light.
+        self._menu_message: dict[int, tuple[int, int]] = {}
 
         registry.configure_callbacks(on_report=self._report_for, on_notice=self._notice_for)
 
@@ -265,6 +314,7 @@ class CopyBot:
             balances=await self._balances(owner_id, accounts),
             mode=mode,
             lang=lang,
+            listed_in_columns=mode == MODE_REVERSE and bool(accounts),
         )
 
     async def _balances(self, owner_id: int, accounts: list[Account]) -> dict[int, messages.Balance]:
@@ -321,19 +371,48 @@ class CopyBot:
         would look like the change had not taken."""
         self._balance_cache.pop(owner_id, None)
 
-    async def _show_menu(self, update: Update, owner_id: int) -> None:
-        service = await self._registry.get(self._folder(owner_id), owner_id)
-        text = await self._menu_text(owner_id)
-        keyboard = _menu_keyboard(
-            service.running,
-            await self._lang(owner_id),
-            await self._stuck_count(owner_id),
-            await self._folder_name(owner_id),
+    async def _menu_columns(self, owner_id: int) -> tuple[list, list] | None:
+        """The two legs, or None when this folder is not in REVERSE.
+
+        Only REVERSE has legs to show. In COPY every account does the same thing, so a column per
+        direction would be one column and a screenful of cells saying so.
+        """
+        folder_id = self._folder(owner_id)
+        mode, _ = await self._store.get_mode(folder_id)
+        if mode != MODE_REVERSE:
+            return None
+        master = await self._store.get_master(folder_id)
+        followers = await self._store.list_accounts(folder_id, FOLLOWER)
+        if not master and not followers:
+            return None
+        service = await self._registry.get(folder_id, owner_id)
+        accounts = ([master] if master else []) + followers
+        return messages.reverse_columns(
+            master, followers, await self._balances(owner_id, accounts), service.account_status
         )
+
+    async def _menu_view(self, owner_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        service = await self._registry.get(self._folder(owner_id), owner_id)
+        return (
+            await self._menu_text(owner_id),
+            _menu_keyboard(
+                service.running,
+                await self._lang(owner_id),
+                await self._stuck_count(owner_id),
+                await self._folder_name(owner_id),
+                await self._menu_columns(owner_id),
+            ),
+        )
+
+    async def _show_menu(self, update: Update, owner_id: int) -> None:
+        text, keyboard = await self._menu_view(owner_id)
         if update.callback_query:
+            message = update.callback_query.message
+            self._menu_message[owner_id] = (message.chat_id, message.message_id)
             await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         elif update.message:
-            await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            sent = await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            self._menu_message[owner_id] = (sent.chat_id, sent.message_id)
 
     async def _cmd_start(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         owner_id = await self._guard(update)
@@ -352,7 +431,18 @@ class CopyBot:
         service = await self._registry.get(self._folder(owner_id), owner_id)
 
         if action == "menu":
+            # Refresh is the button pressed to find out what is true now, so it asks rather than
+            # redrawing what was already on screen.
+            self._invalidate_balances(owner_id)
+            with contextlib.suppress(Exception):
+                await service.refresh_account_status()
             await self._show_menu(update, owner_id)
+        elif action == "noop":
+            # The cells in the two legs are a display made of buttons; pressing one does nothing,
+            # and the answer above already cleared Telegram's spinner.
+            pass
+        elif action.startswith("closecol:"):
+            await self._close_column(update, owner_id, action.split(":", 1)[1])
         elif action == "start":
             await query.edit_message_text(await service.start())
             await self._show_menu_message(owner_id)
@@ -504,6 +594,47 @@ class CopyBot:
             LOGGER.warning("unhandled button %r from %s", action, owner_id)
             await self._show_menu(update, owner_id)
 
+    async def _close_column(self, update: Update, owner_id: int, leg: str) -> None:
+        """Close one leg at market, touching only the accounts that actually hold something.
+
+        The skip is not politeness, it is the whole safety of the button. On MEXC an order on the
+        opposite side of a flat account opens a position rather than closing one, so sending a
+        close to an account already closed by hand would put it right back in, facing the other
+        way. Accounts are read first and the flat ones are named, not silently passed over.
+        """
+        lang = await self._lang(owner_id)
+        folder_id = self._folder(owner_id)
+        service = await self._registry.get(folder_id, owner_id)
+
+        master = await self._store.get_master(folder_id)
+        followers = await self._store.list_accounts(folder_id, FOLLOWER)
+        wanted = (
+            [a for a in followers if a.is_reversed]
+            if leg == "opposite"
+            else ([master] if master else []) + [a for a in followers if not a.is_reversed]
+        )
+        side = t(lang, "column_opposite" if leg == "opposite" else "column_as_master")
+
+        closed, failed, skipped = await service.close_accounts([a.id for a in wanted])
+
+        lines = [t(lang, "closed_column", side=side), ""]
+        if not closed and not failed:
+            lines.append(t(lang, "column_nothing_open"))
+        lines += [f"✅ {label}" for label in closed]
+        lines += [f"❌ {label} — {error}" for label, error in failed]
+        if skipped:
+            lines.append("")
+            lines.append(t(lang, "column_skipped", names=", ".join(skipped)))
+
+        await update.callback_query.edit_message_text(
+            NEWLINE.join(lines),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu")]]
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        self._invalidate_balances(owner_id)
+
     def _chat_for(self, owner_id: int) -> int:
         """Where to message this owner.
 
@@ -517,18 +648,11 @@ class CopyBot:
         chat_id = self._chat_for(owner_id)
         if not (self._app and chat_id):
             return
-        service = await self._registry.get(self._folder(owner_id), owner_id)
-        await self._app.bot.send_message(
-            chat_id,
-            await self._menu_text(owner_id),
-            reply_markup=_menu_keyboard(
-                service.running,
-                await self._lang(owner_id),
-                await self._stuck_count(owner_id),
-                await self._folder_name(owner_id),
-            ),
-            parse_mode=ParseMode.HTML,
+        text, keyboard = await self._menu_view(owner_id)
+        sent = await self._app.bot.send_message(
+            chat_id, text, reply_markup=keyboard, parse_mode=ParseMode.HTML
         )
+        self._menu_message[owner_id] = (sent.chat_id, sent.message_id)
 
     async def _refuse_while_running(self, update: Update, owner_id: int) -> bool:
         """Mode changes are refused while copying is on.
@@ -1197,3 +1321,35 @@ class CopyBot:
             # Same reasoning as _notice_for: these lines carry exchange text, and one stray "<"
             # in an error message would otherwise cost the whole trade report.
             await self._app.bot.send_message(chat_id, text)
+        await self._refresh_menu(owner_id)
+
+    async def _refresh_menu(self, owner_id: int) -> None:
+        """Bring the menu already on screen up to date, in place.
+
+        Called after a trade, so the lights and balances move with the report rather than waiting
+        for someone to press Refresh — a light that is only true after you ask is not doing the
+        job of a light.
+
+        Everything here is best-effort. The trade has already happened; failing to redraw a
+        keyboard must never surface as an error about it.
+        """
+        target = self._menu_message.get(owner_id)
+        if not (self._app and target):
+            return
+        chat_id, message_id = target
+        try:
+            service = await self._registry.get(self._folder(owner_id), owner_id)
+            await service.refresh_account_status()
+            self._invalidate_balances(owner_id)
+            text, keyboard = await self._menu_view(owner_id)
+            await self._app.bot.edit_message_text(
+                text, chat_id=chat_id, message_id=message_id,
+                reply_markup=keyboard, parse_mode=ParseMode.HTML,
+            )
+        except BadRequest as err:
+            # "Message is not modified" means the screen already says this. Nothing to do, and
+            # nothing worth logging as a problem.
+            if "not modified" not in str(err).lower():
+                LOGGER.info("could not refresh the menu for %s: %s", owner_id, err)
+        except Exception:  # noqa: BLE001 — a redraw must not report itself as a trade failure
+            LOGGER.info("could not refresh the menu for %s", owner_id, exc_info=True)

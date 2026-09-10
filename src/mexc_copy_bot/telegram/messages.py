@@ -104,6 +104,7 @@ def main_menu(
     balances: dict[int, Balance] | None = None,
     mode: str = "COPY",
     lang: str = DEFAULT,
+    listed_in_columns: bool = False,
 ) -> str:
     """The main screen.
 
@@ -141,6 +142,14 @@ def main_menu(
     else:
         lines.append(t(lang, "menu_mode_copy"))
     lines.append("")
+
+    if listed_in_columns:
+        # The accounts are on the keyboard below, one cell each with a balance and a light.
+        # Repeating them here would put the same numbers on screen twice, and the two copies
+        # would disagree the moment one of them was a moment older than the other.
+        if not master:
+            lines.append(t(lang, "master_not_set"))
+        return chr(10).join(lines).rstrip()
 
     if not master:
         lines.append(t(lang, "master_not_set"))
@@ -378,3 +387,73 @@ def history(events: list[dict], lang: str = DEFAULT) -> str:
                 line += f" ({e['pnl_count']}/{e['ok']})"
         lines.append(line)
     return "\n".join(lines)
+
+# ── the REVERSE screen's two columns ────────────────────────────────────────────────────────
+def compact_money(value: float | None) -> str:
+    """A balance small enough to sit in a button next to a name and a light.
+
+    Whole dollars above one, because the cents in "$1,247.38" cost three characters to say
+    nothing you would act on. Under a dollar they are the only part that carries information, so
+    they stay.
+    """
+    if value is None:
+        return "—"
+    if abs(value) >= 1 or value == 0:
+        return f"${value:,.0f}"
+    return f"${value:.2f}"
+
+
+@dataclass(frozen=True)
+class Cell:
+    """One account as it appears in a column."""
+
+    account_id: int
+    label: str
+    balance: float | None
+    holding: bool
+
+    def text(self) -> str:
+        # The light goes last so the eye can run down the right-hand edge of a column and see
+        # which accounts are in and which are not, without reading a single name.
+        return f"{self.label}  {compact_money(self.balance)}  {'🟢' if self.holding else '🔴'}"
+
+
+def reverse_columns(
+    master: Account | None,
+    followers: list[Account],
+    balances: dict[int, Balance],
+    holding: dict[int, bool],
+) -> tuple[list[Cell], list[Cell]]:
+    """Split a folder into the two legs the REVERSE screen shows.
+
+    Left is everything trading the master's way — the master itself included. It is listed there
+    rather than above because after the entry it is exactly that and nothing more: its own exit
+    moves no other account, so singling it out would suggest an authority it does not have.
+
+    Right is everything trading against the master.
+
+    Numbering runs within each column. The account's stored label is not used: "Follower #7" says
+    nothing about which way it trades, and which way it trades is the only thing this screen is
+    about.
+    """
+    def balance_of(account: Account) -> float | None:
+        entry = balances.get(account.id)
+        return entry.available if entry and entry.error is None else None
+
+    left: list[Cell] = []
+    right: list[Cell] = []
+
+    if master:
+        left.append(Cell(master.id, "Master", balance_of(master), holding.get(master.id, False)))
+
+    for account in followers:
+        column = right if account.is_reversed else left
+        side = "opposite" if account.is_reversed else "as master"
+        # Counted over the accounts already placed in this column under the same heading, so the
+        # master sitting at the top of the left one does not consume a follower's number.
+        index = sum(1 for c in column if c.label.startswith(side)) + 1
+        column.append(
+            Cell(account.id, f"{side} {index}", balance_of(account), holding.get(account.id, False))
+        )
+
+    return left, right

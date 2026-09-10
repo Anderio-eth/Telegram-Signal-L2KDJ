@@ -83,6 +83,18 @@ STRINGS: dict[str, dict[str, str]] = {
     "available": {UK: "{equity} (вільно {available})", EN: "{equity} (available {available})"},
     # Shown only when part of the wallet cannot back a position — bonus credit, usually. Without
     # it the menu reads "there is money" while every order is refused.
+    "btn_close_column": {UK: "✖ Закрити всі", EN: "✖ Close all"},
+    "closed_column": {
+        UK: "✖ <b>ЗАКРИТО НАПРЯМОК: {side}</b>",
+        EN: "✖ <b>CLOSED THE {side} LEG</b>",
+    },
+    "column_as_master": {UK: "за майстром", EN: "as master"},
+    "column_opposite": {UK: "навпаки", EN: "opposite"},
+    "column_nothing_open": {
+        UK: "У цьому напрямку немає жодної відкритої позиції — нічого не відправлено.",
+        EN: "Nothing is open on this leg — nothing was sent.",
+    },
+    "column_skipped": {UK: "Пропущено (вже без позиції): {names}", EN: "Skipped (already flat): {names}"},
     "not_openable": {
         UK: "  ⚠️ {amount} не йде під позицію",
         EN: "  ⚠️ {amount} cannot back a position",
