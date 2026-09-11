@@ -139,11 +139,6 @@ STRINGS: dict[str, dict[str, str]] = {
     "mode_title": {UK: "⚙️ <b>РЕЖИМ</b>", EN: "⚙️ <b>MODE</b>"},
     "mode_now_reverse": {UK: "Зараз: 🔁 <b>ГРУПИ</b>", EN: "Currently: 🔁 <b>GROUPS</b>"},
     "mode_now_copy": {UK: "Зараз: 📋 <b>КОПІЮВАННЯ</b>", EN: "Currently: 📋 <b>COPY</b>"},
-    "mode_hedging_on": {UK: "Хеджує на: <b>{label}</b>", EN: "Hedging on: <b>{label}</b>"},
-    "mode_no_hedge": {
-        UK: "⚠️ Акаунт не обрано — нічого копіюватись не буде.",
-        EN: "⚠️ No account chosen — nothing will be mirrored.",
-    },
     "mode_mirroring_all": {
         UK: "Дзеркалить майстра на всі {n} акаунт(и).",
         EN: "Mirroring the master onto all {n} follower(s).",

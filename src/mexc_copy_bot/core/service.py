@@ -214,7 +214,9 @@ class CopyService:
     # ── lifecycle ───────────────────────────────────────────────────────────────────────────
     @property
     def running(self) -> bool:
-        return self._ws is not None
+        # Not "is there a socket": a groups folder runs without one, watching every account over
+        # REST instead. What running means is that the background work is going.
+        return self._ws is not None or self._position_poll_task is not None
 
     @property
     def master_connected(self) -> bool:
@@ -236,15 +238,31 @@ class CopyService:
         if self._ws:
             return "Вже працює."
 
+        mode, _ = await self._store.get_mode(self._folder_id)
+        grouped = mode == MODE_REVERSE
+
         master = await self._store.get_master(self._folder_id)
-        if not master:
+        if not master and not grouped:
             return "Master акаунт не додано."
 
-        credentials = await self._store.get_credentials(master.id, self._owner_id)
-        if not credentials:
+        credentials = (
+            await self._store.get_credentials(master.id, self._owner_id) if master else None
+        )
+        if not credentials and not grouped:
             return "Не вдалося прочитати ключі майстра."
 
         self._session = aiohttp.ClientSession()
+        if grouped:
+            # No master, so no master socket. Every account is watched over REST by the group
+            # poller, and a socket on one of them would only report that one.
+            if len(await self._group_accounts()) < 2:
+                await self._session.close()
+                self._session = None
+                return "Потрібно щонайменше два акаунти — по одному в кожній групі."
+            self._start_loops()
+            await self._store.set_running(self._folder_id, True)
+            return "✅ Запущено — стежу за всіма акаунтами."
+
         api_key, secret = credentials
         self._ws = MasterWebSocket(
             api_key,
@@ -257,10 +275,7 @@ class CopyService:
             reconnect_max_seconds=self._ws_reconnect_max,
         )
         self._ws.start()
-        self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
-        self._order_poll_task = asyncio.create_task(self._order_poll_loop(), name="orders")
-        self._position_poll_task = asyncio.create_task(self._position_poll_loop(), name="positions")
-        self._status_poll_task = asyncio.create_task(self._status_poll_loop(), name="status")
+        self._start_loops()
         await self._store.set_running(self._folder_id, True)
 
         if await self._ws.wait_connected(CONNECT_TIMEOUT_SECONDS):
@@ -275,6 +290,13 @@ class CopyService:
                 + "(Вебсокет недоступний з цієї мережі, копіювання це не спиняє.)"
             )
         return "⚠️ Копіювання запущено, але майстра ще не видно — пробую далі."
+
+    def _start_loops(self) -> None:
+        """The background work, started the same way whether or not there is a socket."""
+        self._reconcile_task = asyncio.create_task(self._reconcile_loop(), name="reconcile")
+        self._order_poll_task = asyncio.create_task(self._order_poll_loop(), name="orders")
+        self._position_poll_task = asyncio.create_task(self._position_poll_loop(), name="positions")
+        self._status_poll_task = asyncio.create_task(self._status_poll_loop(), name="status")
 
     async def stop(self) -> str:
         """Stop copying NEW actions. Existing follower positions are left untouched (spec §7)."""
@@ -1236,6 +1258,18 @@ class CopyService:
                 LOGGER.exception("order poll failed")
 
     async def _poll_orders_once(self) -> None:
+        mode, _ = await self._store.get_mode(self._folder_id)
+        if mode == MODE_REVERSE:
+            # Mirroring the master's resting orders is a COPY-mode mechanism, and in groups it
+            # doubles up: the copy is placed as a limit here, and then the master's own fill shows
+            # up as a position the group poller reads as somebody opening by hand — so it is
+            # copied a second time, at market. A limit still reaches the other accounts; it just
+            # reaches them when it FILLS, through the one path that watches every account.
+            #
+            # It also only ever watched the master, which is the wrong shape for a mode where any
+            # account can be the one that moved.
+            return
+
         client = await self._master_client()
         if not client:
             return
@@ -1331,6 +1365,13 @@ class CopyService:
 
         mode, _ = await self._store.get_mode(self._folder_id)
         reverse = mode == MODE_REVERSE
+
+        if reverse:
+            # See _poll_orders_once: in groups this path would place a copy now AND the group
+            # poller would copy the same trade again when the master's limit filled. The socket
+            # can still reach here even though the poll no longer does.
+            LOGGER.info("groups mode: the master's resting orders are not mirrored separately")
+            return
 
         # Same rule as a market exit: in REVERSE the master leaving does not take the hedge with
         # it. Checked before anything is placed, not after.

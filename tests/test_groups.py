@@ -260,3 +260,132 @@ def test_watching_stays_within_one_accounts_allowance():
         f"watching alone would use {per_account:.1f} of the {allowed:.1f} requests a second each "
         f"account allows, leaving too little for the orders"
     )
+
+
+# ── groups and the COPY-mode machinery must not both act ───────────────────
+class OrderStore(Store):
+    def __init__(self, accounts, mode=MODE_REVERSE):
+        super().__init__(accounts)
+        self._mode = mode
+
+    async def get_mode(self, folder_id):
+        return (self._mode, None)
+
+    async def set_running(self, folder_id, running):
+        self.running = running
+
+
+def test_the_masters_resting_orders_are_not_mirrored_in_groups():
+    """Otherwise the same trade is copied twice: once as a limit placed here, and again at market
+    when the master's own limit fills and the group poller reads it as somebody opening by hand."""
+    svc = CopyService(OrderStore([account(1, 1), account(2, 2)]), folder_id=1, owner_id=1)
+    reached = []
+
+    async def master_client():
+        reached.append("asked the venue")
+        raise AssertionError("groups mode must not poll the master's orders")
+
+    svc._master_client = master_client
+    asyncio.run(svc._poll_orders_once())
+    assert reached == []
+
+
+def test_a_copy_folder_still_mirrors_them():
+    """The guard is about groups only; a copy folder's limit mirroring is untouched."""
+    svc = CopyService(OrderStore([account(1, 1)], mode="COPY"), folder_id=1, owner_id=1)
+    asked = []
+
+    async def master_client():
+        asked.append(True)
+        return None
+
+    svc._master_client = master_client
+    asyncio.run(svc._poll_orders_once())
+    assert asked == [True]
+
+
+def test_groups_start_without_a_master():
+    """There is no master in this mode, so requiring one would leave a correctly configured
+    folder unable to start."""
+    svc = CopyService(OrderStore([account(1, 1), account(2, 2)]), folder_id=1, owner_id=1)
+    started = asyncio.run(svc.start())
+    assert "Master" not in started
+    assert svc.running, "the background work must be going even with no socket"
+    asyncio.run(svc.stop())
+
+
+def test_one_account_is_not_enough_to_start():
+    """Two legs need two accounts; starting with one would watch and copy nothing while looking
+    like it was working."""
+    svc = CopyService(OrderStore([account(1, 1)]), folder_id=1, owner_id=1)
+    assert "два акаунти" in asyncio.run(svc.start())
+    assert not svc.running
+
+
+# ── the whole cycle, start to finish ────────────────────────────────────────
+def test_open_copy_then_close_one_leg():
+    """A full round with no network: somebody opens by hand, both legs fill, one leg is closed
+    with the button and reports what it made, and the other is left alone."""
+    accounts = [account(1, 1), account(2, 1), account(3, 2), account(4, 2)]
+    holdings = {}
+    svc, copied = build(accounts, holdings)
+    asyncio.run(svc._poll_groups_once())
+
+    # 1. Opened by hand on 1 — group 1 goes LONG, group 2 goes SHORT.
+    holdings[1] = [snapshot(side=LONG)]
+    asyncio.run(svc._poll_groups_once())
+    assert len(copied) == 1 and copied[0][0] == 1
+
+    # 2. The copies land.
+    holdings[2] = [snapshot(side=LONG)]
+    holdings[3] = [snapshot(side=SHORT)]
+    holdings[4] = [snapshot(side=SHORT)]
+    asyncio.run(svc._poll_groups_once())
+    assert len(copied) == 1, "the copies must not be read as four more people trading"
+    assert svc.account_status == {1: True, 2: True, 3: True, 4: True}
+    assert svc.account_sides == {1: LONG, 2: LONG, 3: SHORT, 4: SHORT}
+
+    # 3. One account of leg 2 is closed by hand; its light goes out on its own.
+    holdings[4] = []
+    asyncio.run(svc._poll_groups_once())
+    assert svc.account_status[4] is False
+    assert len(copied) == 1, "a close is never copied"
+
+    # 4. Leg 1 is closed with the button. Only what is holding is touched.
+    class Pos:
+        def __init__(self, symbol, vol, pid):
+            self.symbol, self.hold_vol, self.position_id = symbol, vol, pid
+
+    class Settled:
+        def __init__(self, pid, realised):
+            self.position_id, self.realised = pid, realised
+
+    class Client:
+        def __init__(self, positions, settled):
+            self.positions, self.settled, self.closed = positions, settled, []
+
+        async def get_open_positions(self, symbol=None):
+            return list(self.positions)
+
+        async def get_closed_positions(self, symbol=None, *, page_size=50):
+            return list(self.settled)
+
+        async def close_all(self, symbol=None):
+            self.closed.append(symbol)
+
+    clients = iter([
+        Client([Pos("BTC_USDT", 10.0, 11)], [Settled(11, 3.5)]),
+        Client([Pos("BTC_USDT", 10.0, 22)], [Settled(22, -1.25)]),
+    ])
+    original = service_module.MexcRestClient
+    service_module.MexcRestClient = lambda *a, **k: next(clients)
+    try:
+        closed, failed, skipped = asyncio.run(svc.close_accounts([1, 2]))
+    finally:
+        service_module.MexcRestClient = original
+
+    assert sorted(closed) == [("acc 1", 3.5), ("acc 2", -1.25)]
+    assert not failed and not skipped
+    assert svc.account_status[1] is False and svc.account_status[2] is False
+    # Leg 2 was not named, so it was not touched.
+    assert svc.account_status[3] is True
