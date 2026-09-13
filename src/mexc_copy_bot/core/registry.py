@@ -72,9 +72,10 @@ class ServiceRegistry:
                 ws_reconnect_max_seconds=self._ws_reconnect_max,
             )
             if self._on_report:
-                service.on_report = self._on_report(owner_id)
+                # The folder goes along so a report can size the trade in its own venue's units.
+                service.on_report = self._on_report(owner_id, folder_id)
             if self._on_notice:
-                service.on_notice = self._on_notice(owner_id)
+                service.on_notice = self._on_notice(owner_id, folder_id)
             self._services[folder_id] = service
             return service
 

@@ -35,6 +35,7 @@ from ..db.store import (
     PositionRow,
     Store,
 )
+from ..exchange import EXCHANGE_HIBT, EXCHANGE_MEXC, exchange_name, make_rest_client, normalize
 from ..mexc.rest import MexcError, MexcRestClient, PositionStops
 from ..mexc.websocket import MasterWebSocket
 from .copy_engine import CopyEngine, FollowerResult, _is_already_flat, side_for_group
@@ -141,6 +142,9 @@ class CopyService:
         self._store = store
         self._folder_id = folder_id
         self._owner_id = owner_id
+        # The venue this folder trades on. Read at start() and kept: it can only be changed on a
+        # folder that is stopped and empty, so nothing that trades can see it move underneath it.
+        self._exchange: str | None = None
         self._retry_attempts = retry_attempts
         self._reconcile_seconds = reconcile_seconds
         self._ws_reconnect_max = ws_reconnect_max_seconds
@@ -252,6 +256,9 @@ class CopyService:
             return "Не вдалося прочитати ключі майстра."
 
         self._session = aiohttp.ClientSession()
+        # Re-read rather than trusted from before: the folder may have been switched while stopped.
+        self._exchange = None
+        exchange = await self.exchange()
         if grouped:
             # No master, so no master socket. Every account is watched over REST by the group
             # poller, and a socket on one of them would only report that one.
@@ -262,6 +269,14 @@ class CopyService:
             self._start_loops()
             await self._store.set_running(self._folder_id, True)
             return "✅ Запущено — стежу за всіма акаунтами."
+
+        if exchange != EXCHANGE_MEXC:
+            # The master socket is MEXC's protocol. Every other venue is watched over REST, which
+            # this service already does for MEXC whenever the socket is blocked — the position
+            # poller below is the same path, so nothing is lost but the socket's head start.
+            self._start_loops()
+            await self._store.set_running(self._folder_id, True)
+            return f"✅ Копіювання запущено ({exchange_name(exchange)}) — майстер читається через REST."
 
         api_key, secret = credentials
         self._ws = MasterWebSocket(
@@ -290,6 +305,13 @@ class CopyService:
                 + "(Вебсокет недоступний з цієї мережі, копіювання це не спиняє.)"
             )
         return "⚠️ Копіювання запущено, але майстра ще не видно — пробую далі."
+
+    async def exchange(self) -> str:
+        """Which venue this folder's accounts are on."""
+        if self._exchange is None:
+            folder = await self._store.get_folder(self._folder_id, self._owner_id)
+            self._exchange = normalize(folder.exchange if folder else None)
+        return self._exchange
 
     def _start_loops(self) -> None:
         """The background work, started the same way whether or not there is a socket."""
@@ -332,7 +354,7 @@ class CopyService:
                 if not credentials:
                     outcomes.append((follower, "credentials missing"))
                     continue
-                client = MexcRestClient(*credentials, session=session)
+                client = make_rest_client(credentials, session=session)
                 try:
                     await client.close_all()
                     await self._clear_expected_positions(follower.id)
@@ -369,7 +391,7 @@ class CopyService:
             credentials = await self._store.get_credentials(follower.id, follower.owner_id)
             if not credentials:
                 return None, "credentials missing"
-            client = MexcRestClient(*credentials, session=self._session)
+            client = make_rest_client(credentials, session=self._session)
             try:
                 positions = await client.get_open_positions(order.symbol)
             except MexcError as err:
@@ -549,7 +571,7 @@ class CopyService:
         credentials = await self._store.get_credentials(master.id, self._owner_id)
         if not credentials:
             return
-        client = MexcRestClient(*credentials, session=self._session)
+        client = make_rest_client(credentials, session=self._session)
         try:
             positions = await client.get_open_positions()
         except MexcError as err:
@@ -592,7 +614,7 @@ class CopyService:
         if not credentials:
             return (None, None)
         try:
-            stops = await MexcRestClient(*credentials, session=self._session).get_stop_orders(event.symbol)
+            stops = await make_rest_client(credentials, session=self._session).get_stop_orders(event.symbol)
         except MexcError as err:
             # Not fatal: a missing stop is worth less than a missed trade, so the order still goes.
             LOGGER.info("could not read master stops for %s: %s", event.symbol, err)
@@ -631,7 +653,7 @@ class CopyService:
 
         symbol = str(data.get("symbol") or "") or None
         try:
-            master_stops = await MexcRestClient(*credentials, session=self._session).get_stop_orders(symbol)
+            master_stops = await make_rest_client(credentials, session=self._session).get_stop_orders(symbol)
         except MexcError as err:
             LOGGER.warning("could not read master stops: %s", err)
             return
@@ -664,7 +686,7 @@ class CopyService:
         credentials = await self._store.get_credentials(follower.id, follower.owner_id)
         if not credentials or not self._session:
             return False
-        client = MexcRestClient(*credentials, session=self._session)
+        client = make_rest_client(credentials, session=self._session)
         try:
             own = {(s.symbol, s.position_type): s for s in await client.get_stop_orders()}
         except MexcError as err:
@@ -733,7 +755,7 @@ class CopyService:
         credentials = await self._store.get_credentials(master.id, self._owner_id)
         if not credentials:
             return None
-        return MexcRestClient(*credentials, session=self._session)
+        return make_rest_client(credentials, session=self._session)
 
     # ── what each account is holding ────────────────────────────────────────────────────────
     @property
@@ -771,7 +793,7 @@ class CopyService:
             credentials = await self._store.get_credentials(account.id, self._owner_id)
             if not credentials:
                 return account.id, None
-            client = MexcRestClient(*credentials, session=self._session)
+            client = make_rest_client(credentials, session=self._session)
             try:
                 positions = await client.get_open_positions()
             except (MexcError, aiohttp.ClientError, asyncio.TimeoutError) as err:
@@ -872,7 +894,7 @@ class CopyService:
             if not credentials:
                 failed.append((account.label, "немає ключів"))
                 return
-            client = MexcRestClient(*credentials, session=self._session)
+            client = make_rest_client(credentials, session=self._session)
             try:
                 symbols = {p.symbol for p in await client.get_open_positions() if p.hold_vol > 0}
             except MexcError as err:
@@ -930,7 +952,7 @@ class CopyService:
         credentials = await self._store.get_credentials(account.id, self._owner_id)
         if not credentials or not self._session:
             return None
-        client = MexcRestClient(*credentials, session=self._session)
+        client = make_rest_client(credentials, session=self._session)
         try:
             rows = await client.get_open_positions_raw()
         except (MexcError, aiohttp.ClientError, asyncio.TimeoutError) as err:
@@ -977,8 +999,13 @@ class CopyService:
         if asyncio.get_running_loop().time() > deadline:
             pending.pop(key, None)
             return False
-        # Sizes are rounded to whole contracts by the venue, so an exact match is not guaranteed.
-        if event.delta_vol > vol * 1.05 + 1:
+        # Sizes are rounded by the venue, so an exact match is not guaranteed. On MEXC they round to
+        # whole contracts, hence one contract of slack. On HIBT sizes are the asset itself and the
+        # client only ever rounds DOWN, so there is no whole unit to allow for — and one unit of
+        # slack there would be a whole ETH, enough to swallow a real trade made by hand as if it
+        # were the bot's own copy.
+        slack = 1.0 if normalize(self._exchange) == EXCHANGE_MEXC else 1e-9
+        if event.delta_vol > vol * 1.05 + slack:
             return False
         remaining = vol - event.delta_vol
         if remaining > 1e-9:
@@ -1073,9 +1100,10 @@ class CopyService:
                     event.delta_vol * account.size_multiplier,
                 )
 
-            engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts)
+            engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts, exchange=await self.exchange())
             event_id = await self._store.record_event(
                 owner_id=self._owner_id,
+                folder_id=self._folder_id,
                 dedupe_key=f"g{trigger.id}:{event.dedupe_key}",
                 symbol=event.symbol,
                 position_type=event.position_type,
@@ -1269,6 +1297,12 @@ class CopyService:
             # It also only ever watched the master, which is the wrong shape for a mode where any
             # account can be the one that moved.
             return
+        if await self.exchange() == EXCHANGE_HIBT:
+            # A HIBT order row says buy or sell but not open or close, and the field that would say
+            # so is undocumented. Mirroring on a guess would copy a master's closing limit as an
+            # opening one — the followers would end up holding both sides. Positions are still
+            # copied when they fill; only the head start of a resting limit is given up.
+            return
 
         client = await self._master_client()
         if not client:
@@ -1426,7 +1460,7 @@ class CopyService:
                 )
                 return
 
-        engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts)
+        engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts, exchange=await self.exchange())
         results = await engine.mirror_resting_order(
             order, followers, reverse=reverse, vol_by_account=vol_by_account
         )
@@ -1498,7 +1532,7 @@ class CopyService:
         credentials = await self._store.get_credentials(follower.id, follower.owner_id)
         if not credentials or not self._session:
             return None
-        client = MexcRestClient(*credentials, session=self._session)
+        client = make_rest_client(credentials, session=self._session)
         try:
             positions = await client.get_open_positions(symbol)
         except MexcError as err:
@@ -1514,7 +1548,7 @@ class CopyService:
         todo = [(accounts[aid], oid) for aid, oid in pairs if aid in accounts]
 
         assert self._session is not None
-        engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts)
+        engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts, exchange=await self.exchange())
         cancelled = await engine.cancel_mirrored_orders(todo)
         await self._store.clear_mirrored_order(self._owner_id, master_order_id)
         LOGGER.info("cancelled %s/%s mirrored copies of %s", cancelled, len(todo), master_order_id)
@@ -1608,7 +1642,7 @@ class CopyService:
         credentials = await self._store.get_credentials(follower.id, follower.owner_id)
         if not credentials or not self._session:
             return None
-        client = MexcRestClient(*credentials, session=self._session)
+        client = make_rest_client(credentials, session=self._session)
         try:
             positions = await client.get_open_positions(symbol)
         except MexcError as err:
@@ -1659,6 +1693,7 @@ class CopyService:
         event = replace(event, raw=raw)
         event_id = await self._store.record_event(
             owner_id=self._owner_id,
+            folder_id=self._folder_id,
             dedupe_key=event.dedupe_key,
             symbol=event.symbol,
             position_type=event.position_type,
@@ -1710,7 +1745,7 @@ class CopyService:
         # entry, so they are deliberately left off (see _handle_stop_order).
         stops = (None, None) if reverse else await self._master_stops(event)
 
-        engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts)
+        engine = CopyEngine(self._store, self._session, retry_attempts=self._retry_attempts, exchange=await self.exchange())
         results = await engine.execute(event, event_id, followers, reverse=reverse, stops=stops)
 
         if self.on_report:
@@ -1751,7 +1786,7 @@ class CopyService:
             credentials = await self._store.get_credentials(follower.id, self._owner_id)
             if not credentials:
                 continue
-            client = MexcRestClient(*credentials, session=self._session)
+            client = make_rest_client(credentials, session=self._session)
             try:
                 actual_positions = await client.get_open_positions()
             except MexcError as err:

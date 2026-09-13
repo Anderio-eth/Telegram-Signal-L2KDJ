@@ -72,6 +72,9 @@ class Store:
         self.accounts = accounts
         self.events = []
 
+    async def get_folder(self, folder_id, owner_id):
+        return None  # no folder row: the service treats that as a MEXC folder
+
     async def get_mode(self, folder_id):
         return (MODE_REVERSE, None)
 
@@ -268,6 +271,9 @@ class OrderStore(Store):
         super().__init__(accounts)
         self._mode = mode
 
+    async def get_folder(self, folder_id, owner_id):
+        return None  # no folder row: the service treats that as a MEXC folder
+
     async def get_mode(self, folder_id):
         return (self._mode, None)
 
@@ -377,12 +383,12 @@ def test_open_copy_then_close_one_leg():
         Client([Pos("BTC_USDT", 10.0, 11)], [Settled(11, 3.5)]),
         Client([Pos("BTC_USDT", 10.0, 22)], [Settled(22, -1.25)]),
     ])
-    original = service_module.MexcRestClient
-    service_module.MexcRestClient = lambda *a, **k: next(clients)
+    original = service_module.make_rest_client
+    service_module.make_rest_client = lambda *a, **k: next(clients)
     try:
         closed, failed, skipped = asyncio.run(svc.close_accounts([1, 2]))
     finally:
-        service_module.MexcRestClient = original
+        service_module.make_rest_client = original
 
     assert sorted(closed) == [("acc 1", 3.5), ("acc 2", -1.25)]
     assert not failed and not skipped

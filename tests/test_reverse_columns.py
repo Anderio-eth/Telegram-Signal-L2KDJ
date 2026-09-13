@@ -184,16 +184,16 @@ def run_close(accounts, clients, ids):
     svc._session = object()
     handed = []
 
-    def factory(key, secret, *, session):
+    def factory(credentials, *, session):
         handed.append(len(handed))
         return clients[handed[-1]]
 
-    original = service_module.MexcRestClient
-    service_module.MexcRestClient = factory
+    original = service_module.make_rest_client
+    service_module.make_rest_client = factory
     try:
         return asyncio.run(svc.close_accounts(ids)), svc
     finally:
-        service_module.MexcRestClient = original
+        service_module.make_rest_client = original
 
 
 def test_an_account_already_flat_is_never_sent_an_order():

@@ -22,6 +22,7 @@ import uuid
 import aiohttp
 
 from ..db.store import KIND_EXIT, Account, StuckGroup, Store
+from ..exchange import make_rest_client
 from ..mexc.rest import (
     ORDER_TYPE_LIMIT,
     SIDE_CLOSE_LONG,
@@ -45,7 +46,7 @@ class StuckManager:
         credentials = await self._store.get_credentials(account_id, self._owner_id)
         if not credentials:
             return None
-        return MexcRestClient(*credentials, session=self._session)
+        return make_rest_client(credentials, session=self._session)
 
     # ── closing what is held ────────────────────────────────────────────────────────────────
     async def close_at_market(

@@ -95,7 +95,7 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def _fake(monkeypatch):
     FakeClient.instances.clear()
-    monkeypatch.setattr("mexc_copy_bot.core.copy_engine.MexcRestClient", FakeClient)
+    monkeypatch.setattr("mexc_copy_bot.core.copy_engine.make_rest_client", FakeClient)
 
 
 def run_open(*, reverse: bool, stops):

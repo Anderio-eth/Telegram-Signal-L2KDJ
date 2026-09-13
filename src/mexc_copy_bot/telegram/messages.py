@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from ..core.copy_engine import FollowerResult
 from ..core.events import Action, MasterEvent
 from ..db.store import MODE_REVERSE, Account
+from ..exchange import exchange_name
 from .i18n import DEFAULT, t
 
 ACTION_ICON = {
@@ -336,6 +337,7 @@ def folders_screen(folders, active_id, counts, lang=DEFAULT) -> str:
                 lang, "folder_row",
                 mark="▶️" if folder.id == active_id else "  ",
                 name=folder.name,
+                exchange=exchange_name(getattr(folder, "exchange", None)),
                 accounts=counts.get(folder.id, 0),
                 state=t(lang, "folder_running" if folder.running else "folder_stopped"),
             )

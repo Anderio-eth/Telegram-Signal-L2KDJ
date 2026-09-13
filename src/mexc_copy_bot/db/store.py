@@ -23,6 +23,7 @@ from typing import Any
 
 import asyncpg
 
+from ..exchange import DEFAULT_EXCHANGE, EXCHANGES, Credentials
 from ..security.encryption import CredentialCipher
 
 LOGGER = logging.getLogger(__name__)
@@ -96,6 +97,8 @@ class Folder:
     # database holding one language's words for everybody.
     group_one_name: str | None = None
     group_two_name: str | None = None
+    # The venue every account in this folder trades on. See exchange.py for why it lives here.
+    exchange: str = DEFAULT_EXCHANGE
 
 
 KIND_ENTRY = "ENTRY"
@@ -194,13 +197,16 @@ class Store:
             )
 
     # ── folders ─────────────────────────────────────────────────────────────────────────────
-    async def list_folders(self, owner_id: int) -> list[Folder]:
+    async def list_folders(self, owner_id: int, exchange: str | None = None) -> list[Folder]:
+        """This owner's folders — every one, or only one exchange's, as a topic shows them."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, owner_id, name, running, mode, reverse_account_id,"
-                " group_one_name, group_two_name"
-                " FROM copy_folders WHERE owner_id = $1 ORDER BY created_at, id",
+                " group_one_name, group_two_name, exchange"
+                " FROM copy_folders WHERE owner_id = $1 AND ($2::text IS NULL OR exchange = $2)"
+                " ORDER BY created_at, id",
                 owner_id,
+                exchange,
             )
         return [Folder(**dict(r)) for r in rows]
 
@@ -210,7 +216,7 @@ class Store:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT id, owner_id, name, running, mode, reverse_account_id,"
-                " group_one_name, group_two_name"
+                " group_one_name, group_two_name, exchange"
                 " FROM copy_folders WHERE id = $1 AND owner_id = $2",
                 folder_id,
                 owner_id,
@@ -239,12 +245,128 @@ class Store:
                 label.strip()[:24],
             )
 
-    async def create_folder(self, owner_id: int, name: str) -> int:
+    async def create_folder(self, owner_id: int, name: str, exchange: str = DEFAULT_EXCHANGE) -> int:
         async with self._pool.acquire() as conn:
             return await conn.fetchval(
-                "INSERT INTO copy_folders (owner_id, name) VALUES ($1, $2) RETURNING id",
+                "INSERT INTO copy_folders (owner_id, name, exchange) VALUES ($1, $2, $3) RETURNING id",
                 owner_id,
                 name.strip()[:40],
+                exchange if exchange in EXCHANGES else DEFAULT_EXCHANGE,
+            )
+
+    async def set_folder_exchange(self, folder_id: int, owner_id: int, exchange: str) -> bool:
+        """Switch the venue — only while the folder is EMPTY and stopped.
+
+        Enforced in the query, not just in the menu. Keys belong to one exchange: a folder switched
+        with accounts in it would start sending MEXC keys to HIBT, and a running one would be trading
+        on keys that no longer match its venue. Returns False when the switch was refused.
+        """
+        if exchange not in EXCHANGES:
+            return False
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE copy_folders SET exchange = $3, updated_at = now()"
+                " WHERE id = $1 AND owner_id = $2 AND NOT running"
+                " AND NOT EXISTS (SELECT 1 FROM copy_accounts WHERE folder_id = $1)",
+                folder_id,
+                owner_id,
+                exchange,
+            )
+        return result.endswith("1")
+
+    # ── forum topics ────────────────────────────────────────────────────────────────────────
+    async def bind_topic(
+        self, chat_id: int, thread_id: int, exchange: str, title: str | None, bound_by: int | None
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO copy_topics (chat_id, thread_id, exchange, title, bound_by)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (chat_id, thread_id) DO UPDATE
+                SET exchange = EXCLUDED.exchange,
+                    title = COALESCE(EXCLUDED.title, copy_topics.title),
+                    bound_by = EXCLUDED.bound_by
+                """,
+                chat_id, thread_id, exchange, title, bound_by,
+            )
+
+    async def unbind_topic(self, chat_id: int, thread_id: int) -> bool:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM copy_topics WHERE chat_id = $1 AND thread_id = $2", chat_id, thread_id
+            )
+        return result.endswith("1")
+
+    async def topic_exchange(self, chat_id: int, thread_id: int) -> str | None:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT exchange FROM copy_topics WHERE chat_id = $1 AND thread_id = $2", chat_id, thread_id
+            )
+
+    async def list_topics(self, chat_id: int) -> list[tuple[int, str, str | None]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT thread_id, exchange, title FROM copy_topics WHERE chat_id = $1 ORDER BY exchange",
+                chat_id,
+            )
+        return [(r["thread_id"], r["exchange"], r["title"]) for r in rows]
+
+    async def remember_view(
+        self, owner_id: int, exchange: str, chat_id: int, thread_id: int, display_name: str | None
+    ) -> None:
+        """Note where this owner works with this exchange. The open folder is kept as it was."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO copy_topic_views (owner_id, exchange, chat_id, thread_id, display_name)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (owner_id, exchange) DO UPDATE
+                SET chat_id = EXCLUDED.chat_id,
+                    thread_id = EXCLUDED.thread_id,
+                    display_name = COALESCE(EXCLUDED.display_name, copy_topic_views.display_name),
+                    updated_at = now()
+                """,
+                owner_id, exchange, chat_id, thread_id, display_name,
+            )
+
+    async def topic_view(self, owner_id: int, exchange: str) -> dict[str, Any] | None:
+        """{chat_id, thread_id, folder_id, display_name} for this owner and exchange, if they have
+        ever used that exchange's topic."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT chat_id, thread_id, folder_id, display_name FROM copy_topic_views"
+                " WHERE owner_id = $1 AND exchange = $2",
+                owner_id, exchange,
+            )
+        return dict(row) if row else None
+
+    async def set_view_folder(self, owner_id: int, exchange: str, folder_id: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE copy_topic_views SET folder_id = $3, updated_at = now()"
+                " WHERE owner_id = $1 AND exchange = $2",
+                owner_id, exchange, folder_id,
+            )
+
+    async def record_screen_owner(self, chat_id: int, message_id: int, owner_id: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO copy_screen_owners (chat_id, message_id, owner_id) VALUES ($1, $2, $3)
+                ON CONFLICT (chat_id, message_id) DO UPDATE SET owner_id = EXCLUDED.owner_id
+                """,
+                chat_id, message_id, owner_id,
+            )
+            await conn.execute(
+                "DELETE FROM copy_screen_owners WHERE created_at < now() - interval '14 days'"
+            )
+
+    async def screen_owner(self, chat_id: int, message_id: int) -> int | None:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT owner_id FROM copy_screen_owners WHERE chat_id = $1 AND message_id = $2",
+                chat_id, message_id,
             )
 
     async def rename_folder(self, folder_id: int, owner_id: int, name: str) -> bool:
@@ -302,7 +424,7 @@ class Store:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, owner_id, name, running, mode, reverse_account_id,"
-                " group_one_name, group_two_name"
+                " group_one_name, group_two_name, exchange"
                 " FROM copy_folders WHERE running ORDER BY id"
             )
         return [Folder(**dict(r)) for r in rows]
@@ -430,23 +552,32 @@ class Store:
         accounts = await self.list_accounts(folder_id, MASTER)
         return accounts[0] if accounts else None
 
-    async def get_credentials(self, account_id: int, owner_id: int) -> tuple[str, str] | None:
+    async def get_credentials(self, account_id: int, owner_id: int) -> Credentials | None:
         """Decrypted (api_key, secret). The only place plaintext exists, and only in memory.
 
         Scoped by owner as well as id: nothing should be able to ask for another owner's keys,
         so the query simply cannot find them.
+
+        Carries the folder's exchange with it, so whoever builds a client from these keys builds the
+        right one. Still unpacks as a pair.
         """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT api_key_enc, api_secret_enc FROM copy_accounts WHERE id = $1 AND owner_id = $2",
+                "SELECT a.api_key_enc, a.api_secret_enc, f.exchange"
+                " FROM copy_accounts a LEFT JOIN copy_folders f ON f.id = a.folder_id"
+                " WHERE a.id = $1 AND a.owner_id = $2",
                 account_id,
                 owner_id,
             )
         if not row:
             return None
-        return self._cipher.decrypt(row["api_key_enc"]), self._cipher.decrypt(row["api_secret_enc"])
+        return Credentials(
+            self._cipher.decrypt(row["api_key_enc"]),
+            self._cipher.decrypt(row["api_secret_enc"]),
+            row["exchange"],
+        )
 
-    async def get_credentials_for(self, folder_id: int) -> dict[int, tuple[str, str]]:
+    async def get_credentials_for(self, folder_id: int) -> dict[int, Credentials]:
         """Every one of this owner's accounts, decrypted, in a single round trip.
 
         The menu needs all ten at once to show balances. Asking per account turned one screen into
@@ -455,11 +586,15 @@ class Store:
         """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, api_key_enc, api_secret_enc FROM copy_accounts WHERE folder_id = $1",
+                "SELECT a.id, a.api_key_enc, a.api_secret_enc, f.exchange"
+                " FROM copy_accounts a LEFT JOIN copy_folders f ON f.id = a.folder_id"
+                " WHERE a.folder_id = $1",
                 folder_id,
             )
         return {
-            r["id"]: (self._cipher.decrypt(r["api_key_enc"]), self._cipher.decrypt(r["api_secret_enc"]))
+            r["id"]: Credentials(
+                self._cipher.decrypt(r["api_key_enc"]), self._cipher.decrypt(r["api_secret_enc"]), r["exchange"]
+            )
             for r in rows
         }
 
@@ -769,8 +904,13 @@ class Store:
         leverage: int,
         open_type: int,
         raw: dict[str, Any] | None,
+        folder_id: int | None = None,
     ) -> int | None:
         """Returns the new event id, or None when this exact event was already recorded.
+
+        `folder_id` is what lets a topic's history show only its own exchange. The column existed
+        from the start and was never filled, so every event recorded before this reads as MEXC —
+        which is what they all were.
 
         The None case is the idempotency guard doing its job — a duplicate push after a reconnect
         must not become a second round of orders.
@@ -780,8 +920,8 @@ class Store:
                 """
                 INSERT INTO copy_master_events
                     (owner_id, dedupe_key, symbol, position_type, action, master_vol, delta_vol,
-                     leverage, open_type, raw)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     leverage, open_type, raw, folder_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (owner_id, dedupe_key) DO NOTHING
                 RETURNING id
                 """,
@@ -795,6 +935,7 @@ class Store:
                 leverage,
                 open_type,
                 json.dumps(raw) if raw else None,
+                folder_id,
             )
 
     async def create_task(
@@ -850,7 +991,10 @@ class Store:
                 realized_pnl,
             )
 
-    async def recent_events(self, owner_id: int, limit: int = 10) -> list[dict[str, Any]]:
+    async def recent_events(
+        self, owner_id: int, limit: int = 10, exchange: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Latest events — all of this owner's, or only one exchange's for a topic's history."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -864,12 +1008,15 @@ class Store:
                        count(t.realized_pnl) AS pnl_count
                 FROM copy_master_events e
                 LEFT JOIN copy_tasks t ON t.event_id = e.id
+                LEFT JOIN copy_folders f ON f.id = e.folder_id
                 WHERE e.owner_id = $1
+                  AND ($3::text IS NULL OR COALESCE(f.exchange, 'mexc') = $3)
                 GROUP BY e.id
                 ORDER BY e.observed_at DESC
                 LIMIT $2
                 """,
                 owner_id,
                 limit,
+                exchange,
             )
         return [dict(r) for r in rows]

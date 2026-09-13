@@ -120,7 +120,7 @@ class FakeClient:
 def _fake_client(monkeypatch):
     FakeClient.instances.clear()
     FakeClient.holds = True
-    monkeypatch.setattr("mexc_copy_bot.core.copy_engine.MexcRestClient", FakeClient)
+    monkeypatch.setattr("mexc_copy_bot.core.copy_engine.make_rest_client", FakeClient)
 
 
 async def run(action: Action, master_side: int, *, reverse: bool):

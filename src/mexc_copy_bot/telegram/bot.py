@@ -9,16 +9,24 @@ Anyone not on it gets a refusal — this bot can move real money on ten accounts
 must never reach a keyboard.
 
 Everyone on the whitelist gets their OWN world: their own master, their own followers, their own
-START/STOP and their own Emergency Stop. There is no shared view and no admin — the two brothers
-running this see only what they added themselves. Every handler derives `owner_id` from
-`update.effective_user.id` and passes it down; nothing here can address an account by id alone,
-because the store requires the owner too.
+START/STOP and their own Emergency Stop. There is no admin — the two brothers running this control
+only what they added themselves. Every handler derives `owner_id` from `update.effective_user.id`
+and passes it down; nothing here can address an account by id alone, because the store requires
+the owner too.
+
+It runs in two kinds of place. In a private chat it is what it always was: every folder in one
+list. In a forum group each topic is one exchange (see telegram/topics.py) — the MEXC topic shows
+only MEXC folders, the HIBT topic only HIBT ones. Control stays per person there, but VISIBILITY
+does not: a group shows every member every message the bot posts, menus and reports included.
+What the bot does about that is keep each menu answering only to its owner, and never ask for
+API keys anywhere but a private chat.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 import time
 
@@ -27,10 +35,11 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    Message,
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -57,9 +66,29 @@ from ..db.store import (
     Account,
     Store,
 )
-from ..mexc.rest import MexcError, MexcRestClient, get_contract_specs, get_ticker_price
+from ..exchange import (
+    DEFAULT_EXCHANGE,
+    EXCHANGE_HIBT,
+    EXCHANGE_MEXC,
+    Credentials,
+    contract_specs,
+    exchange_name,
+    make_rest_client,
+    ticker_price,
+)
+from ..mexc.rest import MexcError
 from . import messages
 from .i18n import EN, UK, t
+from .topics import (
+    ADD_LINK_COMMAND,
+    CURRENT_VIEW,
+    Place,
+    View,
+    add_link,
+    exchange_from_title,
+    parse_add_payload,
+    parse_exchange,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -91,6 +120,11 @@ MENU_FILTER = filters.Regex(f"^{MENU_BUTTON}$")
 # the bot sends first and then simply stays there.
 PERSISTENT_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton(MENU_BUTTON)]], resize_keyboard=True, is_persistent=True
+)
+# In a group the same button, shown only to the person it was sent in reply to. A plain one would
+# appear above everybody's message box, including people the bot refuses.
+GROUP_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton(MENU_BUTTON)]], resize_keyboard=True, is_persistent=True, selective=True
 )
 
 # How long a balance reading stays good enough to reuse. Tapping around the menu should not fire
@@ -135,6 +169,13 @@ def _column_rows(
             if right else blank,
         ])
     return rows
+
+
+def _topic_title(message) -> str | None:
+    """A forum topic's name, as Telegram attaches it to messages posted inside the topic."""
+    root = getattr(message, "reply_to_message", None)
+    created = getattr(root, "forum_topic_created", None) if root else None
+    return created.name if created else None
 
 
 def _menu_keyboard(
@@ -202,22 +243,33 @@ class CopyBot:
         # Language per owner, read once and kept: it is needed by every screen and every
         # notice, and a database round trip per line of text would be absurd.
         self._lang_cache: dict[int, str] = {}
-        # Which folder each owner is looking at. Resolved in _guard, so every handler can
-        # reach it without another round trip — the alternative was threading a folder id
-        # through every screen by hand, which is the sort of change one place gets forgotten
-        # in, and a forgotten one mixes two setups' accounts together.
-        self._folder_cache: dict[int, int] = {}
+        # Which folder each owner is looking at is NOT kept here any more. It depends on where
+        # they are looking from — the MEXC topic and the HIBT topic show different folders — and
+        # a single slot per owner, shared by every handler and every background report, is exactly
+        # how a START pressed in one topic ends up starting the other one's folder. See
+        # telegram/topics.py: it lives in the View, one per running task.
+        #
+        # Forum topics, cached because every button press in a group asks: (chat, thread) ->
+        # exchange, and (chat, message) -> the owner of that menu.
+        self._topic_cache: dict[tuple[int, int], str] = {}
+        self._screen_owners: dict[tuple[int, int], int] = {}
+        # (owner, exchange) -> the place last written to the database, so an unchanged place
+        # costs nothing on the next press.
+        self._places: dict[tuple[int, str], tuple[Place, str]] = {}
+        # Display names, so a report in a shared topic can say whose trade it was.
+        self._names: dict[int, str] = {}
         # Sessions opened for stuck-account work while copying is stopped, closed on shutdown.
         self._own_sessions: list[aiohttp.ClientSession] = []
-        # owner id -> (chat, message) of the menu currently on screen. Kept so a trade report can
-        # bring the lights and balances up to date without waiting for someone to press Refresh —
-        # which is the whole point of a light.
-        self._menu_message: dict[int, tuple[int, int]] = {}
-        # Who already has the Menu button above their message box. Sent once per process rather
-        # than on every menu, which would be a stray message each time.
-        self._menu_button_shown: set[int] = set()
-        # When the menu was last moved to the bottom, per owner.
-        self._menu_moved: dict[int, float] = {}
+        # (owner, exchange or None) -> (chat, message) of the menu currently on screen. Kept so a
+        # trade report can bring the lights and balances up to date without waiting for someone to
+        # press Refresh — which is the whole point of a light. Per exchange because in a forum
+        # group one owner has a menu in each topic.
+        self._menu_message: dict[tuple[int, str | None], tuple[int, int]] = {}
+        # (owner, chat, thread) that already have the Menu button above their message box. Sent
+        # once per place per process rather than on every menu, which would be a stray message.
+        self._menu_button_shown: set[tuple[int, int, int | None]] = set()
+        # When the menu was last moved to the bottom, per owner per exchange.
+        self._menu_moved: dict[tuple[int, str | None], float] = {}
 
         registry.configure_callbacks(on_report=self._report_for, on_notice=self._notice_for)
 
@@ -226,7 +278,15 @@ class CopyBot:
         app = Application.builder().token(self._settings.bot_token).build()
 
         add_conversation = ConversationHandler(
-            entry_points=[CallbackQueryHandler(self._begin_add, pattern="^add_(master|follower)$")],
+            entry_points=[
+                CallbackQueryHandler(self._begin_add, pattern="^add_(master|follower)$"),
+                # Arriving from a topic's "add account" link. Private chats only: the keys that
+                # follow must never be typed where a group can read them.
+                CommandHandler(
+                    "start", self._begin_add_from_link,
+                    filters=filters.ChatType.PRIVATE & filters.Regex(ADD_LINK_COMMAND),
+                ),
+            ],
             states={
                 ASK_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, self._got_key)],
                 ASK_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, self._got_secret)],
@@ -293,8 +353,18 @@ class CopyBot:
             per_message=False,
         )
 
-        app.add_handler(CommandHandler("start", self._cmd_start))
+        # A /start carrying an add-account link is left to the add conversation below; this
+        # handler comes first, and taking it here would open the menu instead of asking for keys.
+        app.add_handler(CommandHandler("start", self._cmd_start, filters=~filters.Regex(ADD_LINK_COMMAND)))
+        app.add_handler(CommandHandler("menu", self._cmd_start))
         app.add_handler(MessageHandler(MENU_FILTER, self._cmd_start))
+        app.add_handler(CommandHandler("bind", self._cmd_bind))
+        app.add_handler(CommandHandler("unbind", self._cmd_unbind))
+        app.add_handler(CommandHandler("topics", self._cmd_topics))
+        app.add_handler(MessageHandler(
+            filters.StatusUpdate.FORUM_TOPIC_CREATED | filters.StatusUpdate.FORUM_TOPIC_EDITED,
+            self._on_topic_event,
+        ))
         app.add_handler(add_conversation)
         app.add_handler(price_conversation)
         app.add_handler(folder_conversation)
@@ -308,13 +378,57 @@ class CopyBot:
         return bool(user and user.id in self._settings.allowed_user_ids)
 
     async def _guard(self, update: Update) -> int | None:
-        """Returns the owner id to act as, or None when the user is refused."""
-        if self._authorized(update):
-            owner_id = update.effective_user.id
-            if update.effective_chat:
-                self._chat_ids[owner_id] = update.effective_chat.id
-            await self._resolve_folder(owner_id)
+        """Returns the owner id to act as, or None when the user is refused.
+
+        Also settles where they are acting, and so what they see. In a private chat that is every
+        folder they own, as it always was. In a forum group it is the topic: the topic names an
+        exchange, only that exchange's folders exist there, and a button belongs to whoever the
+        menu was opened for.
+        """
+        if not self._authorized(update):
+            return await self._refuse(update)
+        user = update.effective_user
+        owner_id = user.id
+        self._names[owner_id] = user.full_name or (f"@{user.username}" if user.username else str(owner_id))
+        chat = update.effective_chat
+        if chat is None or chat.type == ChatType.PRIVATE:
+            chat_id = chat.id if chat else owner_id
+            self._chat_ids[owner_id] = chat_id
+            folder_id = await self._resolve_folder(owner_id, None)
+            CURRENT_VIEW.set(View(owner_id, None, Place(chat_id), folder_id))
             return owner_id
+        return await self._guard_group(update, owner_id, chat.id)
+
+    async def _guard_group(self, update: Update, owner_id: int, chat_id: int) -> int | None:
+        query = update.callback_query
+        message = query.message if query else update.message
+        lang = await self._lang(owner_id)
+        if not isinstance(message, Message):
+            # A button on a message too old for Telegram to hand back. Which topic it was in cannot
+            # be read, so it cannot be acted on safely.
+            if query:
+                await query.answer(t(lang, "screen_stale"), show_alert=True)
+            return None
+        thread_id = message.message_thread_id if message.is_topic_message else None
+        if thread_id is None:
+            await self._hint(update, t(lang, "topic_use_a_topic"))
+            return None
+        exchange = await self._topic_exchange(chat_id, thread_id, message)
+        if exchange is None:
+            await self._hint(update, t(lang, "topic_not_bound"))
+            return None
+        if query and await self._screen_owner(chat_id, message.message_id) != owner_id:
+            # Somebody else's menu. Acting on it would redraw their screen with this person's
+            # accounts, in front of the whole topic.
+            await query.answer(t(lang, "screen_not_yours"), show_alert=True)
+            return None
+        place = Place(chat_id, thread_id)
+        await self._remember_place(owner_id, exchange, place)
+        folder_id = await self._resolve_folder(owner_id, exchange)
+        CURRENT_VIEW.set(View(owner_id, exchange, place, folder_id))
+        return owner_id
+
+    async def _refuse(self, update: Update) -> None:
         LOGGER.warning("refused telegram user %s", update.effective_user.id if update.effective_user else "?")
         if update.callback_query:
             await update.callback_query.answer(t(UK, "not_authorized"), show_alert=True)
@@ -322,23 +436,268 @@ class CopyBot:
             await update.message.reply_text(t(UK, "not_authorized") + ".")
         return None
 
-    async def _resolve_folder(self, owner_id: int) -> int:
-        """The folder this owner is working in, creating their first one if they have none.
+    async def _hint(self, update: Update, text: str) -> None:
+        """Say why nothing happened, in whichever way this update can be answered."""
+        if update.callback_query:
+            await update.callback_query.answer(text, show_alert=True)
+        elif update.message:
+            with contextlib.suppress(Exception):
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+    async def _resolve_folder(self, owner_id: int, exchange: str | None) -> int:
+        """The folder this owner is working in here, creating their first one if they have none.
 
         A brand new owner has never chosen a folder and has none to choose. Making one beats
         showing an empty screen that reads as though their accounts had gone missing.
+
+        Read from the database on every press rather than cached: a folder deleted in one place
+        must not survive as a cached id in another.
         """
-        folder_id = await self._store.active_folder_id(owner_id)
-        if folder_id is None:
-            folder_id = await self._store.create_folder(owner_id, "MEXC")
-            await self._store.set_active_folder(owner_id, folder_id)
-            LOGGER.info("created first folder %s for owner %s", folder_id, owner_id)
-        self._folder_cache[owner_id] = folder_id
+        if exchange is None:
+            folder_id = await self._store.active_folder_id(owner_id)
+            if folder_id is None:
+                folder_id = await self._store.create_folder(owner_id, "MEXC")
+                await self._store.set_active_folder(owner_id, folder_id)
+                LOGGER.info("created first folder %s for owner %s", folder_id, owner_id)
+            return folder_id
+
+        remembered = await self._store.topic_view(owner_id, exchange)
+        folder = None
+        if remembered and remembered.get("folder_id"):
+            folder = await self._store.get_folder(remembered["folder_id"], owner_id)
+            if folder and folder.exchange != exchange:
+                folder = None
+        if folder is None:
+            same_venue = await self._store.list_folders(owner_id, exchange)
+            if same_venue:
+                folder = same_venue[0]
+        if folder is None:
+            folder_id = await self._store.create_folder(owner_id, exchange_name(exchange), exchange)
+            LOGGER.info("created first %s folder %s for owner %s", exchange, folder_id, owner_id)
+        else:
+            folder_id = folder.id
+        if not remembered or remembered.get("folder_id") != folder_id:
+            await self._store.set_view_folder(owner_id, exchange, folder_id)
         return folder_id
 
+    def _view(self, owner_id: int) -> View:
+        """Where this owner is acting right now. Set by _guard, or by _enter_folder_view for a
+        background message. Never guessed: acting on a folder nobody chose is how accounts from two
+        setups get mixed, so a missing view is an error rather than a default."""
+        view = CURRENT_VIEW.get()
+        if view is None or view.owner_id != owner_id or view.folder_id is None:
+            raise RuntimeError(f"no view for owner {owner_id}")
+        return view
+
     def _folder(self, owner_id: int) -> int:
-        """The cached folder. Warm by the time any handler runs, because _guard fills it."""
-        return self._folder_cache[owner_id]
+        """The folder in front of this owner right now."""
+        return self._view(owner_id).folder_id
+
+    async def _switch_folder(self, owner_id: int, folder_id: int) -> None:
+        """Open another folder here, and remember that it is the one open here."""
+        view = self._view(owner_id)
+        if view.in_topic:
+            await self._store.set_view_folder(owner_id, view.exchange, folder_id)
+        else:
+            await self._store.set_active_folder(owner_id, folder_id)
+        CURRENT_VIEW.set(view.with_folder(folder_id))
+        self._invalidate_balances(owner_id)
+
+    # ── forum topics ────────────────────────────────────────────────────────────────────────
+    async def _topic_exchange(self, chat_id: int, thread_id: int, message: Message | None) -> str | None:
+        """The exchange a topic is for — bound earlier, or recognised now by its title."""
+        key = (chat_id, thread_id)
+        if key in self._topic_cache:
+            return self._topic_cache[key]
+        exchange = await self._store.topic_exchange(chat_id, thread_id)
+        if exchange is None:
+            title = _topic_title(message)
+            exchange = exchange_from_title(title)
+            if exchange:
+                await self._store.bind_topic(chat_id, thread_id, exchange, title, None)
+                LOGGER.info("bound topic %s/%s (%r) to %s by its title", chat_id, thread_id, title, exchange)
+        if exchange:
+            self._topic_cache[key] = exchange
+        return exchange
+
+    async def _screen_owner(self, chat_id: int, message_id: int) -> int | None:
+        key = (chat_id, message_id)
+        if key not in self._screen_owners:
+            owner = await self._store.screen_owner(chat_id, message_id)
+            if owner is None:
+                return None
+            self._screen_owners[key] = owner
+        return self._screen_owners[key]
+
+    async def _own_screen(self, message, owner_id: int, markup) -> None:
+        """Write down whose menu a message in a group is. Only keyboards need an owner: a message
+        with nothing to press cannot be acted on by the wrong person."""
+        if not isinstance(message, Message) or message.chat_id >= 0:
+            return
+        if not isinstance(markup, InlineKeyboardMarkup):
+            return
+        self._screen_owners[(message.chat_id, message.message_id)] = owner_id
+        with contextlib.suppress(Exception):
+            await self._store.record_screen_owner(message.chat_id, message.message_id, owner_id)
+
+    async def _remember_place(self, owner_id: int, exchange: str, place: Place) -> None:
+        name = self._names.get(owner_id, "")
+        if self._places.get((owner_id, exchange)) == (place, name):
+            return
+        await self._store.remember_view(owner_id, exchange, place.chat_id, place.thread_id, name or None)
+        self._places[(owner_id, exchange)] = (place, name)
+
+    async def _enter_folder_view(self, owner_id: int, folder_id: int | None):
+        """Set up the view a background message about `folder_id` is shown in.
+
+        It goes to that folder's exchange topic, if the owner has ever used one, and otherwise to
+        their private chat. The menu redrawn there is the one open in THAT place — not necessarily
+        `folder_id`: a report about a folder running in the background must not swap what the
+        owner is looking at. Returns (the folder, the view).
+        """
+        folder = await self._store.get_folder(folder_id, owner_id) if folder_id is not None else None
+        exchange = folder.exchange if folder else DEFAULT_EXCHANGE
+        remembered = await self._store.topic_view(owner_id, exchange)
+        if remembered:
+            if remembered.get("display_name"):
+                self._names.setdefault(owner_id, remembered["display_name"])
+            place, key_exchange = Place(remembered["chat_id"], remembered["thread_id"]), exchange
+        else:
+            place, key_exchange = Place(self._chat_ids.get(owner_id, owner_id)), None
+        shown = await self._resolve_folder(owner_id, key_exchange)
+        view = View(owner_id, key_exchange, place, shown)
+        CURRENT_VIEW.set(view)
+        return folder, view
+
+    def _whose(self, owner_id: int, folder=None) -> str:
+        name = html.escape(self._names.get(owner_id) or str(owner_id))
+        suffix = f" · {html.escape(folder.name)}" if folder else ""
+        return f"👤 <b>{name}</b>{suffix}"
+
+    async def _send(self, place: Place, owner_id: int, text: str, **kwargs):
+        """Send into a place — its topic included — and remember whose screen it is.
+
+        `send_message` knows nothing about topics: without message_thread_id, a message meant for
+        the HIBT topic lands in General. Everything the bot sends on its own goes through here, so
+        that cannot be forgotten one call at a time.
+        """
+        if not self._app:
+            return None
+        if place.thread_id is not None:
+            kwargs["message_thread_id"] = place.thread_id
+        try:
+            sent = await self._app.bot.send_message(place.chat_id, text, **kwargs)
+        except BadRequest as err:
+            reason = str(err).lower()
+            if place.thread_id is not None and "thread" in reason:
+                # The topic was deleted or closed. The owner still has to hear about their trade.
+                kwargs.pop("message_thread_id", None)
+                LOGGER.warning("topic %s/%s is gone; writing to %s privately", place.chat_id, place.thread_id, owner_id)
+                return await self._send(Place(owner_id), owner_id, text, **kwargs)
+            if not kwargs.get("parse_mode"):
+                raise
+            # Exchange text can carry a stray "<" that Telegram rejects as HTML. Losing a report to
+            # a formatting character is the worse outcome, so it goes out unformatted instead.
+            kwargs.pop("parse_mode")
+            sent = await self._app.bot.send_message(place.chat_id, text, **kwargs)
+        await self._own_screen(sent, owner_id, kwargs.get("reply_markup"))
+        return sent
+
+    async def _send_here(self, owner_id: int, text: str, **kwargs):
+        return await self._send(self._view(owner_id).place, owner_id, text, **kwargs)
+
+    def _in_flow_place(self, owner_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Is this reply typed where the question was asked?
+
+        Telegram keys a conversation by chat and user, and every topic of a forum is the same chat.
+        Without this, a name typed in the HIBT topic would answer a rename started in the MEXC topic
+        — and rename the MEXC folder, because the question was about that one.
+        """
+        asked = context.user_data.get("flow_place")
+        return asked is None or asked == self._view(owner_id).place
+
+    async def _cmd_bind(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/bind mexc | /bind hibt — make this topic that exchange's."""
+        if not self._authorized(update):
+            await self._refuse(update)
+            return
+        message, chat = update.message, update.effective_chat
+        lang = await self._lang(update.effective_user.id)
+        if chat is None or chat.type == ChatType.PRIVATE or not message.is_topic_message:
+            await message.reply_text(t(lang, "bind_only_in_topic"), parse_mode=ParseMode.HTML)
+            return
+        title = _topic_title(message)
+        exchange = parse_exchange(context.args[0] if context.args else None) or exchange_from_title(title)
+        if not exchange:
+            await message.reply_text(t(lang, "bind_usage"), parse_mode=ParseMode.HTML)
+            return
+        await self._store.bind_topic(chat.id, message.message_thread_id, exchange, title, update.effective_user.id)
+        self._topic_cache[(chat.id, message.message_thread_id)] = exchange
+        text = t(lang, "bind_done", exchange=exchange_name(exchange))
+        if not await self._bot_is_admin(chat):
+            text += NEWLINE + NEWLINE + t(lang, "bot_not_admin")
+        await message.reply_text(text, parse_mode=ParseMode.HTML)
+        await self._cmd_start(update, context)
+
+    async def _cmd_unbind(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            await self._refuse(update)
+            return
+        message, chat = update.message, update.effective_chat
+        lang = await self._lang(update.effective_user.id)
+        if chat is None or chat.type == ChatType.PRIVATE or not message.is_topic_message:
+            await message.reply_text(t(lang, "bind_only_in_topic"), parse_mode=ParseMode.HTML)
+            return
+        await self._store.unbind_topic(chat.id, message.message_thread_id)
+        self._topic_cache.pop((chat.id, message.message_thread_id), None)
+        await message.reply_text(t(lang, "unbind_done"), parse_mode=ParseMode.HTML)
+
+    async def _cmd_topics(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            await self._refuse(update)
+            return
+        chat = update.effective_chat
+        lang = await self._lang(update.effective_user.id)
+        if chat is None or chat.type == ChatType.PRIVATE:
+            await update.message.reply_text(t(lang, "bind_only_in_topic"), parse_mode=ParseMode.HTML)
+            return
+        bound = await self._store.list_topics(chat.id)
+        lines = [t(lang, "topics_title"), ""]
+        lines += [
+            f"• <b>{exchange_name(exchange)}</b> — {html.escape(title or '#' + str(thread))}"
+            for thread, exchange, title in bound
+        ] or [t(lang, "topics_none")]
+        if not await self._bot_is_admin(chat):
+            lines += ["", t(lang, "bot_not_admin")]
+        await update.message.reply_text(NEWLINE.join(lines), parse_mode=ParseMode.HTML)
+
+    async def _on_topic_event(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """A topic was created or renamed. One called MEXC or HIBT is bound on the spot.
+
+        Only ever binds, never unbinds: a topic bound by hand with /bind keeps its exchange when
+        someone renames it to something the title matcher does not recognise.
+        """
+        message = update.message
+        if not message or not message.is_topic_message:
+            return
+        created, edited = message.forum_topic_created, message.forum_topic_edited
+        title = (created.name if created else None) or (edited.name if edited else None)
+        exchange = exchange_from_title(title)
+        if not exchange:
+            return
+        await self._store.bind_topic(message.chat_id, message.message_thread_id, exchange, title, None)
+        self._topic_cache[(message.chat_id, message.message_thread_id)] = exchange
+        with contextlib.suppress(Exception):
+            await message.reply_text(t(UK, "bind_auto", exchange=exchange_name(exchange)), parse_mode=ParseMode.HTML)
+
+    async def _bot_is_admin(self, chat) -> bool:
+        """Without admin rights the bot does not see the names and prices people type in answer
+        to its questions, and cannot tidy away old menus."""
+        try:
+            member = await chat.get_member(self._app.bot.id)
+        except Exception:  # noqa: BLE001 - unknown is reported as "not admin", which is the safe advice
+            return False
+        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
     def _lang_now(self, owner_id: int) -> str:
         """The cached language. Every handler calls _lang() early, so this is warm by the time a
@@ -361,7 +720,13 @@ class CopyBot:
         lang = await self._lang(owner_id)
 
         accounts = ([master] if master else []) + followers
-        return messages.main_menu(
+        view = self._view(owner_id)
+        header = (
+            f"{self._whose(owner_id)} · {exchange_name(view.exchange)}{NEWLINE}{NEWLINE}"
+            if view.place.is_group
+            else ""
+        )
+        return header + messages.main_menu(
             running=service.running,
             master=master,
             followers=followers,
@@ -404,7 +769,7 @@ class CopyBot:
                 if not credentials:
                     return messages.Balance(error="credentials could not be read")
                 try:
-                    snapshot = await MexcRestClient(*credentials, session=session).get_usdt_snapshot()
+                    snapshot = await make_rest_client(credentials, session=session).get_usdt_snapshot()
                     return messages.Balance(
                         equity=snapshot.equity,
                         available=snapshot.openable,
@@ -440,21 +805,27 @@ class CopyBot:
             (folder.group_two_name if folder and folder.group_two_name else t(lang, "group_two")),
         )
 
-    async def _ensure_menu_button(self, chat_id: int, owner_id: int) -> None:
-        """Put the Menu button above the message box, once per chat.
+    async def _ensure_menu_button(self, update: Update, owner_id: int) -> None:
+        """Put the Menu button above the message box, once per place.
 
         Telegram attaches a reply keyboard to a message being SENT and has no way to add one while
         editing, so it cannot ride along with the menu itself — the menu is usually an edit. It is
         sent once, on its own, and then stays until someone removes it.
+
+        In a group it is sent as a reply and marked selective, so it appears for the person who
+        asked and nobody else.
         """
-        if owner_id in self._menu_button_shown or not self._app:
+        place = self._view(owner_id).place
+        key = (owner_id, place.chat_id, place.thread_id)
+        if key in self._menu_button_shown or not self._app:
             return
-        self._menu_button_shown.add(owner_id)
+        self._menu_button_shown.add(key)
+        hint = t(await self._lang(owner_id), "menu_button_hint")
         with contextlib.suppress(Exception):
-            await self._app.bot.send_message(
-                chat_id, t(await self._lang(owner_id), "menu_button_hint"),
-                reply_markup=PERSISTENT_KEYBOARD,
-            )
+            if place.is_group and update.message:
+                await update.message.reply_text(hint, reply_markup=GROUP_KEYBOARD)
+            else:
+                await self._send(place, owner_id, hint, reply_markup=PERSISTENT_KEYBOARD)
 
     async def _menu_columns(self, owner_id: int) -> tuple[list, list, tuple[str, str]] | None:
         """The two legs, or None when this folder is not in REVERSE.
@@ -497,16 +868,18 @@ class CopyBot:
 
     async def _show_menu(self, update: Update, owner_id: int) -> None:
         text, keyboard = await self._menu_view(owner_id)
+        key = (owner_id, self._view(owner_id).exchange)
         if update.callback_query:
             message = update.callback_query.message
-            self._menu_message[owner_id] = (message.chat_id, message.message_id)
+            self._menu_message[key] = (message.chat_id, message.message_id)
             await update.callback_query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         elif update.message:
             # The inline keyboard belongs to the message; the Menu button belongs to the chat. Both
             # cannot ride on one send, so the persistent one goes out first and then stays put.
-            await self._ensure_menu_button(update.effective_chat.id, owner_id)
+            await self._ensure_menu_button(update, owner_id)
             sent = await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-            self._menu_message[owner_id] = (sent.chat_id, sent.message_id)
+            await self._own_screen(sent, owner_id, keyboard)
+            self._menu_message[key] = (sent.chat_id, sent.message_id)
 
     async def _cmd_start(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         owner_id = await self._guard(update)
@@ -548,7 +921,7 @@ class CopyBot:
         elif action == "positions":
             await self._show_positions(update, owner_id)
         elif action == "history":
-            events = await self._store.recent_events(owner_id, 10)
+            events = await self._store.recent_events(owner_id, 10, self._view(owner_id).exchange)
             await query.edit_message_text(
                 messages.history(events, await self._lang(owner_id)),
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(self._lang_now(owner_id), "btn_back"), callback_data="menu")]]),
@@ -608,14 +981,16 @@ class CopyBot:
         elif action.startswith("fsel:"):
             folder_id = int(action.split(":", 1)[1])
             folder = await self._store.get_folder(folder_id, owner_id)
-            if folder:
-                await self._store.set_active_folder(owner_id, folder_id)
-                self._folder_cache[owner_id] = folder_id
-                self._invalidate_balances(owner_id)
+            view = self._view(owner_id)
+            # In a topic only that exchange's folders can be opened, whatever an old keyboard offers.
+            if folder and (not view.in_topic or folder.exchange == view.exchange):
+                await self._switch_folder(owner_id, folder_id)
                 await update.callback_query.answer(
                     t(await self._lang(owner_id), "folder_switched", name=folder.name).replace("<b>", "").replace("</b>", "")
                 )
             await self._show_menu(update, owner_id)
+        elif action.startswith("fexch:"):
+            await self._switch_folder_exchange(update, owner_id, action.split(":", 1)[1])
         elif action == "fdel":
             await self._confirm_delete_folder(update, owner_id)
         elif action == "fdel_ok":
@@ -746,24 +1121,15 @@ class CopyBot:
         )
         self._invalidate_balances(owner_id)
 
-    def _chat_for(self, owner_id: int) -> int:
-        """Where to message this owner.
-
-        Falls back to the owner id itself because a private chat with a bot has chat.id ==
-        user.id. Without the fallback, everything resumed on boot (spec §31) would trade with
-        no report reaching anyone until that person happened to press a button.
-        """
-        return self._chat_ids.get(owner_id, owner_id)
-
     async def _show_menu_message(self, owner_id: int) -> None:
-        chat_id = self._chat_for(owner_id)
-        if not (self._app and chat_id):
+        """A fresh menu, sent to wherever this owner is acting right now."""
+        if not self._app:
             return
+        view = self._view(owner_id)
         text, keyboard = await self._menu_view(owner_id)
-        sent = await self._app.bot.send_message(
-            chat_id, text, reply_markup=keyboard, parse_mode=ParseMode.HTML
-        )
-        self._menu_message[owner_id] = (sent.chat_id, sent.message_id)
+        sent = await self._send(view.place, owner_id, text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+        if sent:
+            self._menu_message[(owner_id, view.exchange)] = (sent.chat_id, sent.message_id)
 
     async def _refuse_while_running(self, update: Update, owner_id: int) -> bool:
         """Mode changes are refused while copying is on.
@@ -832,6 +1198,7 @@ class CopyBot:
         await query.answer()
         _, kind, target = (query.data or "").split(":")
         context.user_data["rename"] = (kind, int(target))
+        context.user_data["flow_place"] = self._view(owner_id).place
 
         lang = await self._lang(owner_id)
         if kind == "g":
@@ -849,6 +1216,9 @@ class CopyBot:
         owner_id = await self._guard(update)
         if owner_id is None:
             return ConversationHandler.END
+        if not self._in_flow_place(owner_id, context):
+            return ASK_RENAME
+        context.user_data.pop("flow_place", None)
         target = context.user_data.pop("rename", None)
         name = (update.message.text or "").strip()
         if target and name:
@@ -907,11 +1277,16 @@ class CopyBot:
 
     async def _folder_name(self, owner_id: int) -> str:
         folder = await self._store.get_folder(self._folder(owner_id), owner_id)
-        return folder.name if folder else "—"
+        if not folder:
+            return "—"
+        venue = exchange_name(folder.exchange)
+        # "MEXC · MEXC" says nothing twice; the first folder is literally named after its venue.
+        return folder.name if venue.lower() in folder.name.lower() else f"{folder.name} · {venue}"
 
     async def _show_folders(self, update: Update, owner_id: int) -> None:
         lang = await self._lang(owner_id)
-        folders = await self._store.list_folders(owner_id)
+        view = self._view(owner_id)
+        folders = await self._store.list_folders(owner_id, view.exchange)
         active = self._folder(owner_id)
         counts = {f.id: len(await self._store.list_accounts(f.id)) for f in folders}
 
@@ -925,6 +1300,16 @@ class CopyBot:
             InlineKeyboardButton(t(lang, "btn_new_folder"), callback_data="fnew"),
             InlineKeyboardButton(t(lang, "btn_rename_folder"), callback_data="fren"),
         ])
+        if not view.in_topic:
+            # A topic IS its exchange, so there is nothing to switch there. Only a private chat,
+            # which lists every folder, offers to move an empty one between venues.
+            current = next((f for f in folders if f.id == active), None)
+            other = EXCHANGE_HIBT if (current and current.exchange == EXCHANGE_MEXC) else EXCHANGE_MEXC
+            rows.append([InlineKeyboardButton(
+                t(lang, "btn_folder_exchange", current=exchange_name(current.exchange if current else None),
+                  other=exchange_name(other)),
+                callback_data=f"fexch:{other}",
+            )])
         rows.append([InlineKeyboardButton(t(lang, "btn_delete_folder"), callback_data="fdel")])
         rows.append([InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu")])
 
@@ -934,9 +1319,36 @@ class CopyBot:
             parse_mode=ParseMode.HTML,
         )
 
+    async def _switch_folder_exchange(self, update: Update, owner_id: int, exchange: str) -> None:
+        """Move the folder on screen to another venue - only while it is empty and stopped.
+
+        Empty, because stored keys belong to the venue they came from. Stopped, because a running
+        folder is trading on them. The store enforces both in the UPDATE itself; the checks here
+        only decide which explanation to show.
+        """
+        lang = await self._lang(owner_id)
+        if self._view(owner_id).in_topic:
+            await update.callback_query.answer(t(lang, "folder_exchange_in_topic"), show_alert=True)
+            return
+        folder_id = self._folder(owner_id)
+        service = await self._registry.get(folder_id, owner_id)
+        if service.running:
+            await update.callback_query.answer(t(lang, "folder_stop_first"), show_alert=True)
+            return
+        if await self._store.list_accounts(folder_id):
+            await update.callback_query.answer(t(lang, "folder_exchange_not_empty"), show_alert=True)
+            return
+        if not await self._store.set_folder_exchange(folder_id, owner_id, exchange):
+            await update.callback_query.answer(t(lang, "folder_exchange_refused"), show_alert=True)
+            return
+        await update.callback_query.answer(
+            t(lang, "folder_exchange_set", exchange=exchange_name(exchange)), show_alert=True
+        )
+        await self._show_folders(update, owner_id)
+
     async def _confirm_delete_folder(self, update: Update, owner_id: int) -> None:
         lang = await self._lang(owner_id)
-        folders = await self._store.list_folders(owner_id)
+        folders = await self._store.list_folders(owner_id, self._view(owner_id).exchange)
         if len(folders) < 2:
             # Deleting the only folder would leave nothing to switch to and nowhere to add an
             # account, so the bot would have to invent one on the next tap anyway.
@@ -963,10 +1375,12 @@ class CopyBot:
         folder_id = self._folder(owner_id)
         await self._store.delete_folder(folder_id, owner_id)
         # Point the owner at whatever is left before anything tries to read the deleted one.
-        remaining = await self._store.list_folders(owner_id)
+        view = self._view(owner_id)
+        remaining = await self._store.list_folders(owner_id, view.exchange)
         if remaining:
-            await self._store.set_active_folder(owner_id, remaining[0].id)
-        await self._resolve_folder(owner_id)
+            await self._switch_folder(owner_id, remaining[0].id)
+        else:
+            CURRENT_VIEW.set(view.with_folder(await self._resolve_folder(owner_id, view.exchange)))
         self._invalidate_balances(owner_id)
         await update.callback_query.edit_message_text(
             t(lang, "folder_deleted"),
@@ -981,6 +1395,7 @@ class CopyBot:
             return ConversationHandler.END
         await update.callback_query.answer()
         context.user_data["folder_action"] = update.callback_query.data  # fnew or fren
+        context.user_data["flow_place"] = self._view(owner_id).place
         await update.callback_query.edit_message_text(
             t(await self._lang(owner_id), "folder_name_ask"),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
@@ -993,25 +1408,31 @@ class CopyBot:
         if owner_id is None:
             return ConversationHandler.END
         lang = await self._lang(owner_id)
+        if not self._in_flow_place(owner_id, context):
+            return ASK_FOLDER_NAME
         name = (update.message.text or "").strip()[:40]
         if not name:
             await update.message.reply_text(t(lang, "folder_name_ask"))
             return ASK_FOLDER_NAME
 
+        context.user_data.pop("flow_place", None)
         action = context.user_data.pop("folder_action", "fnew")
         if action == "fren":
             await self._store.rename_folder(self._folder(owner_id), owner_id, name)
             text = t(lang, "folder_renamed", name=name)
         else:
-            folder_id = await self._store.create_folder(owner_id, name)
+            # Created on the exchange of the topic it was asked for in; in a private chat, MEXC
+            # until switched.
+            folder_id = await self._store.create_folder(
+                owner_id, name, self._view(owner_id).exchange or DEFAULT_EXCHANGE
+            )
             # A new folder is empty, so switching to it immediately is what anyone creating one
             # was about to do anyway.
-            await self._store.set_active_folder(owner_id, folder_id)
-            self._folder_cache[owner_id] = folder_id
-            self._invalidate_balances(owner_id)
+            await self._switch_folder(owner_id, folder_id)
             text = t(lang, "folder_created", name=name)
 
-        await update.effective_chat.send_message(
+        await self._send_here(
+            owner_id,
             text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
                 t(lang, "btn_back"), callback_data="folders")]]),
@@ -1134,8 +1555,9 @@ class CopyBot:
 
         market = None
         try:
+            exchange = await self._exchange_for(owner_id)
             async with aiohttp.ClientSession() as session:
-                market = await get_ticker_price(session, group.symbol)
+                market = await ticker_price(session, exchange, group.symbol)
         except Exception:  # noqa: BLE001 — a missing quote must not block moving the order
             LOGGER.debug("no ticker for %s", group.symbol)
 
@@ -1166,6 +1588,7 @@ class CopyBot:
             return ConversationHandler.END
         await update.callback_query.answer()
         context.user_data["price_group"] = int(update.callback_query.data.split(":")[1])
+        context.user_data["flow_place"] = self._view(owner_id).place
         await update.callback_query.edit_message_text(
             t(await self._lang(owner_id), "move_limit_ask"),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
@@ -1178,6 +1601,8 @@ class CopyBot:
         if owner_id is None:
             return ConversationHandler.END
         lang = await self._lang(owner_id)
+        if not self._in_flow_place(owner_id, context):
+            return ASK_PRICE
         raw = (update.message.text or "").strip().replace(",", ".")
         try:
             price = float(raw)
@@ -1188,6 +1613,7 @@ class CopyBot:
             await update.message.reply_text(t(lang, "move_limit_bad"))
             return ASK_PRICE
 
+        context.user_data.pop("flow_place", None)
         group_id = context.user_data.pop("price_group", None)
         group = await self._store.get_stuck_group(owner_id, group_id) if group_id else None
         if not group:
@@ -1198,7 +1624,8 @@ class CopyBot:
         outcomes = await manager.move_limit(group, price)
         lines = [t(lang, "done_title"), "", f"<b>{group.symbol}</b> → {price:g}", ""]
         lines += [f"{label} — {outcome}" for label, outcome in outcomes]
-        await update.effective_chat.send_message(
+        await self._send_here(
+            owner_id,
             NEWLINE.join(lines),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
                 t(lang, "btn_back"), callback_data="stuck")]]),
@@ -1238,11 +1665,11 @@ class CopyBot:
     async def _show_positions(self, update: Update, owner_id: int) -> None:
         lines = [t(await self._lang(owner_id), "positions_title"), ""]
         async with aiohttp.ClientSession() as session:
-            for account in await self._store.list_accounts(owner_id):
+            for account in await self._store.list_accounts(self._folder(owner_id)):
                 credentials = await self._store.get_credentials(account.id, owner_id)
                 if not credentials:
                     continue
-                client = MexcRestClient(*credentials, session=session)
+                client = make_rest_client(credentials, session=session)
                 marker = "👑" if account.is_master else "•"
                 try:
                     positions = [p for p in await client.get_open_positions() if p.hold_vol > 0]
@@ -1274,15 +1701,60 @@ class CopyBot:
         # indistinguishable from the bot being broken, even when the flow behind it works.
         await update.callback_query.answer()
         kind = MASTER if update.callback_query.data == "add_master" else FOLLOWER
+        view = self._view(owner_id)
+        if view.place.is_group:
+            # Keys are never typed into a group. The whole topic would read them, and deleting the
+            # message afterwards is too late: members have already had the notification.
+            lang = await self._lang(owner_id)
+            link = add_link(self._app.bot.username, view.exchange, kind, view.folder_id)
+            await update.callback_query.edit_message_text(
+                t(lang, "add_in_private", exchange=exchange_name(view.exchange)),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(t(lang, "btn_open_private"), url=link)],
+                    [InlineKeyboardButton(t(lang, "btn_back"), callback_data="accounts")],
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+            return ConversationHandler.END
         context.user_data["kind"] = kind
+        folder = await self._store.get_folder(view.folder_id, owner_id)
         prompt = await update.callback_query.edit_message_text(
-            t(await self._lang(owner_id), "add_send_key", kind=kind.title()),
+            t(await self._lang(owner_id), "add_send_key", kind=kind.title(),
+              exchange=exchange_name(folder.exchange if folder else None)),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(self._lang_now(owner_id), "btn_cancel_x"), callback_data="menu")]]),
         )
         # Tracked so the whole exchange can be swept away once the account is connected: these
         # prompts are scaffolding, and what they were collecting now lives in the menu instead.
         context.user_data["cleanup"] = [prompt.message_id] if hasattr(prompt, "message_id") else []
+        return ASK_KEY
+
+    async def _begin_add_from_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Keys for a folder of a topic, entered here in private.
+
+        The link names a folder, but only points at it: it has to belong to whoever followed the link
+        and be on the exchange the link says, or the flow does not start. A link forwarded to someone
+        else, or edited by hand, reaches nobody's folder.
+        """
+        owner_id = await self._guard(update)
+        if owner_id is None:
+            return ConversationHandler.END
+        lang = await self._lang(owner_id)
+        parsed = parse_add_payload(context.args[0] if context.args else None)
+        folder = await self._store.get_folder(parsed[2], owner_id) if parsed else None
+        if not parsed or not folder or folder.exchange != parsed[0]:
+            await update.message.reply_text(t(lang, "add_link_invalid"), parse_mode=ParseMode.HTML)
+            return ConversationHandler.END
+        exchange, kind, folder_id = parsed
+        context.user_data.clear()
+        context.user_data.update(kind=kind, add_folder_id=folder_id)
+        prompt = await update.message.reply_text(
+            t(lang, "add_send_key_for", kind=kind.title(), exchange=exchange_name(exchange),
+              folder=html.escape(folder.name)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(lang, "btn_cancel_x"), callback_data="menu")]]),
+        )
+        context.user_data["cleanup"] = [prompt.message_id]
         return ASK_KEY
 
     async def _got_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1297,7 +1769,8 @@ class CopyBot:
                 await update.message.delete()
             except Exception:  # noqa: BLE001 — deletion is best-effort, not a reason to abort
                 pass
-        prompt = await update.effective_chat.send_message(
+        prompt = await self._send_here(
+            owner_id,
             t(await self._lang(owner_id), "add_send_secret"),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(self._lang_now(owner_id), "btn_cancel_x"), callback_data="menu")]]),
@@ -1318,13 +1791,18 @@ class CopyBot:
             pass
 
         lang = await self._lang(owner_id)
-        folder_id = self._folder(owner_id)
-        status = await update.effective_chat.send_message(t(lang, "add_validating"))
+        # From a topic's link, the folder the link named; otherwise the one on screen.
+        linked_folder = context.user_data.get("add_folder_id")
+        folder_id = linked_folder or self._folder(owner_id)
+        exchange = await self._exchange_for(owner_id, folder_id)
+        status = await self._send_here(owner_id, t(lang, "add_validating", exchange=exchange_name(exchange)))
 
         # Validate before storing: an account that cannot read its own balance will fail on the
         # first real trade, and finding that out now is far cheaper (spec §4).
+        # Checked against the folder's own exchange. Keys belong to one venue, and a folder trades on
+        # one: HIBT keys validated against MEXC would be refused as invalid when they are perfectly fine.
         async with aiohttp.ClientSession() as session:
-            client = MexcRestClient(api_key, secret, session=session)
+            client = make_rest_client(Credentials(api_key, secret, exchange), session=session)
             try:
                 equity, available = await client.get_usdt_balance()
                 mode = await client.get_position_mode()
@@ -1333,7 +1811,7 @@ class CopyBot:
                 context.user_data.clear()
                 return ConversationHandler.END
 
-        master = await self._store.get_master(self._folder(owner_id))
+        master = await self._store.get_master(folder_id)
         warning = ""
         if kind == FOLLOWER and master and master.position_mode and mode != master.position_mode:
             # Hedge vs one-way changes what a side means; copying across a mismatch mirrors the
@@ -1403,7 +1881,15 @@ class CopyBot:
         await self._delete_messages(update.effective_chat.id, cleanup)
 
         context.user_data.clear()
-        await self._show_menu_message(owner_id)
+        if linked_folder:
+            # Added from a topic: say so here, then move the updated menu to the bottom of the
+            # topic, which is where the owner is going to look. Moved rather than sent again, so
+            # the "open private chat" screen left behind there goes away with it.
+            await update.effective_chat.send_message(t(lang, "add_done_go_back"), parse_mode=ParseMode.HTML)
+            await self._enter_folder_view(owner_id, linked_folder)
+            await self._refresh_menu(owner_id, force=True)
+        else:
+            await self._show_menu_message(owner_id)
         return ConversationHandler.END
 
     async def _abandon_and_dispatch(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1440,144 +1926,108 @@ class CopyBot:
     # ── outbound ────────────────────────────────────────────────────────────────────────────
     # The registry asks for a callback per owner, so a service physically cannot report into a
     # chat that is not its owner's.
-    def _report_for(self, owner_id: int):
+    def _report_for(self, owner_id: int, folder_id: int | None = None):
         async def report(event: MasterEvent, results: list[FollowerResult]) -> None:
-            await self._report_event(owner_id, event, results)
+            await self._report_event(owner_id, event, results, folder_id)
 
         return report
 
-    def _notice_for(self, owner_id: int):
+    async def _exchange_for(self, owner_id: int, folder_id: int | None = None) -> str:
+        """The venue of a given folder, or of the one on screen when none is named."""
+        folder = await self._store.get_folder(
+            folder_id if folder_id is not None else self._folder(owner_id), owner_id
+        )
+        return folder.exchange if folder else EXCHANGE_MEXC
+
+    def _notice_for(self, owner_id: int, folder_id: int | None = None):
         async def notice(text: str) -> None:
-            chat_id = self._chat_for(owner_id)
-            if not (self._app and chat_id):
+            if not self._app:
                 return
+            folder, view = await self._enter_folder_view(owner_id, folder_id)
+            if view.place.is_group:
+                text = self._whose(owner_id, folder) + NEWLINE + text
             try:
-                await self._app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-            except BadRequest:
-                # Notices carry text straight from the exchange — a symbol or an error message
-                # can contain a stray "<" that makes Telegram reject the whole message as invalid
-                # HTML. Losing a trade report to a formatting character is the worse outcome, so
-                # it goes out unformatted rather than not at all.
-                await self._app.bot.send_message(chat_id, text)
+                # _send falls back to plain text when exchange text breaks the HTML.
+                await self._send(view.place, owner_id, text, parse_mode=ParseMode.HTML)
+            except Exception:  # noqa: BLE001 - a notice must never take the service down with it
+                LOGGER.warning("could not deliver a notice to %s", owner_id, exc_info=True)
             await self._refresh_menu(owner_id)
 
         return notice
 
-    async def _report_event(self, owner_id: int, event: MasterEvent, results: list[FollowerResult]) -> None:
-        chat_id = self._chat_for(owner_id)
-        if not (self._app and chat_id):
+    async def _report_event(
+        self, owner_id: int, event: MasterEvent, results: list[FollowerResult], folder_id: int | None = None
+    ) -> None:
+        if not self._app:
             return
+        folder, view = await self._enter_folder_view(owner_id, folder_id)
         notional = None
         try:
+            # The folder the event came from, not the one on screen: a folder on another venue
+            # keeps copying in the background. Its size units matter here - a HIBT size read against
+            # MEXC's contract size (0.01 ETH) would report a $450 trade as $4.50.
+            exchange = folder.exchange if folder else EXCHANGE_MEXC
             async with aiohttp.ClientSession() as session:
-                specs = await get_contract_specs(session, event.symbol)
-                price = await get_ticker_price(session, event.symbol)
+                specs = await contract_specs(session, exchange, event.symbol)
+                price = await ticker_price(session, exchange, event.symbol)
             spec = specs.get(event.symbol)
             if spec and price:
                 notional = spec.notional(event.delta_vol, price)
-        except Exception:  # noqa: BLE001 — a missing price must not suppress the trade report
+        except Exception:  # noqa: BLE001 - a missing price must not suppress the trade report
             LOGGER.debug("could not compute notional for %s", event.symbol)
 
         text = messages.event_report(event, results, notional, await self._lang(owner_id))
+        if view.place.is_group:
+            # Everyone in the topic reads this. Whose trade it was is the first thing they need.
+            text = self._whose(owner_id, folder) + NEWLINE + text
         try:
-            await self._app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-        except BadRequest:
-            # Same reasoning as _notice_for: these lines carry exchange text, and one stray "<"
-            # in an error message would otherwise cost the whole trade report.
-            await self._app.bot.send_message(chat_id, text)
+            await self._send(view.place, owner_id, text, parse_mode=ParseMode.HTML)
+        except Exception:  # noqa: BLE001 - logged; the trade itself already happened
+            LOGGER.warning("could not deliver a trade report to %s", owner_id, exc_info=True)
         await self._refresh_menu(owner_id)
 
-    async def _refresh_menu(self, owner_id: int) -> None:
-        """Move the menu to the bottom of the chat, brought up to date.
+    async def _refresh_menu(self, owner_id: int, *, force: bool = False) -> None:
+        """Move the menu to the bottom of the place it lives in, brought up to date.
 
         Telegram has no way to pin a message to the bottom, so the only way to keep the menu in
         front of you is to send it again below whatever just arrived and remove the old copy. The
         new one goes out BEFORE the old one is deleted, so there is never an instant with no menu
         on screen.
 
+        One menu per owner per place: in a forum group the same person keeps a MEXC menu in one
+        topic and a HIBT menu in another, and a report for one must not move the other.
+
         Everything here is best-effort: the trade has already happened, and failing to redraw a
         keyboard must never surface as an error about it.
         """
         if not self._app:
             return
+        try:
+            view = self._view(owner_id)
+        except RuntimeError:
+            return
+        key = (owner_id, view.exchange)
 
         now = time.monotonic()
-        if now - self._menu_moved.get(owner_id, 0.0) < MENU_MOVE_COOLDOWN:
+        if not force and now - self._menu_moved.get(key, 0.0) < MENU_MOVE_COOLDOWN:
             # A trade can produce a report and a notice within the same second. Moving the menu
             # for each would leave a trail of them up the chat.
             return
-        self._menu_moved[owner_id] = now
+        self._menu_moved[key] = now
 
-        previous = self._menu_message.get(owner_id)
-        chat_id = previous[0] if previous else self._chat_for(owner_id)
+        previous = self._menu_message.get(key)
         try:
-            service = await self._registry.get(self._folder(owner_id), owner_id)
+            service = await self._registry.get(view.folder_id, owner_id)
             await service.refresh_account_status()
             self._invalidate_balances(owner_id)
             text, keyboard = await self._menu_view(owner_id)
-            sent = await self._app.bot.send_message(
-                chat_id, text, reply_markup=keyboard, parse_mode=ParseMode.HTML
-            )
-            self._menu_message[owner_id] = (sent.chat_id, sent.message_id)
-        except Exception:  # noqa: BLE001 — a redraw must not report itself as a trade failure
+            sent = await self._send(view.place, owner_id, text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            if sent:
+                self._menu_message[key] = (sent.chat_id, sent.message_id)
+        except Exception:  # noqa: BLE001 - a redraw must not report itself as a trade failure
             LOGGER.info("could not move the menu for %s", owner_id, exc_info=True)
             return
 
         if previous:
             with contextlib.suppress(Exception):
                 await self._app.bot.delete_message(chat_id=previous[0], message_id=previous[1])
-
-    async def _report_event(self, owner_id: int, event: MasterEvent, results: list[FollowerResult]) -> None:
-        chat_id = self._chat_for(owner_id)
-        if not (self._app and chat_id):
-            return
-        notional = None
-        try:
-            async with aiohttp.ClientSession() as session:
-                specs = await get_contract_specs(session, event.symbol)
-                price = await get_ticker_price(session, event.symbol)
-            spec = specs.get(event.symbol)
-            if spec and price:
-                notional = spec.notional(event.delta_vol, price)
-        except Exception:  # noqa: BLE001 — a missing price must not suppress the trade report
-            LOGGER.debug("could not compute notional for %s", event.symbol)
-
-        text = messages.event_report(event, results, notional, await self._lang(owner_id))
-        try:
-            await self._app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-        except BadRequest:
-            # Same reasoning as _notice_for: these lines carry exchange text, and one stray "<"
-            # in an error message would otherwise cost the whole trade report.
-            await self._app.bot.send_message(chat_id, text)
-        await self._refresh_menu(owner_id)
-
-    async def _refresh_menu(self, owner_id: int) -> None:
-        """Bring the menu already on screen up to date, in place.
-
-        Called after a trade, so the lights and balances move with the report rather than waiting
-        for someone to press Refresh — a light that is only true after you ask is not doing the
-        job of a light.
-
-        Everything here is best-effort. The trade has already happened; failing to redraw a
-        keyboard must never surface as an error about it.
-        """
-        target = self._menu_message.get(owner_id)
-        if not (self._app and target):
-            return
-        chat_id, message_id = target
-        try:
-            service = await self._registry.get(self._folder(owner_id), owner_id)
-            await service.refresh_account_status()
-            self._invalidate_balances(owner_id)
-            text, keyboard = await self._menu_view(owner_id)
-            await self._app.bot.edit_message_text(
-                text, chat_id=chat_id, message_id=message_id,
-                reply_markup=keyboard, parse_mode=ParseMode.HTML,
-            )
-        except BadRequest as err:
-            # "Message is not modified" means the screen already says this. Nothing to do, and
-            # nothing worth logging as a problem.
-            if "not modified" not in str(err).lower():
-                LOGGER.info("could not refresh the menu for %s: %s", owner_id, err)
-        except Exception:  # noqa: BLE001 — a redraw must not report itself as a trade failure
-            LOGGER.info("could not refresh the menu for %s", owner_id, exc_info=True)

@@ -96,6 +96,11 @@ CREATE TABLE IF NOT EXISTS copy_folders (
 ALTER TABLE copy_folders ADD COLUMN IF NOT EXISTS group_one_name TEXT;
 ALTER TABLE copy_folders ADD COLUMN IF NOT EXISTS group_two_name TEXT;
 
+-- Which venue the folder trades on. Per folder, never per account: the copy engine mirrors raw size,
+-- and a size is contracts on MEXC but the asset itself on HIBT — 100 contracts of BTC (0.01 BTC)
+-- mirrored onto HIBT would be 100 BTC. Every row that predates this column is MEXC, hence the default.
+ALTER TABLE copy_folders ADD COLUMN IF NOT EXISTS exchange TEXT NOT NULL DEFAULT 'mexc';
+
 CREATE INDEX IF NOT EXISTS copy_folders_owner ON copy_folders (owner_id, created_at);
 
 CREATE TABLE IF NOT EXISTS copy_accounts (
@@ -341,3 +346,44 @@ BEGIN
         DROP INDEX copy_accounts_single_master;
     END IF;
 END $$;
+
+
+-- ── forum topics ────────────────────────────────────────────────────────────────────────────────
+-- A topic in a forum group, and the exchange it is for. Every owner who opens the bot there works
+-- with that exchange's folders only. Bound by name ("MEXC", "HIBT") or with /bind.
+CREATE TABLE IF NOT EXISTS copy_topics (
+    chat_id    BIGINT      NOT NULL,
+    thread_id  BIGINT      NOT NULL,
+    exchange   TEXT        NOT NULL,
+    title      TEXT,
+    bound_by   BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chat_id, thread_id)
+);
+
+-- Where each owner last worked with each exchange, and which of that exchange's folders they had
+-- open there. Reports for a folder go to this place, so they land in the MEXC topic for a MEXC
+-- folder rather than in whichever chat the owner happened to tap last. Kept in the database, not
+-- in memory: after a redeploy, trades resume before anyone touches the bot, and their reports
+-- still need somewhere to go.
+CREATE TABLE IF NOT EXISTS copy_topic_views (
+    owner_id     BIGINT      NOT NULL,
+    exchange     TEXT        NOT NULL,
+    chat_id      BIGINT      NOT NULL,
+    thread_id    BIGINT      NOT NULL,
+    folder_id    BIGINT,
+    display_name TEXT,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (owner_id, exchange)
+);
+
+-- Who each menu in a group belongs to. Everyone in a topic sees every menu, and a button is pressed
+-- by whoever taps it; without this, one member pressing Positions on another's menu would replace
+-- it with their own accounts. Rows older than a fortnight are pruned as new ones arrive.
+CREATE TABLE IF NOT EXISTS copy_screen_owners (
+    chat_id    BIGINT      NOT NULL,
+    message_id BIGINT      NOT NULL,
+    owner_id   BIGINT      NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chat_id, message_id)
+);

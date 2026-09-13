@@ -60,6 +60,7 @@ STRINGS: dict[str, dict[str, str]] = {
     "btn_new_folder": {UK: "➕ Нова папка", EN: "➕ New folder"},
     "btn_rename_folder": {UK: "✏️ Перейменувати", EN: "✏️ Rename"},
     "btn_delete_folder": {UK: "🗑 Видалити папку", EN: "🗑 Delete folder"},
+    "btn_folder_exchange": {UK: "🔁 Біржа: {current} → {other}", EN: "🔁 Exchange: {current} → {other}"},
     "btn_confirm_delete": {UK: "✅ Так, видалити", EN: "✅ Yes, delete"},
     "btn_confirm_change": {UK: "✅ Так, змінити", EN: "✅ Yes, change it"},
     "btn_back": {UK: "« Назад", EN: "« Back"},
@@ -184,11 +185,40 @@ STRINGS: dict[str, dict[str, str]] = {
 
     # ── adding an account ──────────────────────────────────────────────────
     "add_send_key": {
-        UK: "Додаю {kind} акаунт.\n\nНадішли <b>API Key</b> від MEXC повідомленням:",
-        EN: "Adding {kind} account.\n\nSend the MEXC <b>API Key</b> as a message:",
+        UK: "Додаю {kind} акаунт.\n\nНадішли <b>API Key</b> від {exchange} повідомленням:",
+        EN: "Adding {kind} account.\n\nSend the {exchange} <b>API Key</b> as a message:",
+    },
+    "add_send_key_for": {
+        UK: "🔐 Додаю {kind} акаунт у папку <b>{folder}</b> ({exchange}).\n\n"
+            "Тут, в особистих, ключі не бачить ніхто, крім тебе.\n\n"
+            "Надішли <b>API Key</b> від {exchange} повідомленням:",
+        EN: "🔐 Adding {kind} account to folder <b>{folder}</b> ({exchange}).\n\n"
+            "Here, in private, nobody but you sees the keys.\n\n"
+            "Send the {exchange} <b>API Key</b> as a message:",
+    },
+    "add_in_private": {
+        UK: "🔐 Ключі {exchange} вводяться <b>тільки в особистих повідомленнях</b> з ботом.\n\n"
+            "У гілці їх прочитали б усі учасники групи — навіть якщо повідомлення одразу видалити, "
+            "сповіщення вже прийде.\n\nНатисни кнопку нижче: відкриється приватний чат, "
+            "там додаси акаунт, і меню оновиться тут.",
+        EN: "🔐 {exchange} keys are entered <b>only in a private chat</b> with the bot.\n\n"
+            "In the topic every group member would read them — deleting the message right away does "
+            "not help, the notification is already out.\n\nPress the button below: a private chat "
+            "opens, you add the account there, and the menu updates here.",
+    },
+    "btn_open_private": {UK: "🔐 Відкрити особистий чат", EN: "🔐 Open private chat"},
+    "add_link_invalid": {
+        UK: "❌ Посилання недійсне: папку не знайдено серед твоїх, або вона на іншій біржі. "
+            "Натисни «Додати акаунт» у гілці ще раз.",
+        EN: "❌ This link is not valid: the folder is not one of yours, or it is on another exchange. "
+            "Press “Add account” in the topic again.",
+    },
+    "add_done_go_back": {
+        UK: "✅ Акаунт додано. Меню в гілці оновлено — можна повертатись туди.",
+        EN: "✅ Account added. The menu in the topic is updated — you can go back there.",
     },
     "add_send_secret": {UK: "Тепер надішли <b>Secret Key</b>:", EN: "Now send the <b>Secret Key</b>:"},
-    "add_validating": {UK: "Перевіряю ключі на MEXC…", EN: "Validating with MEXC…"},
+    "add_validating": {UK: "Перевіряю ключі на {exchange}…", EN: "Validating with {exchange}…"},
     "add_cannot_connect": {UK: "❌ Не вдалося підключитись: {error}", EN: "❌ Could not connect: {error}"},
     "add_cannot_save": {UK: "❌ Не вдалося зберегти: {error}", EN: "❌ Could not save: {error}"},
     "add_done": {UK: "✅ <b>{label} додано</b>{warning}", EN: "✅ <b>{label} added</b>{warning}"},
@@ -200,6 +230,57 @@ STRINGS: dict[str, dict[str, str]] = {
 
     # ── control ────────────────────────────────────────────────────────────
     "not_authorized": {UK: "Немає доступу", EN: "Not authorized"},
+    # ── forum topics ───────────────────────────────────────────────────────
+    "topic_use_a_topic": {
+        UK: "Тут бот не працює — відкрий гілку <b>MEXC</b> або <b>HIBT</b>.",
+        EN: "The bot does not work here — open the <b>MEXC</b> or <b>HIBT</b> topic.",
+    },
+    "topic_not_bound": {
+        UK: "Ця гілка ще не прив'язана до біржі. Напиши тут <code>/bind mexc</code> або "
+            "<code>/bind hibt</code>.",
+        EN: "This topic is not bound to an exchange yet. Send <code>/bind mexc</code> or "
+            "<code>/bind hibt</code> here.",
+    },
+    "screen_not_yours": {
+        UK: "Це меню іншого користувача. Відкрий своє: /menu",
+        EN: "This menu belongs to someone else. Open your own: /menu",
+    },
+    "screen_stale": {
+        UK: "Це меню застаріло. Відкрий нове: /menu",
+        EN: "This menu is out of date. Open a new one: /menu",
+    },
+    "bind_only_in_topic": {
+        UK: "Цю команду треба писати всередині гілки форум-групи.",
+        EN: "Send this command inside a topic of a forum group.",
+    },
+    "bind_usage": {
+        UK: "Вкажи біржу: <code>/bind mexc</code> або <code>/bind hibt</code>.",
+        EN: "Name the exchange: <code>/bind mexc</code> or <code>/bind hibt</code>.",
+    },
+    "bind_done": {
+        UK: "✅ Гілку прив'язано до <b>{exchange}</b>. Кожен бачить тут лише свої акаунти {exchange}.",
+        EN: "✅ Topic bound to <b>{exchange}</b>. Everyone sees only their own {exchange} accounts here.",
+    },
+    "bind_auto": {
+        UK: "✅ Гілку розпізнано як <b>{exchange}</b>. Відкрити своє меню: /menu",
+        EN: "✅ Topic recognised as <b>{exchange}</b>. Open your menu: /menu",
+    },
+    "unbind_done": {
+        UK: "Гілку відв'язано. Бот тут більше не працює, поки її не прив'язати знову.",
+        EN: "Topic unbound. The bot will not work here until it is bound again.",
+    },
+    "topics_title": {UK: "📌 <b>Гілки цієї групи</b>", EN: "📌 <b>Topics in this group</b>"},
+    "topics_none": {UK: "Жодна гілка не прив'язана.", EN: "No topic is bound."},
+    "bot_not_admin": {
+        UK: "⚠️ Бот не адміністратор групи. Зроби його адміном — інакше він не побачить назви й "
+            "ціни, які ти вводиш у відповідь на його запитання, і не зможе прибирати старі меню.",
+        EN: "⚠️ The bot is not a group admin. Make it one — otherwise it cannot see the names and "
+            "prices you type in reply to its questions, and cannot tidy away old menus.",
+    },
+    "folder_exchange_in_topic": {
+        UK: "У гілці біржа фіксована. Щоб працювати з іншою біржею — перейди в її гілку.",
+        EN: "A topic's exchange is fixed. To work with another exchange, go to its topic.",
+    },
     "emergency_confirm": {
         UK: "⚠️ <b>АВАРІЙНИЙ СТОП</b>\n\nЦе зупинить копіювання І закриє всі позиції на "
             "<b>твоїх</b> follower-акаунтах. Скасувати неможливо.",
@@ -308,10 +389,24 @@ STRINGS: dict[str, dict[str, str]] = {
             "folder that is copying keeps copying.",
     },
     "folder_row": {
-        UK: "{mark} <b>{name}</b> — {accounts} акаунт(ів) · {state}",
-        EN: "{mark} <b>{name}</b> — {accounts} account(s) · {state}",
+        UK: "{mark} <b>{name}</b> [{exchange}] — {accounts} акаунт(ів) · {state}",
+        EN: "{mark} <b>{name}</b> [{exchange}] — {accounts} account(s) · {state}",
     },
     "folder_running": {UK: "🟢 працює", EN: "🟢 running"},
+    "folder_exchange_set": {
+        UK: "Біржа папки: {exchange}. Тепер додай акаунти з ключами саме цієї біржі.",
+        EN: "Folder exchange: {exchange}. Now add accounts with keys from this exchange.",
+    },
+    "folder_exchange_not_empty": {
+        UK: "Біржу можна змінити лише в порожній папці: ключі належать одній біржі. "
+            "Створи нову папку або видали акаунти з цієї.",
+        EN: "The exchange can only be changed on an empty folder: keys belong to one exchange. "
+            "Create a new folder or remove this one's accounts.",
+    },
+    "folder_exchange_refused": {
+        UK: "Не вдалося змінити біржу — папка не порожня або працює.",
+        EN: "Could not change the exchange — the folder is not empty or is running.",
+    },
     "folder_stopped": {UK: "🔴 зупинено", EN: "🔴 stopped"},
     "folder_name_ask": {
         UK: "Надішли назву папки повідомленням (до 40 символів).",

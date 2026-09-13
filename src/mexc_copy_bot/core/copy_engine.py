@@ -32,13 +32,13 @@ from typing import Any
 import aiohttp
 
 from ..db.store import Account, PositionRow, Store
+from ..exchange import DEFAULT_EXCHANGE, contract_specs, exchange_name, make_rest_client, normalize
 from ..mexc.rest import (
     ORDER_TYPE_LIMIT,
     SIDE_OPEN_LONG,
     SIDE_OPEN_SHORT,
     MexcError,
     MexcRestClient,
-    get_contract_specs,
 )
 from .orders import MasterOrder
 from .events import Action, MasterEvent
@@ -173,10 +173,18 @@ def _is_permanent(err: MexcError) -> bool:
 
 
 class CopyEngine:
-    def __init__(self, store: Store, session: aiohttp.ClientSession, *, retry_attempts: int = 3) -> None:
+    def __init__(
+        self,
+        store: Store,
+        session: aiohttp.ClientSession,
+        *,
+        retry_attempts: int = 3,
+        exchange: str = DEFAULT_EXCHANGE,
+    ) -> None:
         self._store = store
         self._session = session
         self._retry_attempts = max(1, retry_attempts)
+        self._exchange = normalize(exchange)
 
     async def execute(
         self,
@@ -271,7 +279,7 @@ class CopyEngine:
             credentials = await self._store.get_credentials(follower.id, follower.owner_id)
             if not credentials:
                 return follower, None, "credentials missing"
-            client = MexcRestClient(*credentials, session=self._session)
+            client = make_rest_client(credentials, session=self._session)
             side = order.side
             if reverse and follower.is_reversed:
                 # Opposite side of the same book. Not a price change: both accounts want the same
@@ -342,7 +350,7 @@ class CopyEngine:
             credentials = await self._store.get_credentials(follower.id, follower.owner_id)
             if not credentials:
                 return False
-            client = MexcRestClient(*credentials, session=self._session)
+            client = make_rest_client(credentials, session=self._session)
             try:
                 await client.cancel_orders([order_id])
                 return True
@@ -368,12 +376,12 @@ class CopyEngine:
         if event.action is Action.CLOSE or self._session is None:
             return None
         try:
-            specs = await get_contract_specs(self._session, event.symbol)
+            specs = await contract_specs(self._session, self._exchange, event.symbol)
         except Exception:  # noqa: BLE001 — an unavailable check must not stop a trade
             return None
         spec = specs.get(event.symbol)
         if spec and not spec.api_allowed:
-            return f"{event.symbol}: MEXC blocks API trading on this contract"
+            return f"{event.symbol}: {exchange_name(self._exchange)} blocks API trading on this contract"
         return None
 
     async def _run_follower(
@@ -414,8 +422,7 @@ class CopyEngine:
             await self._store.finish_task(task_id, status="FAILED", attempts=0, error="credentials missing")
             return FollowerResult(follower, False, event.action, vol, "credentials missing", None, side)
 
-        api_key, secret = credentials
-        client = MexcRestClient(api_key, secret, session=self._session)
+        client = make_rest_client(credentials, session=self._session)
 
         attempts = 0
         last_error: str | None = None
@@ -435,7 +442,7 @@ class CopyEngine:
                 if _is_blocked_contract(err):
                     # Say what actually happened. "Contract not activated" reads like an account
                     # setting the user could fix; it is MEXC refusing API orders on this contract.
-                    last_error = f"{event.symbol}: MEXC blocks API trading on this contract"
+                    last_error = f"{event.symbol}: {exchange_name(self._exchange)} blocks API trading on this contract"
                     LOGGER.warning("follower %s: %s", follower.id, last_error)
                     break
                 if _is_permanent(err):

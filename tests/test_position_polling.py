@@ -50,6 +50,9 @@ class Client:
 class CopyModeStore:
     """The master path is a COPY folder; REVERSE is watched by the group poller instead."""
 
+    async def get_folder(self, folder_id, owner_id):
+        return None  # no folder row: the service treats that as a MEXC folder
+
     async def get_mode(self, folder_id):
         return ("COPY", None)
 
