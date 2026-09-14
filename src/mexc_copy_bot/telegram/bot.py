@@ -56,6 +56,7 @@ from telegram.ext import (
 from ..config import Settings
 from ..core.copy_engine import FollowerResult
 from ..core.events import MasterEvent
+from ..core.ladder import LadderConfig, _clock, plan_ladder
 from ..core.registry import ServiceRegistry
 from ..core.stuck import StuckManager
 from ..db.store import (
@@ -78,6 +79,8 @@ from ..exchange import (
     make_rest_client,
     ticker_price,
 )
+from ..hibt import rest as hibt_rest
+from ..hibt.rest import HibtRestClient  # noqa: F401
 from ..mexc.rest import MexcError
 from . import messages
 from .i18n import EN, UK, t
@@ -102,6 +105,7 @@ ASK_KEY, ASK_SECRET = range(2)
 ASK_PRICE = 100
 ASK_FOLDER_NAME = 101
 ASK_RENAME = 102
+ASK_LADDER_VALUE = 103
 
 # Written out rather than inlined: patching this file has twice turned an escaped newline into
 # a real one, which is a syntax error that only shows up at import time.
@@ -186,6 +190,7 @@ def _menu_keyboard(
     stuck: int = 0,
     folder: str = "",
     columns: tuple[list, list, tuple[str, str]] | None = None,
+    show_ladder: bool = False,
 ) -> InlineKeyboardMarkup:
     control = (
         InlineKeyboardButton(t(lang, "btn_stop"), callback_data="stop")
@@ -205,6 +210,7 @@ def _menu_keyboard(
              InlineKeyboardButton(t(lang, "btn_lang"), callback_data="lang")],
         ]
         + legs
+        + ([[InlineKeyboardButton(t(lang, "btn_ladder"), callback_data="ladder")]] if show_ladder else [])
         + [
             [control],
             [InlineKeyboardButton(t(lang, "btn_emergency"), callback_data="emergency")],
@@ -376,6 +382,21 @@ class CopyBot:
         app.add_handler(price_conversation)
         app.add_handler(folder_conversation)
         app.add_handler(rename_conversation)
+
+        ladder_conversation = ConversationHandler(
+            entry_points=[CallbackQueryHandler(self._begin_ladder_value, pattern=r"^ldval:[a-z]+$")],
+            states={ASK_LADDER_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~MENU_FILTER, self._got_ladder_value)
+            ]},
+            fallbacks=[
+                CommandHandler("cancel", self._cancel_add),
+                MessageHandler(MENU_FILTER, self._restart_from_conversation),
+                CallbackQueryHandler(self._abandon_and_dispatch),
+            ],
+            allow_reentry=True,
+            per_message=False,
+        )
+        app.add_handler(ladder_conversation)
         app.add_handler(CallbackQueryHandler(self._on_button))
         self._app = app
         return app
@@ -865,6 +886,272 @@ class CopyBot:
     async def _bot_is_admin(self, chat) -> bool:
         return (await self._bot_rights(chat)).admin
 
+    # ── scheduled hedged entry (the ladder) ───────────────────────────────────────────────────
+    @staticmethod
+    def _new_draft() -> dict:
+        """A fresh entry form. Silver at 1000x in five slices is the case this was built for, so it
+        is what the form starts on; every field is editable before arming."""
+        return {"symbol": "XAG_USDT", "long_account": None, "short_account": None,
+                "leverage": 1000, "margin_usd": None, "parts": 5, "step_seconds": 1.0, "target": None}
+
+    def _draft(self, context) -> dict:
+        return context.user_data.setdefault("ladder", self._new_draft())
+
+    async def _ladder_accounts(self, owner_id: int) -> list:
+        folder_id = self._folder(owner_id)
+        master = await self._store.get_master(folder_id)
+        return ([master] if master else []) + await self._store.list_accounts(folder_id, FOLLOWER)
+
+    def _account_label(self, accounts: list, account_id, lang: str) -> str:
+        for a in accounts:
+            if a.id == account_id:
+                return a.label
+        return t(lang, "ladder_not_set")
+
+    async def _show_ladders(self, update: Update, owner_id: int) -> None:
+        lang = await self._lang(owner_id)
+        ladders = await self._store.list_ladders(owner_id, self._folder(owner_id))
+        lines = [t(lang, "ladder_title"), "", t(lang, "ladder_explain")]
+        rows = [[InlineKeyboardButton(t(lang, "btn_ladder_new"), callback_data="ldnew")]]
+        for l in ladders[:8]:
+            when = _clock(l["target_epoch"])
+            mark = {"ARMED": "🟡", "DONE": "🟢", "PARTIAL": "🟠", "FAILED": "🔴",
+                    "CANCELLED": "⚪", "RUNNING": "🔵", "INTERRUPTED": "⚫"}.get(l["status"], "•")
+            lines.append(f"{mark} <b>{l['symbol']}</b> {when} — {l['status']} "
+                         f"(${l['margin_usd']:g}×{l['leverage']}, {l['parts']}ч)")
+            if l["status"] == "ARMED":
+                rows.append([InlineKeyboardButton(
+                    t(lang, "btn_ladder_cancel", symbol=l["symbol"], when=when), callback_data=f"ldcancel:{l['id']}")])
+            elif l.get("report"):
+                lines.append(f"    <i>{l['report'][:160]}</i>")
+        rows.append([InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu")])
+        await update.callback_query.edit_message_text(
+            NEWLINE.join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+    async def _show_ladder_form(self, update: Update, owner_id: int, context) -> None:
+        lang = await self._lang(owner_id)
+        d = self._draft(context)
+        accounts = await self._ladder_accounts(owner_id)
+        long_label = self._account_label(accounts, d.get("long_account"), lang)
+        short_label = self._account_label(accounts, d.get("short_account"), lang)
+        size = (d["margin_usd"] * d["leverage"]) if d.get("margin_usd") else None
+        when = self._target_line(d.get("target"), lang)
+        lines = [
+            t(lang, "ladder_form_title"), "",
+            t(lang, "ladder_f_symbol", v=d["symbol"]),
+            t(lang, "ladder_f_long", v=long_label),
+            t(lang, "ladder_f_short", v=short_label),
+            t(lang, "ladder_f_leverage", v=d["leverage"]),
+            t(lang, "ladder_f_margin", v=(f"${d['margin_usd']:g}" if d.get("margin_usd") else t(lang, "ladder_not_set")),
+              size=(f"${size:,.0f}" if size else "—")),
+            t(lang, "ladder_f_parts", v=d["parts"]),
+            t(lang, "ladder_f_step", v=d["step_seconds"]),
+            t(lang, "ladder_f_target", v=when),
+        ]
+        rows = [
+            [InlineKeyboardButton(f"1️⃣ {d['symbol']}", callback_data="ldval:symbol")],
+            [InlineKeyboardButton(f"🟢 {long_label}", callback_data="ldacc:long"),
+             InlineKeyboardButton(f"🔴 {short_label}", callback_data="ldacc:short")],
+            [InlineKeyboardButton(f"⚙️ {d['leverage']}x", callback_data="ldval:leverage"),
+             InlineKeyboardButton(f"💵 {('$'+format(d['margin_usd'],'g')) if d.get('margin_usd') else '—'}", callback_data="ldval:margin")],
+            [InlineKeyboardButton(f"🔢 {d['parts']}ч", callback_data="ldval:parts"),
+             InlineKeyboardButton(f"⏳ {d['step_seconds']}s", callback_data="ldval:step")],
+            [InlineKeyboardButton(t(lang, "btn_ladder_time"), callback_data="ldval:target"),
+             InlineKeyboardButton(t(lang, "btn_ladder_swap"), callback_data="ldswap")],
+            [InlineKeyboardButton(t(lang, "btn_ladder_preview"), callback_data="ldplan")],
+            [InlineKeyboardButton(t(lang, "btn_ladder_arm"), callback_data="ldarm")],
+            [InlineKeyboardButton(t(lang, "btn_back"), callback_data="ladder")],
+        ]
+        await self._edit_or_send(update, owner_id, NEWLINE.join(lines), InlineKeyboardMarkup(rows))
+
+    async def _show_ladder_accounts(self, update: Update, owner_id: int, side: str) -> None:
+        lang = await self._lang(owner_id)
+        accounts = await self._ladder_accounts(owner_id)
+        rows = [[InlineKeyboardButton(f"{a.label} (…{a.api_key_hint})", callback_data=f"ldpick:{side}:{a.id}")]
+                for a in accounts]
+        rows.append([InlineKeyboardButton(t(lang, "btn_back"), callback_data="ldform")])
+        await update.callback_query.edit_message_text(
+            t(lang, "ladder_pick_long" if side == "long" else "ladder_pick_short"),
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+    async def _begin_ladder_value(self, update: Update, context) -> int:
+        owner_id = await self._guard(update)
+        if owner_id is None:
+            return ConversationHandler.END
+        await update.callback_query.answer()
+        field = update.callback_query.data.split(":", 1)[1]
+        context.user_data["ladder_field"] = field
+        context.user_data["flow_place"] = self._view(owner_id).place
+        await update.callback_query.edit_message_text(
+            t(await self._lang(owner_id), f"ladder_ask_{field}"),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                t(self._lang_now(owner_id), "btn_cancel_x"), callback_data="ldform")]]),
+            parse_mode=ParseMode.HTML)
+        return ASK_LADDER_VALUE
+
+    async def _got_ladder_value(self, update: Update, context) -> int:
+        owner_id = await self._guard(update)
+        if owner_id is None:
+            return ConversationHandler.END
+        if not self._in_flow_place(owner_id, context):
+            return ASK_LADDER_VALUE
+        lang = await self._lang(owner_id)
+        field = context.user_data.get("ladder_field")
+        raw = (update.message.text or "").strip()
+        d = self._draft(context)
+        if not self._apply_ladder_field(d, field, raw):
+            await update.message.reply_text(t(lang, "ladder_bad_value"))
+            return ASK_LADDER_VALUE
+        context.user_data.pop("flow_place", None)
+        context.user_data.pop("ladder_field", None)
+        await self._show_ladder_form(update, owner_id, context)
+        return ConversationHandler.END
+
+    async def _live_plan(self, owner_id: int, d: dict):
+        """Build a plan from the draft against live price/balances, or return (None, reason)."""
+        if not (d.get("long_account") and d.get("short_account") and d.get("margin_usd") and d.get("target")):
+            return None, "fields"
+        long_creds = await self._store.get_credentials(d["long_account"], owner_id)
+        short_creds = await self._store.get_credentials(d["short_account"], owner_id)
+        if not long_creds or not short_creds:
+            return None, "credentials missing"
+        symbol = d["symbol"]
+        async with aiohttp.ClientSession() as session:
+            rules = (await hibt_rest.load_symbols(session)).get(symbol)
+            if not rules:
+                return None, f"{symbol} not on HIBT"
+            long_client = make_rest_client(long_creds, session=session)
+            short_client = make_rest_client(short_creds, session=session)
+            price = await hibt_rest.get_ticker_price(session, symbol)
+            long_snap, short_snap = await asyncio.gather(
+                long_client.get_usdt_snapshot(), short_client.get_usdt_snapshot())
+        config = LadderConfig(
+            symbol=symbol, long_account=d["long_account"], short_account=d["short_account"],
+            leverage=int(d["leverage"]), margin_usd=float(d["margin_usd"]),
+            parts=int(d["parts"]), step_seconds=float(d["step_seconds"]), target_epoch=float(d["target"]))
+        plan = plan_ladder(
+            config, price=price, size_precision=hibt_rest.size_precision(rules),
+            min_order=float(rules.get("marketMiniAmount") or 0), latency_seconds=0.3,
+            available_long=long_snap.openable, available_short=short_snap.openable, now=__import__("time").time())
+        return plan, None
+
+    async def _show_ladder_plan(self, update: Update, owner_id: int, context) -> None:
+        lang = await self._lang(owner_id)
+        d = self._draft(context)
+        plan, reason = await self._live_plan(owner_id, d)
+        back = [[InlineKeyboardButton(t(lang, "btn_back"), callback_data="ldform")]]
+        if plan is None:
+            msg = t(lang, "ladder_need_fields") if reason == "fields" else f"✗ {reason}"
+            await update.callback_query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(back), parse_mode=ParseMode.HTML)
+            return
+        lines = [t(lang, "ladder_plan_title"), "",
+                 f"<b>{plan.config.symbol}</b>  ${plan.target_notional:,.0f}/акаунт × {plan.config.leverage}x",
+                 f"{plan.total_amount} × {plan.config.parts} " + t(lang, "ladder_slices")]
+        for sslice in plan.slices:
+            lines.append(f"   {sslice.index+1}. {sslice.amount} @ {_clock(sslice.send_epoch)} "
+                         f"(T−{plan.config.target_epoch - sslice.send_epoch:.1f}s)")
+        for w in plan.warnings:
+            lines.append("! " + w)
+        for e in plan.errors:
+            lines.append("✗ " + e)
+        rows = back if not plan.ok else [
+            [InlineKeyboardButton(t(lang, "btn_ladder_arm"), callback_data="ldarm")],
+            [InlineKeyboardButton(t(lang, "btn_back"), callback_data="ldform")]]
+        await update.callback_query.edit_message_text(
+            NEWLINE.join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+    async def _arm_ladder(self, update: Update, owner_id: int, context) -> None:
+        lang = await self._lang(owner_id)
+        d = self._draft(context)
+        plan, reason = await self._live_plan(owner_id, d)
+        if plan is None:
+            await update.callback_query.answer(
+                t(lang, "ladder_need_fields") if reason == "fields" else reason, show_alert=True)
+            return
+        if not plan.ok:
+            await update.callback_query.answer("✗ " + plan.errors[0], show_alert=True)
+            return
+        await self._store.create_ladder(
+            owner_id=owner_id, folder_id=self._folder(owner_id), symbol=d["symbol"],
+            long_account=d["long_account"], short_account=d["short_account"],
+            leverage=int(d["leverage"]), margin_usd=float(d["margin_usd"]),
+            parts=int(d["parts"]), step_seconds=float(d["step_seconds"]), target_epoch=float(d["target"]))
+        context.user_data.pop("ladder", None)
+        await update.callback_query.answer(t(lang, "ladder_armed_alert"), show_alert=True)
+        await self._show_ladders(update, owner_id)
+
+    def _target_line(self, epoch, lang: str) -> str:
+        if not epoch:
+            return t(lang, "ladder_not_set")
+        import time as _t
+        delta = epoch - _t.time()
+        return f"{_clock(epoch)} (" + (t(lang, "ladder_in", s=f"{delta:.0f}") if delta > 0 else t(lang, "ladder_past")) + ")"
+
+    @staticmethod
+    def _apply_ladder_field(d: dict, field: str, raw: str) -> bool:
+        """Set one draft field from typed text. Pure, so the parsing is tested on its own. Returns
+        False if the value could not be read, leaving the draft untouched."""
+        try:
+            if field == "symbol":
+                d["symbol"] = raw.upper().replace("-", "_").replace("/", "_")
+            elif field == "leverage":
+                d["leverage"] = max(1, int(raw))
+            elif field == "parts":
+                d["parts"] = max(1, int(raw))
+            elif field == "margin":
+                value = float(raw.replace(",", "."))
+                if value <= 0:
+                    return False
+                d["margin_usd"] = value
+            elif field == "step":
+                d["step_seconds"] = max(0.05, float(raw.replace(",", ".")))
+            elif field == "target":
+                d["target"] = CopyBot._parse_target(raw)
+            else:
+                return False
+        except (ValueError, TypeError):
+            return False
+        return True
+
+    @staticmethod
+    def _parse_target(text: str) -> float:
+        """Interpret a typed time: `+90` / `90s` seconds from now; `HH:MM[:SS]` today (Kyiv), next day
+        if already past; or a full `YYYY-MM-DD HH:MM[:SS]`. Kyiv time, because that is where the
+        person setting a silver open is looking at the clock; the form also shows a countdown so the
+        absolute zone can be sanity-checked."""
+        import time as _t
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo("Europe/Kyiv")
+        except Exception:  # noqa: BLE001 — fall back to the server clock if tz data is missing
+            tz = None
+        raw = text.strip().lower().replace("с", "s")
+        if raw.startswith("+") or raw.endswith("s"):
+            return _t.time() + float(raw.strip("+s"))
+        now = datetime.now(tz)
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(text.strip(), fmt).replace(tzinfo=tz).timestamp()
+            except ValueError:
+                pass
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                parsed = datetime.strptime(text.strip(), fmt).time()
+                when = now.replace(hour=parsed.hour, minute=parsed.minute, second=parsed.second, microsecond=0)
+                if when <= now:
+                    when = when.replace(day=now.day) + __import__("datetime").timedelta(days=1)
+                return when.timestamp()
+            except ValueError:
+                pass
+        raise ValueError("unrecognised time")
+
+    async def _edit_or_send(self, update: Update, owner_id: int, text: str, markup) -> None:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        else:
+            await self._send_here(owner_id, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
     def _lang_now(self, owner_id: int) -> str:
         """The cached language. Every handler calls _lang() early, so this is warm by the time a
         keyboard is built; the default only applies before anyone has interacted."""
@@ -1029,6 +1316,7 @@ class CopyBot:
                 await self._stuck_count(owner_id),
                 await self._folder_name(owner_id),
                 await self._menu_columns(owner_id),
+                show_ladder=self._view(owner_id).exchange == EXCHANGE_HIBT,
             ),
         )
 
@@ -1161,6 +1449,30 @@ class CopyBot:
             await self._confirm_delete_folder(update, owner_id)
         elif action == "fdel_ok":
             await self._delete_folder(update, owner_id)
+        elif action == "ladder":
+            await self._show_ladders(update, owner_id)
+        elif action == "ldnew":
+            context.user_data["ladder"] = self._new_draft()
+            await self._show_ladder_form(update, owner_id, context)
+        elif action == "ldform":
+            await self._show_ladder_form(update, owner_id, context)
+        elif action == "ldswap":
+            d = self._draft(context)
+            d["long_account"], d["short_account"] = d.get("short_account"), d.get("long_account")
+            await self._show_ladder_form(update, owner_id, context)
+        elif action.startswith("ldacc:"):
+            await self._show_ladder_accounts(update, owner_id, action.split(":", 1)[1])
+        elif action.startswith("ldpick:"):
+            _, side, acc = action.split(":")
+            self._draft(context)[f"{side}_account"] = int(acc)
+            await self._show_ladder_form(update, owner_id, context)
+        elif action == "ldplan":
+            await self._show_ladder_plan(update, owner_id, context)
+        elif action == "ldarm":
+            await self._arm_ladder(update, owner_id, context)
+        elif action.startswith("ldcancel:"):
+            await self._store.cancel_ladder(int(action.split(":", 1)[1]), owner_id)
+            await self._show_ladders(update, owner_id)
         elif action == "stuck":
             await self._show_stuck(update, owner_id)
         elif action.startswith("sg:"):
