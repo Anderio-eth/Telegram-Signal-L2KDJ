@@ -135,6 +135,14 @@ def test_a_closed_position_is_rebuilt_from_its_orders_net_of_fees():
     assert rows[999]["realised"] == pytest.approx(-3.1)
 
 
+def test_a_minimum_finer_than_the_declared_precision_is_still_orderable():
+    # cl_usdt, as the venue reported it: precision 0, minimum 0.01.
+    rules = {"volumePrecision": 0, "marketMiniAmount": "0.01"}
+    assert rest.size_precision(rules) == 2
+    assert str(rest.floor_amount(0.01, rest.size_precision(rules))) == "0.01"
+    assert rest.size_precision({"volumePrecision": 2, "marketMiniAmount": "10"}) == 2
+
+
 def test_sizes_round_down_never_up():
     assert str(rest.floor_amount(0.2394, 2)) == "0.23"
     assert str(rest.floor_amount(0.18000000000000002, 2)) == "0.18"

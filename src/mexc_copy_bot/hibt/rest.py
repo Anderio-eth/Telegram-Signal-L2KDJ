@@ -251,7 +251,8 @@ def closed_rows(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     grouped: dict[int, dict[str, Any]] = {}
     for raw in orders:
-        position_id = _position_id(raw.get("positionID"))
+        # The trade history names it positionId; the order endpoints positionID.
+        position_id = _position_id(raw.get("positionID") or raw.get("positionId"))
         if not position_id:
             continue
         row = grouped.setdefault(
@@ -302,6 +303,20 @@ def floor_amount(vol: float, precision: int) -> Decimal:
         return Decimal(0)
     step = Decimal(1).scaleb(-max(0, int(precision)))
     return value.quantize(step, rounding=ROUND_DOWN)
+
+
+def size_precision(rules: dict[str, Any]) -> int:
+    """How many decimals a size may have on a contract.
+
+    The venue's own figures disagree with each other on some contracts. Measured 2026-09-14:
+    cl_usdt reports volumePrecision 0 alongside a minimum order of 0.01 — flooring to whole units
+    turned the smallest order the venue advertises into zero. The minimum is the more specific of
+    the two claims, so a size is never floored more coarsely than the minimum itself is written.
+    """
+    declared = _int(rules.get("volumePrecision"), 0)
+    minimum = str(rules.get("marketMiniAmount") or rules.get("limitMiniAmount") or "")
+    implied = len(minimum.split(".", 1)[1].rstrip("0")) if "." in minimum else 0
+    return max(declared, implied)
 
 
 def _rows(data: Any) -> list[dict[str, Any]]:
@@ -520,11 +535,17 @@ class HibtRestClient:
         ]
 
     async def _finished_orders(self, symbol: str | None) -> list[dict[str, Any]]:
-        # UNVERIFIED: the paging parameter names are not in the docs, so none are sent and the
-        # venue's default page applies. Enough to settle a close that just happened, which is the
-        # only thing this is used for.
-        params = {"symbol": to_venue(symbol)} if symbol else None
-        return _rows(await self._request("GET", "/v2/order/finished", params))
+        """Filled orders on one symbol, with their realised PnL.
+
+        Measured on a live key, 2026-09-14: /v2/order/finished refuses every parameter set the docs
+        suggest (210001 "param error" with and without symbol, page, size, pageSize, limit, time
+        range). /v2/account/order — "trading history with fills and realised P&L" — answers with a
+        symbol, and refuses without one. So a symbol is required, and without it there is nothing
+        to ask for.
+        """
+        if not symbol:
+            return []
+        return _rows(await self._request("GET", "/v2/account/order", {"symbol": to_venue(symbol)}))
 
     async def get_closed_positions_raw(self, symbol: str | None = None, *, page_size: int = 50) -> list[dict[str, Any]]:
         return closed_rows(await self._finished_orders(symbol))[:page_size]
@@ -634,9 +655,9 @@ class HibtRestClient:
             raise HibtError(None, "limit order requires a price", endpoint=endpoint)
 
         rules = await self._spec_row(symbol)
-        precision = _int(rules.get("volumePrecision"), 8) if rules else 8
-        amount = floor_amount(vol, precision)
         minimum = _num(rules.get("marketMiniAmount" if is_market else "limitMiniAmount")) if rules else 0.0
+        precision = size_precision(rules) if rules else 8
+        amount = floor_amount(vol, precision)
         if amount <= 0 or (minimum and float(amount) < minimum):
             raise HibtError(
                 None,
@@ -651,7 +672,9 @@ class HibtRestClient:
             "type": VENUE_TYPE_MARKET if is_market else VENUE_TYPE_LIMIT,
             "side": VENUE_SIDE_BUY if side == SIDE_OPEN_LONG else VENUE_SIDE_SELL,
             "leverage": int(leverage),
-            "amount": format(amount, "f"),
+            # "10", not "10.00": the venue writes sizes without trailing zeros, and it is not worth
+            # finding out on a live order whether it accepts them.
+            "amount": format(amount.normalize(), "f"),
         }
         if order_type == ORDER_TYPE_POST_ONLY:
             # HIBT has no post-only type. A plain limit can take liquidity if the book has moved,
