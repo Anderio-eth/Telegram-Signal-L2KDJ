@@ -381,6 +381,72 @@ class Store:
                 owner_id, exchange, folder_id,
             )
 
+    # ── scheduled ladders ─────────────────────────────────────────────────────────────────────
+    async def create_ladder(self, **fields) -> int:
+        cols = ("owner_id", "folder_id", "symbol", "long_account", "short_account",
+                "leverage", "margin_usd", "parts", "step_seconds", "target_epoch")
+        values = [fields[c] for c in cols]
+        placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                f"INSERT INTO copy_ladders ({', '.join(cols)}) VALUES ({placeholders}) RETURNING id",
+                *values,
+            )
+
+    async def list_ladders(self, owner_id: int, folder_id: int | None = None) -> list[dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM copy_ladders WHERE owner_id = $1"
+                " AND ($2::bigint IS NULL OR folder_id = $2) ORDER BY target_epoch DESC LIMIT 20",
+                owner_id, folder_id,
+            )
+        return [dict(r) for r in rows]
+
+    async def get_ladder(self, ladder_id: int, owner_id: int) -> dict[str, Any] | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM copy_ladders WHERE id = $1 AND owner_id = $2", ladder_id, owner_id)
+        return dict(row) if row else None
+
+    async def cancel_ladder(self, ladder_id: int, owner_id: int) -> bool:
+        """Only an armed ladder can be cancelled; one already firing is left alone."""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE copy_ladders SET status = 'CANCELLED', updated_at = now()"
+                " WHERE id = $1 AND owner_id = $2 AND status = 'ARMED'", ladder_id, owner_id)
+        return result.endswith("1")
+
+    async def due_ladders(self, cutoff_epoch: float) -> list[dict[str, Any]]:
+        """Armed ladders whose start window has arrived (target within `cutoff` of now)."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM copy_ladders WHERE status = 'ARMED' AND target_epoch <= $1"
+                " ORDER BY target_epoch", cutoff_epoch)
+        return [dict(r) for r in rows]
+
+    async def claim_ladder(self, ladder_id: int) -> bool:
+        """Move a ladder ARMED -> RUNNING atomically, so only one loop can ever fire it."""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE copy_ladders SET status = 'RUNNING', updated_at = now()"
+                " WHERE id = $1 AND status = 'ARMED'", ladder_id)
+        return result.endswith("1")
+
+    async def finish_ladder(self, ladder_id: int, status: str, report: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE copy_ladders SET status = $2, report = $3, updated_at = now() WHERE id = $1",
+                ladder_id, status, report)
+
+    async def expire_stuck_ladders(self) -> None:
+        """A ladder left RUNNING across a restart never finished — the process died mid-fire. Mark it
+        so it is not silently forgotten, and never re-fire it: re-opening a timed entry late is worse
+        than not opening it."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE copy_ladders SET status = 'INTERRUPTED', updated_at = now()"
+                " WHERE status = 'RUNNING'")
+
     async def record_screen_owner(self, chat_id: int, message_id: int, owner_id: int) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(

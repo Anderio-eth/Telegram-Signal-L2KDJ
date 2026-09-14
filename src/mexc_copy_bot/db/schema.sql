@@ -397,3 +397,27 @@ CREATE TABLE IF NOT EXISTS copy_screen_owners (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (chat_id, message_id)
 );
+
+-- ── scheduled hedged entries (the ladder) ─────────────────────────────────────────────────────────
+-- One armed entry: open `symbol` on two accounts at once, opposite sides, sliced into `parts` market
+-- orders ending at `target_epoch`. Stored so it survives a restart and fires from a background loop
+-- rather than from whoever happens to have the menu open — the whole point is a precise time nobody
+-- has to sit and wait for. `report` holds the outcome once it has run.
+CREATE TABLE IF NOT EXISTS copy_ladders (
+    id            BIGSERIAL   PRIMARY KEY,
+    owner_id      BIGINT      NOT NULL,
+    folder_id     BIGINT      REFERENCES copy_folders(id) ON DELETE CASCADE,
+    symbol        TEXT        NOT NULL,
+    long_account  BIGINT      NOT NULL,
+    short_account BIGINT      NOT NULL,
+    leverage      INTEGER     NOT NULL,
+    margin_usd    DOUBLE PRECISION NOT NULL,
+    parts         INTEGER     NOT NULL,
+    step_seconds  DOUBLE PRECISION NOT NULL,
+    target_epoch  DOUBLE PRECISION NOT NULL,
+    status        TEXT        NOT NULL DEFAULT 'ARMED',
+    report        TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS copy_ladders_armed ON copy_ladders (status, target_epoch);

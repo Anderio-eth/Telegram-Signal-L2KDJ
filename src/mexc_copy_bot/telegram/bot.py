@@ -682,6 +682,20 @@ class CopyBot:
         await self._store.remember_view(owner_id, exchange, place.chat_id, place.thread_id, name or None)
         self._places[(owner_id, exchange)] = (place, name)
 
+    async def post_to_folder(self, owner_id: int, folder_id: int | None, text: str) -> None:
+        """Send an unsolicited message about a folder into wherever that owner works with it.
+
+        The entry point the ladder scheduler reports through: it runs in its own background task with
+        no Telegram update behind it, so this sets the view itself and reuses the same _send that
+        every other outbound message goes through (topic-aware, private-chat fallback).
+        """
+        if not self._app:
+            return
+        _, view = await self._enter_folder_view(owner_id, folder_id)
+        with contextlib.suppress(Exception):
+            await self._send(view.place, owner_id, text, parse_mode=ParseMode.HTML)
+        await self._refresh_menu(owner_id)
+
     async def _enter_folder_view(self, owner_id: int, folder_id: int | None):
         """Set up the view a background message about `folder_id` is shown in.
 

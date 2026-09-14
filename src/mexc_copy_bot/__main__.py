@@ -13,6 +13,7 @@ import logging
 from telegram.ext import Application
 
 from .config import Settings
+from .core.ladder_scheduler import LadderScheduler
 from .core.registry import ServiceRegistry
 from .db.store import Store
 from .security.encryption import CredentialCipher
@@ -29,10 +30,17 @@ async def _startup(app: Application) -> None:
     # and one owner having stopped must not stop the other from resuming.
     await registry.resume_persisted()
 
+    # Start the background loop that fires scheduled hedged entries at their time. It reports each
+    # outcome into the owner's topic through the bot.
+    scheduler: LadderScheduler = app.bot_data["ladder_scheduler"]
+    await scheduler.start()
+
 
 async def _shutdown(app: Application) -> None:
     registry: ServiceRegistry = app.bot_data["registry"]
     store: Store = app.bot_data["store"]
+    scheduler: LadderScheduler = app.bot_data["ladder_scheduler"]
+    await scheduler.stop()
     # Note: this tears down the sockets but does NOT flip anyone's persisted running flag off,
     # so a restart resumes them. Only an explicit STOP from Telegram clears it.
     await registry.shutdown()
@@ -64,8 +72,10 @@ def main() -> None:
     )
     bot = CopyBot(settings, store, registry)
     app = bot.build()
+    scheduler = LadderScheduler(store, on_report=bot.post_to_folder)
     app.bot_data["registry"] = registry
     app.bot_data["store"] = store
+    app.bot_data["ladder_scheduler"] = scheduler
     app.post_init = _startup
     app.post_shutdown = _shutdown
 
