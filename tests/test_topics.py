@@ -4,9 +4,10 @@ These drive the real handlers with real telegram objects. Only the two things at
 fakes — the database, and Telegram's servers — so what is under test is exactly the wiring that
 decides where a person is, what they may see there, and where the bot's own messages land.
 
-The failures they guard against are all quiet ones: a menu that renders somebody else's accounts,
-a report that lands in General, a folder of the wrong exchange opening in a topic, API keys typed
-into a group, a rename answered in the wrong topic renaming the wrong folder.
+Each user runs the bot in a forum group of their own. The failures guarded against here are all quiet
+ones: somebody acting in a group that is not theirs, a report that lands in General or at a group the
+bot was removed from, a folder of the wrong exchange opening in a topic, API keys typed into a group,
+a rename answered in the wrong topic renaming the wrong folder.
 """
 
 from __future__ import annotations
@@ -17,8 +18,22 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from telegram import CallbackQuery, Chat, ForumTopicCreated, InlineKeyboardMarkup, Message, MessageEntity, Update, User
-from telegram.error import BadRequest
+from telegram import (
+    CallbackQuery,
+    Chat,
+    ChatMemberAdministrator,
+    ChatMemberLeft,
+    ChatMemberMember,
+    ChatMemberUpdated,
+    ForumTopic,
+    ForumTopicCreated,
+    InlineKeyboardMarkup,
+    Message,
+    MessageEntity,
+    Update,
+    User,
+)
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import ConversationHandler
 
 import mexc_copy_bot.telegram.bot as bot_module
@@ -27,6 +42,7 @@ from mexc_copy_bot.db.store import FOLLOWER, MASTER, Folder
 from mexc_copy_bot.exchange import EXCHANGE_HIBT, EXCHANGE_MEXC
 from mexc_copy_bot.telegram import topics
 from mexc_copy_bot.telegram.bot import ASK_FOLDER_NAME, ASK_KEY, CopyBot
+from mexc_copy_bot.telegram.i18n import t
 from mexc_copy_bot.telegram.topics import CURRENT_VIEW, Place, View
 
 ANNA, BORYS, STRANGER = 111, 222, 333
@@ -66,6 +82,18 @@ class FakeStore:
         self.topics: dict[tuple[int, int], tuple[str, str | None]] = {}
         self.views: dict[tuple[int, str], dict] = {}
         self.screens: dict[tuple[int, int], int] = {}
+        self.groups: dict[int, int] = {}
+
+    async def group_owner(self, chat_id):
+        return self.groups.get(chat_id)
+
+    async def claim_group(self, chat_id, owner_id, title):
+        return self.groups.setdefault(chat_id, owner_id)
+
+    async def release_group(self, chat_id):
+        self.groups.pop(chat_id, None)
+        self.topics = {k: v for k, v in self.topics.items() if k[0] != chat_id}
+        self.views = {k: v for k, v in self.views.items() if v.get("chat_id") != chat_id}
 
     async def get_language(self, owner_id):
         return "uk"
@@ -168,8 +196,13 @@ class FakeTelegram:
         self.alerts: list[str | None] = []
         self.ids = itertools.count(1000)
         self.missing_threads: set[int] = set()
+        self.kicked_from: set[int] = set()
+        self.left: list[int] = []
+        self.created_topics: list[str] = []
 
     async def send_message(self, chat_id, text, message_thread_id=None, reply_markup=None, **_kw):
+        if chat_id in self.kicked_from:
+            raise Forbidden("Forbidden: bot was kicked from the supergroup chat")
         if message_thread_id in self.missing_threads:
             raise BadRequest("Message thread not found")
         chat = Chat(id=chat_id, type=Chat.SUPERGROUP if chat_id < 0 else Chat.PRIVATE, is_forum=chat_id < 0)
@@ -193,6 +226,14 @@ class FakeTelegram:
         self.deleted.append((chat_id, message_id))
         return True
 
+    async def create_forum_topic(self, chat_id, name, **_kw):
+        self.created_topics.append(name)
+        return ForumTopic(message_thread_id=500 + len(self.created_topics), name=name, icon_color=0)
+
+    async def leave_chat(self, chat_id, **_kw):
+        self.left.append(chat_id)
+        return True
+
 
 class _Settings:
     bot_token = "123456:AAHfake-token-for-dispatch-tests"
@@ -206,16 +247,18 @@ def world(monkeypatch):
     copybot = CopyBot(_Settings(), store=store, registry=FakeRegistry())
     copybot._app = SimpleNamespace(bot=telegram)
 
-    async def admin(_chat):
-        return True
-    monkeypatch.setattr(copybot, "_bot_is_admin", admin)
+    rights = SimpleNamespace(admin=True, manage_topics=True)
+
+    async def bot_rights(_chat):
+        return rights
+    monkeypatch.setattr(copybot, "_bot_rights", bot_rights)
 
     # Reports must not reach a real exchange for prices.
     async def no_price(*_a, **_kw):
         raise RuntimeError("offline")
     monkeypatch.setattr(bot_module, "contract_specs", no_price)
     monkeypatch.setattr(bot_module, "ticker_price", no_price)
-    return SimpleNamespace(bot=copybot, store=store, telegram=telegram)
+    return SimpleNamespace(bot=copybot, store=store, telegram=telegram, rights=rights)
 
 
 def command_entities(text):
@@ -229,8 +272,8 @@ def user(user_id):
     return User(id=user_id, first_name={ANNA: "Anna", BORYS: "Borys"}.get(user_id, "Stranger"), is_bot=False)
 
 
-def topic_message(telegram, who, text, thread, title=None, chat_id=GROUP):
-    chat = Chat(id=chat_id, type=Chat.SUPERGROUP, is_forum=True)
+def topic_message(telegram, who, text, thread, title=None, chat_id=GROUP, forum=True):
+    chat = Chat(id=chat_id, type=Chat.SUPERGROUP, is_forum=forum, title="Anna's desk")
     root = None
     if title is not None:
         # Telegram attaches the topic's creation message to posts inside it; that is where the
@@ -353,19 +396,17 @@ def test_a_folder_from_another_exchange_cannot_be_opened_in_a_topic(world):
     assert world.store.views[(ANNA, EXCHANGE_HIBT)]["folder_id"] == hibt_folder
 
 
-# ── one topic, several people ────────────────────────────────────────────────────────────────────
-def test_two_members_get_separate_menus_and_folders(world):
+# ── one group, one owner ─────────────────────────────────────────────────────────────────────────
+def test_a_group_belongs_to_whoever_set_it_up_first(world):
     run(world.bot._cmd_start(topic_message(world.telegram, ANNA, "/menu", HIBT_TOPIC, title="HIBT"), context()))
     run(world.bot._cmd_start(topic_message(world.telegram, BORYS, "/menu", HIBT_TOPIC, title="HIBT"), context()))
 
-    anna, borys = menu_in(world, ANNA, HIBT_TOPIC), menu_in(world, BORYS, HIBT_TOPIC)
-    assert anna.message_id != borys.message_id
-    assert "Anna" in anna.text and "Borys" in borys.text
-    owners = {f.owner_id for f in world.store.folders.values()}
-    assert owners == {ANNA, BORYS}
+    assert world.store.groups[GROUP] == ANNA
+    assert {f.owner_id for f in world.store.folders.values()} == {ANNA}  # nothing was made for Borys
+    assert world.telegram.sent[-1].text == t("uk", "group_not_yours")
 
 
-def test_pressing_someone_elses_menu_does_nothing_to_it(world):
+def test_nobody_else_can_press_anything_in_an_owned_group(world):
     run(world.bot._cmd_start(topic_message(world.telegram, ANNA, "/menu", HIBT_TOPIC, title="HIBT"), context()))
     annas_menu = menu_in(world, ANNA, HIBT_TOPIC)
     edits_before = len(world.telegram.edits)
@@ -373,13 +414,134 @@ def test_pressing_someone_elses_menu_does_nothing_to_it(world):
     run(world.bot._on_button(press(world.telegram, BORYS, "positions", on=annas_menu), context()))
 
     assert len(world.telegram.edits) == edits_before
-    assert "іншого користувача" in (world.telegram.alerts[-1] or "")
+    assert world.telegram.alerts[-1] == t("uk", "group_not_yours")
+
+
+def test_nobody_else_can_rebind_an_owned_groups_topics(world):
+    run(world.bot._cmd_start(topic_message(world.telegram, ANNA, "/menu", HIBT_TOPIC, title="HIBT"), context()))
+    run(world.bot._cmd_bind(topic_message(world.telegram, BORYS, "/bind mexc", HIBT_TOPIC, title="HIBT"), context(["mexc"])))
+    assert world.store.topics[(GROUP, HIBT_TOPIC)][0] == EXCHANGE_HIBT
+
+
+def test_a_button_left_in_an_unowned_group_does_not_claim_it(world):
+    stale = Message(message_id=1, date=NOW, chat=Chat(id=GROUP, type=Chat.SUPERGROUP, is_forum=True),
+                    message_thread_id=HIBT_TOPIC, is_topic_message=True)
+    stale.set_bot(world.telegram)
+    run(world.bot._on_button(press(world.telegram, BORYS, "menu", on=stale), context()))
+    assert GROUP not in world.store.groups
 
 
 def test_someone_not_on_the_whitelist_is_refused_in_a_topic_too(world):
     run(world.bot._cmd_start(topic_message(world.telegram, ANNA, "/menu", HIBT_TOPIC, title="HIBT"), context()))
     run(world.bot._on_button(press(world.telegram, STRANGER, "menu", on=menu_in(world, ANNA, HIBT_TOPIC)), context()))
     assert world.telegram.alerts[-1] == "Немає доступу"
+
+
+# ── adding the bot to a group, /setup, removing it ───────────────────────────────────────────────
+def membership(telegram, who, old, new, chat_id=GROUP):
+    bot_user = User(id=telegram.id, first_name="copybot", is_bot=True)
+    statuses = {"left": ChatMemberLeft(bot_user), "member": ChatMemberMember(bot_user)}
+    admin = ChatMemberAdministrator(
+        bot_user, can_be_edited=False, is_anonymous=False, can_manage_chat=True, can_delete_messages=True,
+        can_manage_video_chats=False, can_restrict_members=False, can_promote_members=False,
+        can_change_info=False, can_invite_users=False, can_post_stories=False, can_edit_stories=False,
+        can_delete_stories=False, can_manage_topics=True,
+    )
+    statuses["administrator"] = admin
+    change = ChatMemberUpdated(
+        chat=Chat(id=chat_id, type=Chat.SUPERGROUP, is_forum=True, title="Anna's desk"),
+        from_user=user(who), date=NOW, old_chat_member=statuses[old], new_chat_member=statuses[new],
+    )
+    return Update(update_id=next(telegram.ids), my_chat_member=change)
+
+
+def test_adding_the_bot_makes_the_group_yours_and_says_how_to_set_it_up(world):
+    run(world.bot._on_membership(membership(world.telegram, ANNA, "left", "member"), context()))
+    assert world.store.groups[GROUP] == ANNA
+    assert "/setup" in world.telegram.sent[-1].text and "Anna" in world.telegram.sent[-1].text
+
+
+def test_the_bot_leaves_a_group_it_was_added_to_by_someone_without_access(world):
+    run(world.bot._on_membership(membership(world.telegram, STRANGER, "left", "member"), context()))
+    assert world.telegram.left == [GROUP]
+    assert GROUP not in world.store.groups
+
+
+def test_being_made_admin_prompts_setup(world):
+    run(world.bot._on_membership(membership(world.telegram, ANNA, "left", "member"), context()))
+    run(world.bot._on_membership(membership(world.telegram, ANNA, "member", "administrator"), context()))
+    assert world.telegram.sent[-1].text == t("uk", "bot_promoted")
+
+
+def test_setup_creates_both_topics_and_binds_them(world):
+    run(world.bot._cmd_setup(topic_message(world.telegram, ANNA, "/setup", thread=None), context()))
+
+    assert sorted(world.telegram.created_topics) == ["HIBT", "MEXC"]
+    assert sorted(ex for ex, _ in world.store.topics.values()) == [EXCHANGE_HIBT, EXCHANGE_MEXC]
+    assert world.store.groups[GROUP] == ANNA
+    # Run again: nothing is created twice.
+    run(world.bot._cmd_setup(topic_message(world.telegram, ANNA, "/setup", thread=None), context()))
+    assert len(world.telegram.created_topics) == 2
+
+
+def test_setup_only_creates_what_is_missing(world):
+    run(world.bot._cmd_start(topic_message(world.telegram, ANNA, "/menu", MEXC_TOPIC, title="MEXC"), context()))
+    run(world.bot._cmd_setup(topic_message(world.telegram, ANNA, "/setup", thread=None), context()))
+    assert world.telegram.created_topics == ["HIBT"]
+
+
+def test_a_topic_created_by_setup_is_not_announced_twice(world):
+    run(world.bot._cmd_setup(topic_message(world.telegram, ANNA, "/setup", thread=None), context()))
+    thread = next(th for (chat, th), (ex, _) in world.store.topics.items() if ex == EXCHANGE_HIBT)
+    sent_before = len(world.telegram.sent)
+
+    event = topic_message(world.telegram, ANNA, None, thread)
+    event.message._unfreeze()
+    event.message.forum_topic_created = ForumTopicCreated("HIBT", 0)
+    run(world.bot._on_topic_event(event, context()))
+
+    assert len(world.telegram.sent) == sent_before
+
+
+@pytest.mark.parametrize(
+    ("forum", "admin", "manage_topics", "expected"),
+    [
+        (False, True, True, "setup_not_forum"),
+        (True, False, False, "setup_need_admin"),
+        (True, True, False, "setup_need_topics_right"),
+    ],
+)
+def test_setup_says_which_switch_is_still_off(world, forum, admin, manage_topics, expected):
+    world.rights.admin, world.rights.manage_topics = admin, manage_topics
+    run(world.bot._cmd_setup(topic_message(world.telegram, ANNA, "/setup", thread=None, forum=forum), context()))
+    assert world.telegram.created_topics == []
+    assert world.telegram.sent[-1].text == t("uk", expected, names="MEXC, HIBT")
+
+
+def test_removing_the_bot_releases_the_group_and_reports_go_privately(world):
+    run(world.bot._cmd_start(topic_message(world.telegram, ANNA, "/menu", HIBT_TOPIC, title="HIBT"), context()))
+    hibt_folder = world.store.views[(ANNA, EXCHANGE_HIBT)]["folder_id"]
+
+    run(world.bot._on_membership(membership(world.telegram, ANNA, "member", "left"), context()))
+    assert GROUP not in world.store.groups and not world.store.topics
+
+    async def background():
+        await world.bot._report_for(ANNA, hibt_folder)(_event(), [])
+    run(background())
+    report = next(m for m in world.telegram.sent if "ETH_USDT" in (m.text or ""))
+    assert (report.chat_id, report.message_thread_id) == (ANNA, None)
+
+
+def test_a_group_that_throws_the_bot_out_without_notice_does_not_swallow_reports(world):
+    run(world.bot._cmd_start(topic_message(world.telegram, ANNA, "/menu", HIBT_TOPIC, title="HIBT"), context()))
+    hibt_folder = world.store.views[(ANNA, EXCHANGE_HIBT)]["folder_id"]
+    world.telegram.kicked_from.add(GROUP)
+
+    async def background():
+        await world.bot._report_for(ANNA, hibt_folder)(_event(), [])
+    run(background())
+    report = next(m for m in world.telegram.sent if "ETH_USDT" in (m.text or ""))
+    assert (report.chat_id, report.message_thread_id) == (ANNA, None)
 
 
 # ── keys never go into the group ─────────────────────────────────────────────────────────────────

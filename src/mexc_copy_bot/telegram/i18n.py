@@ -232,8 +232,60 @@ STRINGS: dict[str, dict[str, str]] = {
     "not_authorized": {UK: "Немає доступу", EN: "Not authorized"},
     # ── forum topics ───────────────────────────────────────────────────────
     "topic_use_a_topic": {
-        UK: "Тут бот не працює — відкрий гілку <b>MEXC</b> або <b>HIBT</b>.",
-        EN: "The bot does not work here — open the <b>MEXC</b> or <b>HIBT</b> topic.",
+        UK: "Тут бот не працює — відкрий гілку <b>MEXC</b> або <b>HIBT</b>. Якщо їх ще немає, напиши /setup.",
+        EN: "The bot does not work here — open the <b>MEXC</b> or <b>HIBT</b> topic. If there are none yet, send /setup.",
+    },
+    "group_not_yours": {
+        UK: "Ця група належить іншому користувачу. Додай бота у <b>свою</b> групу з гілками.",
+        EN: "This group belongs to another user. Add the bot to a group of <b>your own</b>.",
+    },
+    "group_not_set_up": {
+        UK: "Бот у цій групі ще не налаштований. Напиши /setup.",
+        EN: "The bot is not set up in this group yet. Send /setup.",
+    },
+    "group_refused_leaving": {
+        UK: "Додавати цього бота можуть лише користувачі з доступом. Виходжу з групи.",
+        EN: "Only users with access can add this bot. Leaving the group.",
+    },
+    "group_welcome": {
+        UK: "👋 Привіт, {name}! Ця група тепер твоя — тут буде твоє керування ботом.\n\n"
+            "Щоб налаштувати:\n"
+            "1. Увімкни <b>«Теми»</b> в налаштуваннях групи.\n"
+            "2. Зроби бота <b>адміністратором</b> з правом <b>«Керувати темами»</b>.\n"
+            "3. Напиши /setup — я сам створю гілки <b>MEXC</b> і <b>HIBT</b>.",
+        EN: "👋 Hi, {name}! This group is now yours — this is where you control the bot.\n\n"
+            "To set it up:\n"
+            "1. Turn on <b>Topics</b> in the group settings.\n"
+            "2. Make the bot an <b>admin</b> with the <b>Manage topics</b> right.\n"
+            "3. Send /setup — I will create the <b>MEXC</b> and <b>HIBT</b> topics myself.",
+    },
+    "bot_promoted": {
+        UK: "Бот тепер адміністратор. Напиши /setup.",
+        EN: "The bot is an admin now. Send /setup.",
+    },
+    "setup_not_forum": {
+        UK: "У цій групі вимкнені <b>«Теми»</b>. Увімкни їх у налаштуваннях групи й напиши /setup ще раз.",
+        EN: "<b>Topics</b> are off in this group. Turn them on in the group settings and send /setup again.",
+    },
+    "setup_need_admin": {
+        UK: "Зроби бота <b>адміністратором</b> групи з правом <b>«Керувати темами»</b> і напиши /setup ще раз.",
+        EN: "Make the bot a group <b>admin</b> with the <b>Manage topics</b> right and send /setup again.",
+    },
+    "setup_need_topics_right": {
+        UK: "Боту бракує права <b>«Керувати темами»</b>, щоб створити гілки: {names}. "
+            "Дай йому це право й напиши /setup — або створи гілки з такими назвами сам, я їх розпізнаю.",
+        EN: "The bot lacks the <b>Manage topics</b> right to create: {names}. "
+            "Grant it and send /setup — or create topics with those names yourself, I will recognise them.",
+    },
+    "setup_topic_ready": {
+        UK: "Гілка <b>{exchange}</b> готова. Відкрий своє меню: /menu",
+        EN: "The <b>{exchange}</b> topic is ready. Open your menu: /menu",
+    },
+    "setup_done": {
+        UK: "✅ Готово. Гілки: <b>{topics}</b>.\n\n"
+            "Далі — /menu у потрібній гілці. Ключі API додаються лише в особистих повідомленнях з ботом.",
+        EN: "✅ Done. Topics: <b>{topics}</b>.\n\n"
+            "Next — /menu in the topic you want. API keys are added only in a private chat with the bot.",
     },
     "topic_not_bound": {
         UK: "Ця гілка ще не прив'язана до біржі. Напиши тут <code>/bind mexc</code> або "

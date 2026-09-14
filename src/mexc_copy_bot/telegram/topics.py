@@ -7,9 +7,9 @@ owner, one menu, one place for their reports. A forum group breaks that in two w
     another in the HIBT topic, and each must show that exchange's folders — so "which folder is this
     person looking at" is no longer a property of the person, but of the person IN a place.
 
-  · One place has several people. Everyone in the group sees every menu the bot posts. A button is
-    pressed by whoever taps it, so a menu has to know who it belongs to, or one member pressing
-    Positions on another's menu would replace that menu with their own accounts.
+  · A group is one person's. Each user adds the bot to a group of their own and sets it up there,
+    so nobody else's accounts can appear in it. Other members of that group can still see and tap
+    what the bot posts, which is why a menu also remembers who it was opened for.
 
 `View` is the answer to the first: owner + exchange + where. It lives in a ContextVar rather than in
 a field on the bot because the bot is asynchronous — a trade report arriving mid-handler must not be

@@ -274,6 +274,38 @@ class Store:
             )
         return result.endswith("1")
 
+    # ── forum groups ────────────────────────────────────────────────────────────────────────
+    async def group_owner(self, chat_id: int) -> int | None:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval("SELECT owner_id FROM copy_groups WHERE chat_id = $1", chat_id)
+
+    async def claim_group(self, chat_id: int, owner_id: int, title: str | None) -> int:
+        """Who owns this group: `owner_id` if nobody had it yet, otherwise whoever did.
+
+        One statement decides it, so two people reaching a new group at the same moment cannot both
+        come away believing it is theirs.
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO copy_groups (chat_id, owner_id, title) VALUES ($1, $2, $3)"
+                " ON CONFLICT (chat_id) DO NOTHING",
+                chat_id, owner_id, title,
+            )
+            return await conn.fetchval("SELECT owner_id FROM copy_groups WHERE chat_id = $1", chat_id)
+
+    async def release_group(self, chat_id: int) -> None:
+        """The bot left the group: forget the owner, its topics, and it as a place to report to.
+
+        Places are removed too, so the next report for that owner goes to their private chat
+        instead of at a group the bot can no longer write to.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("DELETE FROM copy_groups WHERE chat_id = $1", chat_id)
+                await conn.execute("DELETE FROM copy_topics WHERE chat_id = $1", chat_id)
+                await conn.execute("DELETE FROM copy_topic_views WHERE chat_id = $1", chat_id)
+                await conn.execute("DELETE FROM copy_screen_owners WHERE chat_id = $1", chat_id)
+
     # ── forum topics ────────────────────────────────────────────────────────────────────────
     async def bind_topic(
         self, chat_id: int, thread_id: int, exchange: str, title: str | None, bound_by: int | None

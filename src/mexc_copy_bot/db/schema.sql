@@ -348,6 +348,16 @@ BEGIN
 END $$;
 
 
+-- A forum group belongs to one person. Each user adds the bot to a group of their own and sets it up
+-- there; nobody shares one. The first allowed user to add the bot, or to use it in the group, owns
+-- it, and everyone else is refused there. Removing the bot from the group releases it.
+CREATE TABLE IF NOT EXISTS copy_groups (
+    chat_id    BIGINT      PRIMARY KEY,
+    owner_id   BIGINT      NOT NULL,
+    title      TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ── forum topics ────────────────────────────────────────────────────────────────────────────────
 -- A topic in a forum group, and the exchange it is for. Every owner who opens the bot there works
 -- with that exchange's folders only. Bound by name ("MEXC", "HIBT") or with /bind.

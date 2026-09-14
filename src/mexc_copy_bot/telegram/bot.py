@@ -16,10 +16,10 @@ the owner too.
 
 It runs in two kinds of place. In a private chat it is what it always was: every folder in one
 list. In a forum group each topic is one exchange (see telegram/topics.py) — the MEXC topic shows
-only MEXC folders, the HIBT topic only HIBT ones. Control stays per person there, but VISIBILITY
-does not: a group shows every member every message the bot posts, menus and reports included.
-What the bot does about that is keep each menu answering only to its owner, and never ask for
-API keys anywhere but a private chat.
+only MEXC folders, the HIBT topic only HIBT ones. A group belongs to ONE user: each person adds the
+bot to a group of their own and runs /setup there, and anyone else is refused in it. Anyone the
+owner lets into that group can still read what the bot posts, so API keys are never asked for
+anywhere but a private chat.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import contextlib
 import html
 import logging
 import time
+from types import SimpleNamespace
 
 import aiohttp
 from telegram import (
@@ -40,10 +41,11 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -252,6 +254,8 @@ class CopyBot:
         # Forum topics, cached because every button press in a group asks: (chat, thread) ->
         # exchange, and (chat, message) -> the owner of that menu.
         self._topic_cache: dict[tuple[int, int], str] = {}
+        # chat id -> the one user that group belongs to.
+        self._group_owners: dict[int, int] = {}
         self._screen_owners: dict[tuple[int, int], int] = {}
         # (owner, exchange) -> the place last written to the database, so an unchanged place
         # costs nothing on the next press.
@@ -358,6 +362,7 @@ class CopyBot:
         app.add_handler(CommandHandler("start", self._cmd_start, filters=~filters.Regex(ADD_LINK_COMMAND)))
         app.add_handler(CommandHandler("menu", self._cmd_start))
         app.add_handler(MessageHandler(MENU_FILTER, self._cmd_start))
+        app.add_handler(CommandHandler("setup", self._cmd_setup))
         app.add_handler(CommandHandler("bind", self._cmd_bind))
         app.add_handler(CommandHandler("unbind", self._cmd_unbind))
         app.add_handler(CommandHandler("topics", self._cmd_topics))
@@ -365,6 +370,8 @@ class CopyBot:
             filters.StatusUpdate.FORUM_TOPIC_CREATED | filters.StatusUpdate.FORUM_TOPIC_EDITED,
             self._on_topic_event,
         ))
+        # The bot being added to a group, promoted, or removed from it.
+        app.add_handler(ChatMemberHandler(self._on_membership, ChatMemberHandler.MY_CHAT_MEMBER))
         app.add_handler(add_conversation)
         app.add_handler(price_conversation)
         app.add_handler(folder_conversation)
@@ -397,12 +404,19 @@ class CopyBot:
             folder_id = await self._resolve_folder(owner_id, None)
             CURRENT_VIEW.set(View(owner_id, None, Place(chat_id), folder_id))
             return owner_id
-        return await self._guard_group(update, owner_id, chat.id)
+        return await self._guard_group(update, owner_id, chat)
 
-    async def _guard_group(self, update: Update, owner_id: int, chat_id: int) -> int | None:
+    async def _guard_group(self, update: Update, owner_id: int, chat) -> int | None:
         query = update.callback_query
         message = query.message if query else update.message
+        chat_id = chat.id
         lang = await self._lang(owner_id)
+        # A group is one person's. A message may claim a group nobody owns yet; a button press never
+        # does, because a button in an unowned group can only be left over from before.
+        owner = await self._owner_of_group(chat, claim_for=None if query else owner_id)
+        if owner != owner_id:
+            await self._hint(update, t(lang, "group_not_yours" if owner else "group_not_set_up"))
+            return None
         if not isinstance(message, Message):
             # A button on a message too old for Telegram to hand back. Which topic it was in cannot
             # be read, so it cannot be acted on safely.
@@ -503,6 +517,127 @@ class CopyBot:
         CURRENT_VIEW.set(view.with_folder(folder_id))
         self._invalidate_balances(owner_id)
 
+    # ── forum groups ────────────────────────────────────────────────────────────────────────
+    async def _owner_of_group(self, chat, claim_for: int | None) -> int | None:
+        """Who this group belongs to, claiming it for `claim_for` if nobody does yet."""
+        if chat.id in self._group_owners:
+            return self._group_owners[chat.id]
+        owner = await self._store.group_owner(chat.id)
+        if owner is None and claim_for is not None:
+            owner = await self._store.claim_group(chat.id, claim_for, getattr(chat, "title", None))
+            LOGGER.info("group %s (%r) now belongs to %s", chat.id, getattr(chat, "title", None), owner)
+        if owner is not None:
+            self._group_owners[chat.id] = owner
+        return owner
+
+    async def _group_command(self, update: Update) -> tuple[int, str] | None:
+        """The checks every group command shares: allowed, in a group, and this person's group."""
+        if not self._authorized(update):
+            await self._refuse(update)
+            return None
+        owner_id = update.effective_user.id
+        lang = await self._lang(owner_id)
+        chat = update.effective_chat
+        if chat is None or chat.type == ChatType.PRIVATE:
+            await update.message.reply_text(t(lang, "bind_only_in_topic"), parse_mode=ParseMode.HTML)
+            return None
+        owner = await self._owner_of_group(chat, claim_for=owner_id)
+        if owner != owner_id:
+            await update.message.reply_text(t(lang, "group_not_yours"), parse_mode=ParseMode.HTML)
+            return None
+        return owner_id, lang
+
+    async def _forget_group(self, chat_id: int) -> None:
+        await self._store.release_group(chat_id)
+        self._group_owners.pop(chat_id, None)
+        for key in [k for k in self._topic_cache if k[0] == chat_id]:
+            self._topic_cache.pop(key, None)
+        for key in [k for k, (place, _) in self._places.items() if place.chat_id == chat_id]:
+            self._places.pop(key, None)
+        for key in [k for k, (c, _) in self._menu_message.items() if c == chat_id]:
+            self._menu_message.pop(key, None)
+        LOGGER.info("released group %s", chat_id)
+
+    async def _cmd_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/setup — make this group ready: topics on, bot an admin, a MEXC topic and a HIBT topic.
+
+        Creates whichever of the two topics is missing when the bot is allowed to, and otherwise says
+        exactly which switch is still off. Safe to run again at any time.
+        """
+        checked = await self._group_command(update)
+        if not checked:
+            return
+        owner_id, lang = checked
+        chat, message = update.effective_chat, update.message
+        if not getattr(chat, "is_forum", False):
+            await message.reply_text(t(lang, "setup_not_forum"), parse_mode=ParseMode.HTML)
+            return
+        rights = await self._bot_rights(chat)
+        if not rights.admin:
+            await message.reply_text(t(lang, "setup_need_admin"), parse_mode=ParseMode.HTML)
+            return
+
+        bound = {exchange for _, exchange, _ in await self._store.list_topics(chat.id)}
+        missing = [exchange for exchange in (EXCHANGE_MEXC, EXCHANGE_HIBT) if exchange not in bound]
+        if missing and not rights.manage_topics:
+            await message.reply_text(
+                t(lang, "setup_need_topics_right", names=", ".join(exchange_name(e) for e in missing)),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        for exchange in missing:
+            topic = await self._app.bot.create_forum_topic(chat.id, exchange_name(exchange))
+            # Bound and cached before Telegram's own "topic created" update arrives, so that one is
+            # recognised as already handled rather than announced a second time.
+            await self._store.bind_topic(chat.id, topic.message_thread_id, exchange, topic.name, owner_id)
+            self._topic_cache[(chat.id, topic.message_thread_id)] = exchange
+            with contextlib.suppress(Exception):
+                await self._app.bot.send_message(
+                    chat.id, t(lang, "setup_topic_ready", exchange=exchange_name(exchange)),
+                    message_thread_id=topic.message_thread_id, parse_mode=ParseMode.HTML,
+                )
+        topics_now = ", ".join(sorted(exchange_name(e) for e in bound | set(missing)))
+        await message.reply_text(t(lang, "setup_done", topics=topics_now), parse_mode=ParseMode.HTML)
+
+    async def _on_membership(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """The bot was added to a group, had its rights changed there, or was removed."""
+        change = update.my_chat_member
+        if change is None or change.chat.type == ChatType.PRIVATE:
+            return
+        chat = change.chat
+        gone = (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        if change.new_chat_member.status in gone:
+            await self._forget_group(chat.id)
+            return
+
+        was_in = change.old_chat_member.status not in gone
+        adder = change.from_user
+        if adder is None or adder.id not in self._settings.allowed_user_ids:
+            if not was_in:
+                # Nobody with access put the bot here, so there is nothing for it to do here, and
+                # staying would leave a bot that moves money sitting in a stranger's group.
+                LOGGER.warning("added to group %s by %s, who has no access; leaving", chat.id, adder.id if adder else "?")
+                with contextlib.suppress(Exception):
+                    await self._app.bot.send_message(chat.id, t(UK, "group_refused_leaving"))
+                with contextlib.suppress(Exception):
+                    await self._app.bot.leave_chat(chat.id)
+            return
+
+        lang = await self._lang(adder.id)
+        owner = await self._owner_of_group(chat, claim_for=adder.id)
+        with contextlib.suppress(Exception):
+            if owner != adder.id:
+                await self._app.bot.send_message(chat.id, t(lang, "group_not_yours"), parse_mode=ParseMode.HTML)
+            elif not was_in:
+                await self._app.bot.send_message(
+                    chat.id, t(lang, "group_welcome", name=html.escape(adder.full_name or str(adder.id))),
+                    parse_mode=ParseMode.HTML,
+                )
+            elif change.new_chat_member.status == ChatMemberStatus.ADMINISTRATOR and (
+                change.old_chat_member.status != ChatMemberStatus.ADMINISTRATOR
+            ):
+                await self._app.bot.send_message(chat.id, t(lang, "bot_promoted"), parse_mode=ParseMode.HTML)
+
     # ── forum topics ────────────────────────────────────────────────────────────────────────
     async def _topic_exchange(self, chat_id: int, thread_id: int, message: Message | None) -> str | None:
         """The exchange a topic is for — bound earlier, or recognised now by its title."""
@@ -587,8 +722,18 @@ class CopyBot:
             kwargs["message_thread_id"] = place.thread_id
         try:
             sent = await self._app.bot.send_message(place.chat_id, text, **kwargs)
+        except Forbidden:
+            if not place.is_group:
+                raise
+            # Removed from the group, or muted there. The owner still has to hear about their trade.
+            kwargs.pop("message_thread_id", None)
+            LOGGER.warning("cannot write to group %s; writing to %s privately", place.chat_id, owner_id)
+            return await self._send(Place(owner_id), owner_id, text, **kwargs)
         except BadRequest as err:
             reason = str(err).lower()
+            if place.is_group and "chat not found" in reason:
+                kwargs.pop("message_thread_id", None)
+                return await self._send(Place(owner_id), owner_id, text, **kwargs)
             if place.thread_id is not None and "thread" in reason:
                 # The topic was deleted or closed. The owner still has to hear about their trade.
                 kwargs.pop("message_thread_id", None)
@@ -618,12 +763,12 @@ class CopyBot:
 
     async def _cmd_bind(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/bind mexc | /bind hibt — make this topic that exchange's."""
-        if not self._authorized(update):
-            await self._refuse(update)
+        checked = await self._group_command(update)
+        if not checked:
             return
+        _, lang = checked
         message, chat = update.message, update.effective_chat
-        lang = await self._lang(update.effective_user.id)
-        if chat is None or chat.type == ChatType.PRIVATE or not message.is_topic_message:
+        if not message.is_topic_message:
             await message.reply_text(t(lang, "bind_only_in_topic"), parse_mode=ParseMode.HTML)
             return
         title = _topic_title(message)
@@ -640,12 +785,12 @@ class CopyBot:
         await self._cmd_start(update, context)
 
     async def _cmd_unbind(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._authorized(update):
-            await self._refuse(update)
+        checked = await self._group_command(update)
+        if not checked:
             return
+        _, lang = checked
         message, chat = update.message, update.effective_chat
-        lang = await self._lang(update.effective_user.id)
-        if chat is None or chat.type == ChatType.PRIVATE or not message.is_topic_message:
+        if not message.is_topic_message:
             await message.reply_text(t(lang, "bind_only_in_topic"), parse_mode=ParseMode.HTML)
             return
         await self._store.unbind_topic(chat.id, message.message_thread_id)
@@ -653,14 +798,11 @@ class CopyBot:
         await message.reply_text(t(lang, "unbind_done"), parse_mode=ParseMode.HTML)
 
     async def _cmd_topics(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._authorized(update):
-            await self._refuse(update)
+        checked = await self._group_command(update)
+        if not checked:
             return
+        _, lang = checked
         chat = update.effective_chat
-        lang = await self._lang(update.effective_user.id)
-        if chat is None or chat.type == ChatType.PRIVATE:
-            await update.message.reply_text(t(lang, "bind_only_in_topic"), parse_mode=ParseMode.HTML)
-            return
         bound = await self._store.list_topics(chat.id)
         lines = [t(lang, "topics_title"), ""]
         lines += [
@@ -680,6 +822,8 @@ class CopyBot:
         message = update.message
         if not message or not message.is_topic_message:
             return
+        if (message.chat_id, message.message_thread_id) in self._topic_cache:
+            return  # already bound — /setup created it, or it was bound by hand
         created, edited = message.forum_topic_created, message.forum_topic_edited
         title = (created.name if created else None) or (edited.name if edited else None)
         exchange = exchange_from_title(title)
@@ -690,14 +834,22 @@ class CopyBot:
         with contextlib.suppress(Exception):
             await message.reply_text(t(UK, "bind_auto", exchange=exchange_name(exchange)), parse_mode=ParseMode.HTML)
 
-    async def _bot_is_admin(self, chat) -> bool:
-        """Without admin rights the bot does not see the names and prices people type in answer
-        to its questions, and cannot tidy away old menus."""
+    async def _bot_rights(self, chat):
+        """What the bot may do in a group: be an admin at all, and create topics.
+
+        Without admin rights it does not see the names and prices people type in answer to its
+        questions, and cannot tidy away old menus. Unknown is reported as "no", which is the safe
+        advice to give.
+        """
         try:
             member = await chat.get_member(self._app.bot.id)
-        except Exception:  # noqa: BLE001 - unknown is reported as "not admin", which is the safe advice
-            return False
-        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+        except Exception:  # noqa: BLE001
+            return SimpleNamespace(admin=False, manage_topics=False)
+        admin = member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+        return SimpleNamespace(admin=admin, manage_topics=admin and bool(getattr(member, "can_manage_topics", False)))
+
+    async def _bot_is_admin(self, chat) -> bool:
+        return (await self._bot_rights(chat)).admin
 
     def _lang_now(self, owner_id: int) -> str:
         """The cached language. Every handler calls _lang() early, so this is warm by the time a
