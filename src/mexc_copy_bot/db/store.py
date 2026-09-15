@@ -383,9 +383,11 @@ class Store:
 
     # ── scheduled ladders ─────────────────────────────────────────────────────────────────────
     async def create_ladder(self, **fields) -> int:
-        cols = ("owner_id", "folder_id", "symbol",
-                "leverage", "margin_usd", "parts", "step_seconds", "target_epoch")
-        values = [fields[c] for c in cols]
+        required = ("owner_id", "folder_id", "symbol",
+                    "leverage", "margin_usd", "parts", "step_seconds", "target_epoch")
+        optional = ("sl_kind", "sl_value", "tp_kind", "tp_value")
+        cols = required + optional
+        values = [fields[c] for c in required] + [fields.get(c) for c in optional]
         placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
         async with self._pool.acquire() as conn:
             return await conn.fetchval(

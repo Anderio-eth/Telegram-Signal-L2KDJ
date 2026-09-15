@@ -56,7 +56,7 @@ from telegram.ext import (
 from ..config import Settings
 from ..core.copy_engine import FollowerResult
 from ..core.events import MasterEvent
-from ..core.ladder import LadderConfig, fmt_time, plan_ladder
+from ..core.ladder import Bracket, LadderConfig, bracket_prices, fmt_time, plan_ladder
 from ..core.registry import ServiceRegistry
 from ..core.stuck import StuckManager
 from ..db.store import (
@@ -893,7 +893,7 @@ class CopyBot:
         """A fresh entry form. Silver at 1000x in five slices is the case this was built for. The
         sides are the folder's groups, not chosen here — group 1 goes long, group 2 short."""
         return {"symbol": "XAG_USDT", "leverage": 1000, "margin_usd": None,
-                "parts": 5, "step_seconds": 1.0, "target": None}
+                "parts": 5, "step_seconds": 1.0, "target": None, "sl": None, "tp": None}
 
     def _draft(self, owner_id: int) -> dict:
         """The entry being edited, kept off context.user_data so a Cancel that clears the
@@ -941,6 +941,8 @@ class CopyBot:
               size=(f"${size:,.0f}" if size else "—")),
             t(lang, "ladder_f_parts", v=d["parts"]),
             t(lang, "ladder_f_step", v=d["step_seconds"]),
+            t(lang, "ladder_f_sl", v=(d["sl"].label() if d.get("sl") else t(lang, "ladder_not_set"))),
+            t(lang, "ladder_f_tp", v=(d["tp"].label() if d.get("tp") else t(lang, "ladder_not_set"))),
             t(lang, "ladder_f_target", v=self._target_line(d.get("target"), lang)),
         ]
         rows = [
@@ -950,6 +952,8 @@ class CopyBot:
                                   callback_data="ldval:margin")],
             [InlineKeyboardButton(f"🔢 {d['parts']}ч", callback_data="ldval:parts"),
              InlineKeyboardButton(f"⏳ {d['step_seconds']}s", callback_data="ldval:step")],
+            [InlineKeyboardButton(f"🛑 SL {d['sl'].label() if d.get('sl') else '—'}", callback_data="ldval:sl"),
+             InlineKeyboardButton(f"🎯 TP {d['tp'].label() if d.get('tp') else '—'}", callback_data="ldval:tp")],
             [InlineKeyboardButton(t(lang, "btn_ladder_time"), callback_data="ldval:target")],
             [InlineKeyboardButton(t(lang, "btn_ladder_preview"), callback_data="ldplan")],
             [InlineKeyboardButton(t(lang, "btn_ladder_arm"), callback_data="ldarm")],
@@ -1018,7 +1022,8 @@ class CopyBot:
                 *(make_rest_client(creds[a.id], session=session).get_usdt_snapshot() for a in group1 + group2))
         config = LadderConfig(
             symbol=symbol, leverage=int(d["leverage"]), margin_usd=float(d["margin_usd"]),
-            parts=int(d["parts"]), step_seconds=float(d["step_seconds"]), target_epoch=float(d["target"]))
+            parts=int(d["parts"]), step_seconds=float(d["step_seconds"]), target_epoch=float(d["target"]),
+            sl=d.get("sl"), tp=d.get("tp"))
         plan = plan_ladder(
             config, price=price, size_precision=spec.vol_scale,
             min_order=spec.min_vol, contract_size=spec.contract_size, latency_seconds=0.3,
@@ -1040,6 +1045,19 @@ class CopyBot:
         for sslice in plan.slices:
             lines.append(f"   {sslice.index+1}. {sslice.amount} @ {fmt_time(sslice.send_epoch)} "
                          f"(T−{plan.config.target_epoch - sslice.send_epoch:.1f}s)")
+        if plan.config.sl or plan.config.tp:
+            group1, group2 = await self._groups(owner_id)
+            for side, present in (("LONG", bool(group1)), ("SHORT", bool(group2))):
+                if not present:
+                    continue
+                sl_px, tp_px = bracket_prices(plan.price, side, plan.config.sl, plan.config.tp)
+                bits = []
+                if sl_px:
+                    bits.append(f"🛑 {plan.config.sl.label()} → {sl_px}")
+                if tp_px:
+                    bits.append(f"🎯 {plan.config.tp.label()} → {tp_px}")
+                if bits:
+                    lines.append(f"   {side}: " + ", ".join(bits))
         for w in plan.warnings:
             lines.append("! " + w)
         for e in plan.errors:
@@ -1064,7 +1082,11 @@ class CopyBot:
         await self._store.create_ladder(
             owner_id=owner_id, folder_id=self._folder(owner_id), symbol=d["symbol"],
             leverage=int(d["leverage"]), margin_usd=float(d["margin_usd"]),
-            parts=int(d["parts"]), step_seconds=float(d["step_seconds"]), target_epoch=float(d["target"]))
+            parts=int(d["parts"]), step_seconds=float(d["step_seconds"]), target_epoch=float(d["target"]),
+            sl_kind=(d["sl"].kind if d.get("sl") else None),
+            sl_value=(d["sl"].value if d.get("sl") else None),
+            tp_kind=(d["tp"].kind if d.get("tp") else None),
+            tp_value=(d["tp"].value if d.get("tp") else None))
         self._ladder_drafts.pop(owner_id, None)
         # Turn the bot on for this folder now, so when the entry fires its positions are watched:
         # the menu shows them and closing through the bot works. Without this the folder would be
@@ -1102,6 +1124,8 @@ class CopyBot:
                 d["margin_usd"] = value
             elif field == "step":
                 d["step_seconds"] = max(0.05, float(raw.replace(",", ".")))
+            elif field in ("sl", "tp"):
+                d[field] = CopyBot._parse_bracket(raw)
             elif field == "target":
                 d["target"] = CopyBot._parse_target(raw)
             else:
@@ -1109,6 +1133,21 @@ class CopyBot:
         except (ValueError, TypeError):
             return False
         return True
+
+    @staticmethod
+    def _parse_bracket(text: str) -> Bracket | None:
+        """A stop-loss / take-profit level typed as a percent (`2%`, `2 %`) or as dollars of price
+        move (`5`, `$5`). Empty, `-` or `0` clears it. The percent/dollar meaning is the same for
+        both venues — the price is computed at fire time from the live entry, per side."""
+        raw = text.strip().lower().replace(",", ".").replace(" ", "")
+        if raw in ("", "-", "0", "0%", "$0", "none", "нема", "немає"):
+            return None
+        percent = raw.endswith("%")
+        raw = raw.rstrip("%").lstrip("$")
+        value = float(raw)
+        if value <= 0:
+            return None
+        return Bracket(kind="percent" if percent else "usd", value=value)
 
     @staticmethod
     def _parse_target(text: str) -> float:
@@ -1305,6 +1344,7 @@ class CopyBot:
 
     async def _menu_view(self, owner_id: int) -> tuple[str, InlineKeyboardMarkup]:
         service = await self._registry.get(self._folder(owner_id), owner_id)
+        mode, _ = await self._store.get_mode(self._folder(owner_id))
         return (
             await self._menu_text(owner_id),
             _menu_keyboard(
@@ -1313,7 +1353,9 @@ class CopyBot:
                 await self._stuck_count(owner_id),
                 await self._folder_name(owner_id),
                 await self._menu_columns(owner_id),
-                show_ladder=self._view(owner_id).in_topic,  # scheduled entry works on MEXC and HIBT
+                # The scheduled entry is a groups feature (group 1 vs group 2), on MEXC and HIBT
+                # alike. It has no place in a COPY folder, so it is shown only in a groups one.
+                show_ladder=self._view(owner_id).in_topic and mode == MODE_REVERSE,
             ),
         )
 

@@ -11,7 +11,8 @@ import asyncio
 
 import pytest
 
-from mexc_copy_bot.core.ladder import LadderConfig, LadderExecutor, plan_ladder
+from mexc_copy_bot.core.ladder import (
+    Bracket, LadderConfig, LadderExecutor, bracket_prices, plan_ladder)
 from mexc_copy_bot.mexc.rest import SIDE_OPEN_LONG, SIDE_OPEN_SHORT, MexcError
 
 T = 1_000_000.0  # a round "target" epoch
@@ -124,8 +125,10 @@ class FakeClient:
     async def set_leverage(self, **kw):
         self.leverage_set = kw["leverage"]
 
-    async def submit_order(self, *, symbol, side, vol, leverage, open_type, external_oid):
-        self.orders.append({"symbol": symbol, "side": side, "vol": vol, "oid": external_oid})
+    async def submit_order(self, *, symbol, side, vol, leverage, open_type, external_oid,
+                           stop_loss_price=None, take_profit_price=None):
+        self.orders.append({"symbol": symbol, "side": side, "vol": vol, "oid": external_oid,
+                            "sl": stop_loss_price, "tp": take_profit_price})
         if len(self.orders) in self._fail_on:
             raise MexcError(2005, "insufficient balance", endpoint="/order")
         return {"orderId": f"o{len(self.orders)}"}
@@ -192,3 +195,42 @@ def test_a_refused_slice_is_recorded_and_the_rest_go_on():
     assert report.filled(2) == float(plan.total_amount)
     assert report.filled(1) == float(plan.total_amount) - float(plan.slices[1].amount)
     assert "insufficient balance" in report.summary({1: "A", 2: "B"})
+
+
+# ── stop-loss / take-profit brackets ─────────────────────────────────────────────────────────────
+def test_bracket_percent_sits_the_right_side_of_entry():
+    # long: SL below, TP above; short mirrors it.
+    sl, tp = bracket_prices(100.0, "LONG", Bracket("percent", 2), Bracket("percent", 5))
+    assert (float(sl), float(tp)) == (98.0, 105.0)
+    sl, tp = bracket_prices(100.0, "SHORT", Bracket("percent", 2), Bracket("percent", 5))
+    assert (float(sl), float(tp)) == (102.0, 95.0)
+
+
+def test_bracket_usd_is_a_price_move_not_a_percent():
+    sl, tp = bracket_prices(100.0, "LONG", Bracket("usd", 5), Bracket("usd", 10))
+    assert (float(sl), float(tp)) == (95.0, 110.0)
+    sl, tp = bracket_prices(100.0, "SHORT", Bracket("usd", 5), Bracket("usd", 10))
+    assert (float(sl), float(tp)) == (105.0, 90.0)
+
+
+def test_bracket_one_side_only_and_impossible_levels_are_dropped():
+    sl, tp = bracket_prices(63.25, "LONG", Bracket("percent", 1), None)
+    assert tp is None and float(sl) == pytest.approx(62.6175)
+    # a stop further than 100% below entry would be a negative price — refused, not clamped
+    sl, tp = bracket_prices(100.0, "LONG", Bracket("percent", 150), None)
+    assert sl is None and tp is None
+
+
+def test_executor_sends_bracket_prices_per_side():
+    plan = make_plan(parts=2, price=100.0, sl=Bracket("percent", 2), tp=Bracket("percent", 5))
+    long_c, short_c = FakeClient(), FakeClient()
+    run_ladder(plan, [(1, long_c)], [(2, short_c)])
+    assert all(o["sl"] == 98.0 and o["tp"] == 105.0 for o in long_c.orders)
+    assert all(o["sl"] == 102.0 and o["tp"] == 95.0 for o in short_c.orders)
+
+
+def test_executor_without_brackets_sends_none():
+    plan = make_plan(parts=2, price=100.0)
+    long_c = FakeClient()
+    run_ladder(plan, [(1, long_c)], [])
+    assert all(o["sl"] is None and o["tp"] is None for o in long_c.orders)

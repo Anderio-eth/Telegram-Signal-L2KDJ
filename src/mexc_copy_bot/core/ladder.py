@@ -62,6 +62,53 @@ def fmt_time(epoch: float) -> str:
 
 
 @dataclass(frozen=True)
+class Bracket:
+    """A stop-loss or take-profit distance, either a percent of the entry price or a dollar move."""
+
+    kind: str                   # "percent" or "usd"
+    value: float
+
+    def label(self) -> str:
+        return f"{self.value:g}%" if self.kind == "percent" else f"${self.value:g}"
+
+
+def _price_decimals(price: float) -> int:
+    """Sensible number of decimals for a trigger price, derived from the price's magnitude (the
+    venue's exact tick is not needed for a stop — a slightly coarser price is still accepted)."""
+    if price <= 0:
+        return 2
+    import math
+    return max(0, min(8, 6 - int(math.floor(math.log10(price)))))
+
+
+def bracket_prices(entry: float, side: str, sl: "Bracket | None", tp: "Bracket | None") -> tuple[str | None, str | None]:
+    """The stop-loss and take-profit PRICES for one side, from the entry price.
+
+    A long loses as price falls, so its stop sits below entry and its take-profit above; a short is
+    the mirror. A percent is of the entry price; a dollar amount is that many dollars of price move.
+    Returns rounded price strings (or None), or None for a bracket that would land the wrong side of
+    zero.
+    """
+    if entry <= 0:
+        return None, None
+    dec = _price_decimals(entry)
+    long = side == "LONG"
+
+    def price(b: "Bracket | None", loss: bool) -> str | None:
+        if not b or b.value <= 0:
+            return None
+        move = entry * b.value / 100 if b.kind == "percent" else b.value
+        # loss side is down for a long / up for a short; profit side is the opposite.
+        down = loss if long else not loss
+        p = entry - move if down else entry + move
+        if p <= 0:
+            return None
+        return f"{round(p, dec):.{dec}f}"
+
+    return price(sl, loss=True), price(tp, loss=False)
+
+
+@dataclass(frozen=True)
 class LadderConfig:
     """The numeric plan of a scheduled hedged entry, as set in the bot. Which accounts take part is
     the folder's groups, resolved when the plan is built, not stored here."""
@@ -72,6 +119,8 @@ class LadderConfig:
     parts: int                  # how many slices
     step_seconds: float         # gap between slices
     target_epoch: float         # when the position must be FULLY open (unix seconds)
+    sl: Bracket | None = None   # stop-loss, applied to every slice's order
+    tp: Bracket | None = None   # take-profit
 
 
 @dataclass(frozen=True)
@@ -264,25 +313,34 @@ class LadderExecutor:
             LOGGER.warning("could not preset leverage: %s", err.message)
 
     async def run(self, plan: LadderPlan, *, sleep=asyncio.sleep, clock=time.time) -> LadderReport:
+        # Stop-loss / take-profit prices for each side, from the reference price at plan time. Every
+        # slice's order carries them, so the position is protected as it is built, not after.
+        brackets = {
+            "LONG": bracket_prices(plan.price, "LONG", plan.config.sl, plan.config.tp),
+            "SHORT": bracket_prices(plan.price, "SHORT", plan.config.sl, plan.config.tp),
+        }
         results: list[SliceResult] = []
         for part in plan.slices:
             wait = part.send_epoch - clock()
             if wait > 0:
                 await sleep(wait)
             fired = await asyncio.gather(
-                *(self._fire(c, aid, "LONG", SIDE_OPEN_LONG, part, clock) for aid, c in self._long),
-                *(self._fire(c, aid, "SHORT", SIDE_OPEN_SHORT, part, clock) for aid, c in self._short),
+                *(self._fire(c, aid, "LONG", SIDE_OPEN_LONG, part, clock, brackets["LONG"]) for aid, c in self._long),
+                *(self._fire(c, aid, "SHORT", SIDE_OPEN_SHORT, part, clock, brackets["SHORT"]) for aid, c in self._short),
             )
             results.extend(fired)
         return LadderReport(plan=plan, results=results)
 
-    async def _fire(self, client, account_id, side_name, side, part: Slice, clock) -> SliceResult:
+    async def _fire(self, client, account_id, side_name, side, part: Slice, clock, bracket=(None, None)) -> SliceResult:
         sent = clock()
+        sl, tp = bracket
         try:
             result = await client.submit_order(
                 symbol=self._symbol, side=side, vol=float(part.amount),
                 leverage=self._leverage, open_type=self._open_type,
                 external_oid=f"ld{int(part.send_epoch)}-{account_id}-{part.index}",
+                stop_loss_price=float(sl) if sl else None,
+                take_profit_price=float(tp) if tp else None,
             )
             order_id = result.get("orderId") if isinstance(result, dict) else str(result)
             return SliceResult(part.index, account_id, side_name, part.amount, True,

@@ -68,6 +68,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "ladder_f_margin": {UK: "Маржа: <b>{v}</b> → розмір {size}/акаунт", EN: "Margin: <b>{v}</b> → size {size}/account"},
     "ladder_f_parts": {UK: "Частин: <b>{v}</b>", EN: "Slices: <b>{v}</b>"},
     "ladder_f_step": {UK: "Крок: <b>{v}s</b>", EN: "Step: <b>{v}s</b>"},
+    "ladder_f_sl": {UK: "Стоп-лос: <b>{v}</b>", EN: "Stop-loss: <b>{v}</b>"},
+    "ladder_f_tp": {UK: "Тейк-профіт: <b>{v}</b>", EN: "Take-profit: <b>{v}</b>"},
     "ladder_f_target": {UK: "Час T: <b>{v}</b>", EN: "Time T: <b>{v}</b>"},
     "ladder_in": {UK: "через {s}s", EN: "in {s}s"},
     "ladder_past": {UK: "вже минув", EN: "already past"},
@@ -78,6 +80,18 @@ STRINGS: dict[str, dict[str, str]] = {
     "ladder_ask_margin": {UK: "Надішли маржу в $ на акаунт (розмір = маржа × плече):", EN: "Send the margin in $ per account (size = margin × leverage):"},
     "ladder_ask_parts": {UK: "Надішли кількість частин:", EN: "Send the number of slices:"},
     "ladder_ask_step": {UK: "Надішли крок між ордерами в секундах (напр. 1):", EN: "Send the step between orders in seconds (e.g. 1):"},
+    "ladder_ask_sl": {UK: "Надішли стоп-лос: у відсотках (<code>2%</code>) або в доларах руху ціни (<code>5</code> чи <code>$5</code>).\n"
+                          "Для лонгу — нижче входу, для шорту — вище (рахується автоматично).\n"
+                          "Надішли <code>-</code> або <code>0</code>, щоб прибрати.",
+                      EN: "Send the stop-loss: as a percent (<code>2%</code>) or in dollars of price move (<code>5</code> or <code>$5</code>).\n"
+                          "For a long it goes below entry, for a short above (computed automatically).\n"
+                          "Send <code>-</code> or <code>0</code> to clear."},
+    "ladder_ask_tp": {UK: "Надішли тейк-профіт: у відсотках (<code>5%</code>) або в доларах руху ціни (<code>10</code> чи <code>$10</code>).\n"
+                          "Для лонгу — вище входу, для шорту — нижче (рахується автоматично).\n"
+                          "Надішли <code>-</code> або <code>0</code>, щоб прибрати.",
+                      EN: "Send the take-profit: as a percent (<code>5%</code>) or in dollars of price move (<code>10</code> or <code>$10</code>).\n"
+                          "For a long it goes above entry, for a short below (computed automatically).\n"
+                          "Send <code>-</code> or <code>0</code> to clear."},
     "ladder_ask_target": {UK: "Надішли час T, коли позиція має бути ПОВНІСТЮ відкрита.\n"
                               "Формат: <code>16:30</code>, <code>16:30:00</code>, <code>2026-09-15 16:30:00</code>, "
                               "або <code>+90</code> (через 90с). Час київський.",

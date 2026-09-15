@@ -425,6 +425,11 @@ CREATE INDEX IF NOT EXISTS copy_ladders_armed ON copy_ladders (status, target_ep
 -- are no longer required (kept nullable for old rows).
 ALTER TABLE copy_ladders ALTER COLUMN long_account DROP NOT NULL;
 ALTER TABLE copy_ladders ALTER COLUMN short_account DROP NOT NULL;
+-- Optional stop-loss / take-profit for the scheduled entry, each a kind ('percent' | 'usd') and a value.
+ALTER TABLE copy_ladders ADD COLUMN IF NOT EXISTS sl_kind TEXT;
+ALTER TABLE copy_ladders ADD COLUMN IF NOT EXISTS sl_value DOUBLE PRECISION;
+ALTER TABLE copy_ladders ADD COLUMN IF NOT EXISTS tp_kind TEXT;
+ALTER TABLE copy_ladders ADD COLUMN IF NOT EXISTS tp_value DOUBLE PRECISION;
 
 -- A groups (REVERSE) folder has no master — every account is an equal member of a group. Demote any
 -- master that lingers there so nothing is treated as special. COPY folders keep their master.

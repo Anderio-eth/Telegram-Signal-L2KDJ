@@ -25,9 +25,16 @@ import time
 import aiohttp
 
 from ..exchange import contract_specs, make_rest_client, ticker_price
-from .ladder import LadderConfig, LadderExecutor, plan_ladder
+from .ladder import Bracket, LadderConfig, LadderExecutor, plan_ladder
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _bracket(kind, value) -> Bracket | None:
+    """Rebuild a stop-loss/take-profit bracket from its stored (kind, value), or None if unset."""
+    if not kind or value is None:
+        return None
+    return Bracket(kind=kind, value=float(value))
 
 POLL_SECONDS = 1.0
 # Claim a ladder this many seconds before its slices need to start, so re-planning and leverage
@@ -151,6 +158,8 @@ class LadderScheduler:
         config = LadderConfig(
             symbol=symbol, leverage=ladder["leverage"], margin_usd=ladder["margin_usd"],
             parts=ladder["parts"], step_seconds=ladder["step_seconds"], target_epoch=ladder["target_epoch"],
+            sl=_bracket(ladder.get("sl_kind"), ladder.get("sl_value")),
+            tp=_bracket(ladder.get("tp_kind"), ladder.get("tp_value")),
         )
         plan = plan_ladder(
             config, price=price, size_precision=spec.vol_scale,
