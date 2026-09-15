@@ -1,26 +1,28 @@
-"""Open a hedged position on two accounts at a set time, sliced into parts.
+"""Open a hedged position across two groups at a set time, sliced into parts.
 
-The job: at a known moment T, two accounts must be fully in position — one long, one short — at a size
-too large to send as a single market order without walking the book and, at high leverage, without
-risking liquidation on the entry itself. So the size is split into N equal market orders spaced
-`step` apart, fired on both accounts at once, and timed so the LAST slice fills at T. Everything is
-set in the bot: which group goes long, leverage, the margin to commit, how many slices, the gap
-between them, and T.
+At a known moment T two sides must be fully in position — group 1 long, group 2 short — at a size too
+large to send as one market order without walking the book and, at high leverage, without risking
+liquidation on the entry itself. So the size is split into N equal market orders spaced `step` apart,
+fired on every account of both groups at once, timed so the LAST slice fills at T.
+
+There is no long/short choice: the folder's groups already decide sides. Every account in group 1
+buys, every account in group 2 sells, each opening `margin × leverage` at the same sliced sizes.
 
 The maths, in one place, is `plan_ladder` — pure, so it is tested without a network or a clock:
 
-    size per account   = margin × leverage          (margin is the collateral; e.g. $150 × 1000 = $150k)
-    contracts total    = size / price               (HIBT sizes are the base asset)
-    contracts per slice= total / N                  (the last slice takes the rounding remainder)
-    slice i is sent at = T − latency − (N−1−i)×step  (so slice N−1 fills at T)
+    size per account    = margin × leverage        (e.g. $150 × 1000 = $150k)
+    contracts total     = size / price             (HIBT sizes are the base asset)
+    contracts per slice = total / N                (the last slice takes the rounding remainder)
+    slice i is sent at  = T − latency − (N−1−i)×step   (so slice N−1 fills at T)
 
-A market order fills in the same second it is accepted, ~215 ms after it is sent from here, so
-`latency` is that round trip and `step` must not be smaller than it or the slices queue. If the
-start time it works out to is already in the past, the plan says so rather than firing late.
+A market order fills in the same second it is accepted, ~215 ms after it leaves here, so `latency`
+is that round trip and `step` must not be smaller than it. If the start time works out to be in the
+past, the plan says so rather than firing late.
 
-`LadderExecutor` runs a plan against two live clients. It is deliberately dumb about failure: a
-slice that is refused is recorded and the rest go on unchanged — it never doubles up to catch up and
-never unwinds what filled. What opened, and why the rest did not, is the whole report.
+`LadderExecutor` runs a plan against the two groups of live clients. It is deliberately dumb about
+failure: a slice a venue refuses is recorded and the rest go on unchanged — it never doubles up to
+catch up and never unwinds what filled. What opened, on which account, and why the rest did not, is
+the whole report.
 """
 
 from __future__ import annotations
@@ -48,13 +50,23 @@ def _floor(value: Decimal, precision: int) -> Decimal:
     return value.quantize(step, rounding=ROUND_DOWN)
 
 
+def fmt_time(epoch: float) -> str:
+    """A target/slice time as the person set it — Kyiv wall clock, HH:MM:SS, no milliseconds.
+    Formatted in a fixed zone rather than the server's, so it reads the same on a UTC host."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(epoch, ZoneInfo("Europe/Kyiv")).strftime("%H:%M:%S")
+    except Exception:  # noqa: BLE001 — no tz data: fall back to the host clock
+        return datetime.fromtimestamp(epoch).strftime("%H:%M:%S")
+
+
 @dataclass(frozen=True)
 class LadderConfig:
-    """Everything a scheduled hedged entry needs, as set in the bot."""
+    """The numeric plan of a scheduled hedged entry, as set in the bot. Which accounts take part is
+    the folder's groups, resolved when the plan is built, not stored here."""
 
     symbol: str                 # BTC_USDT spelling; the client lowercases it
-    long_account: int           # account id that goes LONG
-    short_account: int          # account id that goes SHORT
     leverage: int
     margin_usd: float           # collateral per account; size = margin × leverage
     parts: int                  # how many slices
@@ -65,7 +77,7 @@ class LadderConfig:
 @dataclass(frozen=True)
 class Slice:
     index: int
-    send_epoch: float           # when to send this slice (both accounts at once)
+    send_epoch: float           # when to send this slice (all accounts at once)
     amount: str                 # contracts, as the string the venue is given
 
 
@@ -92,14 +104,15 @@ def plan_ladder(
     size_precision: int,
     min_order: float,
     latency_seconds: float,
-    available_long: float,
-    available_short: float,
+    available: list[float],
     now: float,
 ) -> LadderPlan:
     """Work out the slices and their send times, or the reasons it cannot be done.
 
-    Pure: every input that depends on the world — price, the accounts' free balance, the measured
-    latency, and the current time — is passed in, so the arithmetic can be checked exactly.
+    `available` is the free balance of every account that will take part (both groups). Each account
+    opens `margin` of collateral, so every one of them has to be able to afford it.
+
+    Pure: every input that depends on the world is passed in, so the arithmetic can be checked.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -114,14 +127,11 @@ def plan_ladder(
         errors.append("margin must be positive")
     if price <= 0:
         errors.append("no price for the symbol")
-    if config.long_account == config.short_account:
-        errors.append("the long and short accounts must be different")
-
-    for label, available in (("long", available_long), ("short", available_short)):
-        if config.margin_usd > available + 1e-9:
-            errors.append(
-                f"{label} account has ${available:,.2f} free, needs ${config.margin_usd:,.2f} margin"
-            )
+    if len(available) < 2:
+        errors.append("need at least two accounts, one in each group")
+    poorest = min(available) if available else 0.0
+    if available and config.margin_usd > poorest + 1e-9:
+        errors.append(f"an account has only ${poorest:,.2f} free, needs ${config.margin_usd:,.2f} margin")
 
     slices: list[Slice] = []
     total_amount = Decimal(0)
@@ -134,20 +144,15 @@ def plan_ladder(
                 f"{min_order:g}; raise the margin or use fewer parts"
             )
         else:
-            # Equal slices, with the last one absorbing what flooring dropped so the total is exact
-            # and both accounts get the identical schedule.
+            # Equal slices, the last absorbing what flooring dropped so the total is exact and every
+            # account gets the identical schedule.
             remainder = _floor(total - per * (config.parts - 1), size_precision)
             amounts = [per] * (config.parts - 1) + [remainder]
             total_amount = sum(amounts, Decimal(0))
-            # slice N-1 fills at T; each earlier one is `step` before the next; latency shifts all
-            # of them earlier so the order lands, not just leaves, on time.
             start = config.target_epoch - latency_seconds - (config.parts - 1) * config.step_seconds
             slices = [
-                Slice(
-                    index=i,
-                    send_epoch=start + i * config.step_seconds,
-                    amount=format(amounts[i].normalize(), "f"),
-                )
+                Slice(index=i, send_epoch=start + i * config.step_seconds,
+                      amount=format(amounts[i].normalize(), "f"))
                 for i in range(config.parts)
             ]
 
@@ -155,8 +160,8 @@ def plan_ladder(
     if slices and start_epoch < now:
         late_by = now - start_epoch
         errors.append(
-            f"too late: the first slice needed to go at {_clock(start_epoch)} "
-            f"({(config.target_epoch - start_epoch):.1f}s before T), which was {late_by:.1f}s ago"
+            f"too late: the first slice needed to go {(config.target_epoch - start_epoch):.1f}s "
+            f"before T, which was {late_by:.1f}s ago"
         )
     if config.step_seconds < latency_seconds and config.parts > 1:
         warnings.append(
@@ -165,19 +170,10 @@ def plan_ladder(
         )
 
     return LadderPlan(
-        config=config,
-        price=price,
-        target_notional=target_notional,
+        config=config, price=price, target_notional=target_notional,
         total_amount=format(total_amount.normalize(), "f") if total_amount else "0",
-        slices=slices,
-        start_epoch=start_epoch,
-        errors=errors,
-        warnings=warnings,
+        slices=slices, start_epoch=start_epoch, errors=errors, warnings=warnings,
     )
-
-
-def _clock(epoch: float) -> str:
-    return time.strftime("%H:%M:%S", time.localtime(epoch)) + f".{int(epoch % 1 * 1000):03d}"
 
 
 @dataclass
@@ -197,57 +193,66 @@ class SliceResult:
 class LadderReport:
     plan: LadderPlan
     results: list[SliceResult]
-    filled_long: float = 0.0
-    filled_short: float = 0.0
-    final_long: str | None = None   # what the account holds afterwards, read back
-    final_short: str | None = None
+    final: dict[int, str] = field(default_factory=dict)   # account id -> what it holds afterwards
 
-    def summary(self) -> str:
+    def filled(self, account: int) -> float:
+        return sum(float(r.amount) for r in self.results if r.ok and r.account == account)
+
+    @property
+    def accounts(self) -> list[int]:
+        seen = []
+        for r in self.results:
+            if r.account not in seen:
+                seen.append(r.account)
+        return seen
+
+    def summary(self, labels: dict[int, str] | None = None) -> str:
+        labels = labels or {}
         cfg = self.plan.config
-        ok = [r for r in self.results if r.ok]
-        bad = [r for r in self.results if not r.ok]
         lines = [
-            f"{cfg.symbol}  target ${self.plan.target_notional:,.0f}/account at {cfg.leverage}x, "
-            f"{cfg.parts} slices",
-            f"filled: long {self.filled_long:g}, short {self.filled_short:g} "
-            f"(of {self.plan.total_amount} each)",
+            f"{cfg.symbol}  ${self.plan.target_notional:,.0f}/акаунт × {cfg.leverage}x, {cfg.parts} частин",
         ]
-        if self.final_long is not None or self.final_short is not None:
-            lines.append(f"positions now: long {self.final_long}, short {self.final_short}")
-        if ok:
-            acks = [r.ack_ms for r in ok if r.ack_ms is not None]
-            if acks:
-                lines.append(f"{len(ok)} slices sent, {min(acks):.0f}-{max(acks):.0f}ms each")
-        for r in bad:
-            lines.append(f"  ✗ slice {r.index} {r.side} {r.amount}: {r.error}")
+        for account in self.accounts:
+            side = next((r.side for r in self.results if r.account == account), "?")
+            name = labels.get(account, f"#{account}")
+            got = self.filled(account)
+            now = self.final.get(account)
+            line = f"  {'🟢' if side == 'LONG' else '🔴'} {name} {side}: {got:g} / {self.plan.total_amount}"
+            if now is not None:
+                line += f" (тримає {now})"
+            lines.append(line)
+        for r in self.results:
+            if not r.ok:
+                lines.append(f"  ✗ {labels.get(r.account, r.account)} частина {r.index+1} {r.side} {r.amount}: {r.error}")
+        acks = [r.ack_ms for r in self.results if r.ok and r.ack_ms is not None]
+        if acks:
+            lines.append(f"  {len(acks)} ордерів, {min(acks):.0f}-{max(acks):.0f}мс кожен")
         return "\n".join(lines)
 
 
 class LadderExecutor:
-    """Fires a plan against two live clients. Both sides of a slice go at once; a refused slice is
-    recorded and the rest continue."""
+    """Fires a plan across two groups. `long`/`short` are lists of (account_id, client). Every slice
+    goes to all of them at once — group 1 buys, group 2 sells — and a refused order is recorded
+    without doubling up or unwinding."""
 
-    def __init__(self, long_client, short_client, *, symbol: str, leverage: int, open_type: int = 2) -> None:
-        self._long = long_client
-        self._short = short_client
+    def __init__(self, long: list, short: list, *, symbol: str, leverage: int, open_type: int = 2) -> None:
+        self._long = long
+        self._short = short
         self._symbol = symbol
         self._leverage = leverage
         self._open_type = open_type
 
     async def prepare(self) -> None:
-        """Set leverage on both accounts before the clock starts, so no slice pays for it in time."""
+        """Set leverage on every account before the clock starts, so no slice pays for it in time."""
         await asyncio.gather(
-            self._set_leverage(self._long),
-            self._set_leverage(self._short),
+            *(self._set_leverage(c) for _, c in self._long + self._short),
             return_exceptions=True,
         )
 
     async def _set_leverage(self, client) -> None:
         try:
-            await client.set_leverage(
-                position_id=None, leverage=self._leverage, open_type=self._open_type,
-                symbol=self._symbol, position_type=1,
-            )
+            await client.set_leverage(position_id=None, leverage=self._leverage,
+                                      open_type=self._open_type, symbol=self._symbol, position_type=1)
         except MexcError as err:
             LOGGER.warning("could not preset leverage: %s", err.message)
 
@@ -257,19 +262,12 @@ class LadderExecutor:
             wait = part.send_epoch - clock()
             if wait > 0:
                 await sleep(wait)
-            pair = await asyncio.gather(
-                self._fire(self._long, plan.config.long_account, "LONG", SIDE_OPEN_LONG, part, clock),
-                self._fire(self._short, plan.config.short_account, "SHORT", SIDE_OPEN_SHORT, part, clock),
+            fired = await asyncio.gather(
+                *(self._fire(c, aid, "LONG", SIDE_OPEN_LONG, part, clock) for aid, c in self._long),
+                *(self._fire(c, aid, "SHORT", SIDE_OPEN_SHORT, part, clock) for aid, c in self._short),
             )
-            results.extend(pair)
-
-        report = LadderReport(plan=plan, results=results)
-        for r in results:
-            if r.ok and r.side == "LONG":
-                report.filled_long += float(r.amount)
-            elif r.ok and r.side == "SHORT":
-                report.filled_short += float(r.amount)
-        return report
+            results.extend(fired)
+        return LadderReport(plan=plan, results=results)
 
     async def _fire(self, client, account_id, side_name, side, part: Slice, clock) -> SliceResult:
         sent = clock()
@@ -285,6 +283,6 @@ class LadderExecutor:
         except MexcError as err:
             return SliceResult(part.index, account_id, side_name, part.amount, False,
                                sent, error=err.message or str(err))
-        except Exception as err:  # noqa: BLE001 — one slice's failure must not stop the ladder
+        except Exception as err:  # noqa: BLE001 — one order's failure must not stop the ladder
             return SliceResult(part.index, account_id, side_name, part.amount, False,
                                sent, error=f"{type(err).__name__}: {err}")

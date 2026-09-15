@@ -41,7 +41,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "src"))
 
-from mexc_copy_bot.core.ladder import LadderConfig, LadderExecutor, _clock, plan_ladder  # noqa: E402
+from mexc_copy_bot.core.ladder import LadderConfig, LadderExecutor, fmt_time, plan_ladder  # noqa: E402
 from mexc_copy_bot.exchange import Credentials  # noqa: E402
 from mexc_copy_bot.hibt import rest  # noqa: E402
 from mexc_copy_bot.hibt.rest import HibtRestClient  # noqa: E402
@@ -104,14 +104,13 @@ async def main(config_path: str, arm: bool) -> int:
         )
 
         config = LadderConfig(
-            symbol=symbol, long_account=cfg["long_account"], short_account=cfg["short_account"],
-            leverage=int(cfg["leverage"]), margin_usd=float(cfg["margin_usd"]),
+            symbol=symbol, leverage=int(cfg["leverage"]), margin_usd=float(cfg["margin_usd"]),
             parts=int(cfg["parts"]), step_seconds=float(cfg["step_seconds"]), target_epoch=target_epoch,
         )
         plan = plan_ladder(
             config, price=price, size_precision=rest.size_precision(rules),
             min_order=float(rules.get("marketMiniAmount") or 0), latency_seconds=latency,
-            available_long=long_snap.openable, available_short=short_snap.openable, now=time.time(),
+            available=[long_snap.openable, short_snap.openable], now=time.time(),
         )
 
         print(f"LONG  {long_label}: free ${long_snap.openable:.2f}")
@@ -119,9 +118,9 @@ async def main(config_path: str, arm: bool) -> int:
         print(f"{symbol} price {price}, measured latency {latency*1000:.0f}ms")
         print(f"size ${plan.target_notional:,.0f}/account at {config.leverage}x = {plan.total_amount} "
               f"{symbol} each, in {config.parts} slices")
-        print(f"position must be full by T = {_clock(target_epoch)}")
+        print(f"position must be full by T = {fmt_time(target_epoch)}")
         for s in plan.slices:
-            print(f"   slice {s.index}: {s.amount} at {_clock(s.send_epoch)} "
+            print(f"   slice {s.index}: {s.amount} at {fmt_time(s.send_epoch)} "
                   f"(T−{target_epoch - s.send_epoch:.1f}s)")
         for w in plan.warnings:
             print(f"  ! {w}")
@@ -154,7 +153,8 @@ async def main(config_path: str, arm: bool) -> int:
         await asyncio.gather(long_stream.wait_connected(8), short_stream.wait_connected(8))
         print("\nwebsocket watching both accounts; arming.")
 
-        executor = LadderExecutor(long_client, short_client, symbol=symbol, leverage=config.leverage)
+        executor = LadderExecutor([(cfg['long_account'], long_client)], [(cfg['short_account'], short_client)],
+                                  symbol=symbol, leverage=config.leverage)
         await executor.prepare()
         report = await executor.run(plan)
 

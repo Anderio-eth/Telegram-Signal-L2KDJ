@@ -421,3 +421,7 @@ CREATE TABLE IF NOT EXISTS copy_ladders (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS copy_ladders_armed ON copy_ladders (status, target_epoch);
+-- The sides are the folder's groups now, resolved when the ladder fires, so the per-account columns
+-- are no longer required (kept nullable for old rows).
+ALTER TABLE copy_ladders ALTER COLUMN long_account DROP NOT NULL;
+ALTER TABLE copy_ladders ALTER COLUMN short_account DROP NOT NULL;

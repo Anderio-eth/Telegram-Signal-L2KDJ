@@ -383,7 +383,7 @@ class Store:
 
     # ── scheduled ladders ─────────────────────────────────────────────────────────────────────
     async def create_ladder(self, **fields) -> int:
-        cols = ("owner_id", "folder_id", "symbol", "long_account", "short_account",
+        cols = ("owner_id", "folder_id", "symbol",
                 "leverage", "margin_usd", "parts", "step_seconds", "target_epoch")
         values = [fields[c] for c in cols]
         placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
@@ -645,6 +645,12 @@ class Store:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("SELECT DISTINCT owner_id FROM copy_accounts ORDER BY owner_id")
         return [r["owner_id"] for r in rows]
+
+    async def folder_accounts(self, folder_id: int) -> list["Account"]:
+        """Every active account of a folder, master included, for splitting into the two groups."""
+        master = await self.get_master(folder_id)
+        followers = await self.list_accounts(folder_id, FOLLOWER)
+        return [a for a in (([master] if master else []) + followers) if a.active]
 
     async def get_master(self, folder_id: int) -> Account | None:
         accounts = await self.list_accounts(folder_id, MASTER)

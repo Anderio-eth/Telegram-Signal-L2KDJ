@@ -45,6 +45,7 @@ class LadderScheduler:
         self._on_report = on_report        # async (owner_id, folder_id, text) -> None
         self._task: asyncio.Task[None] | None = None
         self._running: set[int] = set()     # ladder ids firing in this process right now
+        self._labels: dict[int, str] = {}   # account id -> label, for the report
 
     async def start(self) -> None:
         await self._store.expire_stuck_ladders()
@@ -92,7 +93,7 @@ class LadderScheduler:
                 opened = [r for r in result.results if r.ok]
                 # nothing opened is a failure, not a partial; some-but-not-all is partial
                 status = "DONE" if len(opened) == len(result.results) else ("PARTIAL" if opened else "FAILED")
-                text = result.summary()
+                text = result.summary(self._labels)
         except Exception as err:  # noqa: BLE001 — a firing that crashes must still be recorded
             LOGGER.exception("ladder %s failed", ladder_id)
             status, text = "FAILED", f"{type(err).__name__}: {err}"
@@ -102,44 +103,56 @@ class LadderScheduler:
         self._running.discard(ladder_id)
 
     async def _run(self, ladder: dict, session: aiohttp.ClientSession):
-        """Returns a LadderReport, or a plain string reason it could not run at all."""
-        long_creds = await self._store.get_credentials(ladder["long_account"], ladder["owner_id"])
-        short_creds = await self._store.get_credentials(ladder["short_account"], ladder["owner_id"])
-        if not long_creds or not short_creds:
-            return "credentials missing"
+        """Returns a LadderReport, or a plain string reason it could not run at all.
 
-        long_client = make_rest_client(long_creds, session=session)
-        short_client = make_rest_client(short_creds, session=session)
+        The two sides are the folder's groups, resolved now: group 1 buys, group 2 sells. Resolved
+        at fire time so a group edited after arming is honoured, and so nothing is opened on a side
+        that has no accounts.
+        """
         symbol = ladder["symbol"]
+        owner_id = ladder["owner_id"]
+        accounts = await self._store.folder_accounts(ladder["folder_id"])
+        group1 = [a for a in accounts if a.group == 1]
+        group2 = [a for a in accounts if a.group == 2]
+        if not group1 or not group2:
+            return "потрібен щонайменше один акаунт у кожній групі (Група 1 → лонг, Група 2 → шорт)"
+
+        self._labels = {a.id: a.label for a in accounts}
+        long, short = [], []
+        for bucket, group in ((long, group1), (short, group2)):
+            for account in group:
+                creds = await self._store.get_credentials(account.id, owner_id)
+                if not creds:
+                    return f"немає ключів для {account.label}"
+                bucket.append((account.id, make_rest_client(creds, session=session)))
 
         rules = (await hibt_rest.load_symbols(session)).get(symbol)
         if not rules:
             return f"{symbol} not listed on HIBT"
         price = await hibt_rest.get_ticker_price(session, symbol)
-        latency, long_snap, short_snap = await asyncio.gather(
-            self._measure(long_client), long_client.get_usdt_snapshot(), short_client.get_usdt_snapshot(),
-        )
+        all_clients = [c for _, c in long + short]
+        latency = await self._measure(all_clients[0])
+        snaps = await asyncio.gather(*(c.get_usdt_snapshot() for c in all_clients))
 
         config = LadderConfig(
-            symbol=symbol, long_account=ladder["long_account"], short_account=ladder["short_account"],
-            leverage=ladder["leverage"], margin_usd=ladder["margin_usd"],
+            symbol=symbol, leverage=ladder["leverage"], margin_usd=ladder["margin_usd"],
             parts=ladder["parts"], step_seconds=ladder["step_seconds"], target_epoch=ladder["target_epoch"],
         )
         plan = plan_ladder(
             config, price=price, size_precision=hibt_rest.size_precision(rules),
             min_order=float(rules.get("marketMiniAmount") or 0), latency_seconds=latency,
-            available_long=long_snap.openable, available_short=short_snap.openable, now=time.time(),
+            available=[s.openable for s in snaps], now=time.time(),
         )
         if not plan.ok:
             return "; ".join(plan.errors)
 
-        executor = LadderExecutor(long_client, short_client, symbol=symbol, leverage=config.leverage)
+        executor = LadderExecutor(long, short, symbol=symbol, leverage=config.leverage)
         await executor.prepare()
         report = await executor.run(plan)
         await asyncio.sleep(1.0)
         with contextlib.suppress(Exception):
-            report.final_long = f"{await self._held(long_client, symbol):g}"
-            report.final_short = f"{await self._held(short_client, symbol):g}"
+            for account_id, client in long + short:
+                report.final[account_id] = f"{await self._held(client, symbol):g}"
         return report
 
     @staticmethod

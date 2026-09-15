@@ -52,13 +52,12 @@ def a_report(config, failed=0):
     plan = LadderPlan(config=config, price=63.0, target_notional=4000.0, total_amount="60",
                       slices=[], start_epoch=config.target_epoch)
     results = [SliceResult(i, 35, "LONG", "20", ok=(i >= failed), sent_epoch=0) for i in range(3)]
-    return LadderReport(plan=plan, results=results, filled_long=60, filled_short=60)
+    return LadderReport(plan=plan, results=results)
 
 
 def config_of(l):
-    return LadderConfig(symbol=l["symbol"], long_account=l["long_account"], short_account=l["short_account"],
-                        leverage=l["leverage"], margin_usd=l["margin_usd"], parts=l["parts"],
-                        step_seconds=l["step_seconds"], target_epoch=l["target_epoch"])
+    return LadderConfig(symbol=l["symbol"], leverage=l["leverage"], margin_usd=l["margin_usd"],
+                        parts=l["parts"], step_seconds=l["step_seconds"], target_epoch=l["target_epoch"])
 
 
 async def drain(scheduler):
