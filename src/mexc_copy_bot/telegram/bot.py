@@ -79,8 +79,6 @@ from ..exchange import (
     make_rest_client,
     ticker_price,
 )
-from ..hibt import rest as hibt_rest
-from ..hibt.rest import HibtRestClient  # noqa: F401
 from ..mexc.rest import MexcError
 from . import messages
 from .i18n import EN, UK, t
@@ -1002,6 +1000,7 @@ class CopyBot:
         if not (d.get("margin_usd") and d.get("target")):
             return None, "fields"
         symbol = d["symbol"]
+        exchange = self._view(owner_id).exchange
         creds = {}
         for a in group1 + group2:
             c = await self._store.get_credentials(a.id, owner_id)
@@ -1009,18 +1008,20 @@ class CopyBot:
                 return None, f"немає ключів для {a.label}"
             creds[a.id] = c
         async with aiohttp.ClientSession() as session:
-            rules = (await hibt_rest.load_symbols(session)).get(symbol)
-            if not rules:
-                return None, f"{symbol} not on HIBT"
-            price = await hibt_rest.get_ticker_price(session, symbol)
+            spec = (await contract_specs(session, exchange, symbol)).get(symbol)
+            if not spec:
+                return None, f"{symbol} не торгується на {exchange_name(exchange)}"
+            if not spec.api_allowed:
+                return None, f"{symbol}: біржа не дозволяє торгівлю через API"
+            price = await ticker_price(session, exchange, symbol)
             snaps = await asyncio.gather(
                 *(make_rest_client(creds[a.id], session=session).get_usdt_snapshot() for a in group1 + group2))
         config = LadderConfig(
             symbol=symbol, leverage=int(d["leverage"]), margin_usd=float(d["margin_usd"]),
             parts=int(d["parts"]), step_seconds=float(d["step_seconds"]), target_epoch=float(d["target"]))
         plan = plan_ladder(
-            config, price=price, size_precision=hibt_rest.size_precision(rules),
-            min_order=float(rules.get("marketMiniAmount") or 0), latency_seconds=0.3,
+            config, price=price, size_precision=spec.vol_scale,
+            min_order=spec.min_vol, contract_size=spec.contract_size, latency_seconds=0.3,
             available=[s.openable for s in snaps], now=__import__("time").time())
         return plan, None
 
@@ -1312,7 +1313,7 @@ class CopyBot:
                 await self._stuck_count(owner_id),
                 await self._folder_name(owner_id),
                 await self._menu_columns(owner_id),
-                show_ladder=self._view(owner_id).exchange == EXCHANGE_HIBT,
+                show_ladder=self._view(owner_id).in_topic,  # scheduled entry works on MEXC and HIBT
             ),
         )
 

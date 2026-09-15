@@ -26,7 +26,7 @@ def config(**over):
 
 def make_plan(**over):
     kw = dict(price=1.5, size_precision=2, min_order=10.0, latency_seconds=0.2,
-              available=[200.0, 200.0], now=T - 100)
+              available=[200.0, 200.0], now=T - 100, contract_size=1.0)
     for key in list(over):
         if key in kw:
             kw[key] = over.pop(key)
@@ -40,6 +40,18 @@ def test_size_is_margin_times_leverage():
     # $150k / $1.5 = 100,000 contracts, in 5 slices of 20,000
     assert plan.total_amount == "100000"
     assert [s.amount for s in plan.slices] == ["20000"] * 5
+
+
+def test_mexc_contract_size_converts_notional_to_contracts():
+    # MEXC BTC_USDT: 1 contract = 0.0001 BTC. $60k margin at 1x = $60k notional at $60k price:
+    # 60000 / (60000 * 0.0001) = 10,000 contracts.
+    plan = make_plan(margin_usd=60000, leverage=1, price=60000.0, parts=1, available=[1e9, 1e9],
+                     size_precision=0, min_order=1.0, contract_size=0.0001)
+    assert plan.ok and plan.total_amount == "10000"
+    # the same notional on a base-asset venue (contract_size 1) is 1 BTC
+    plan2 = make_plan(margin_usd=60000, leverage=1, price=60000.0, parts=1, available=[1e9, 1e9],
+                      size_precision=3, min_order=0.001, contract_size=1.0)
+    assert plan2.total_amount == "1"
 
 
 def test_the_last_slice_absorbs_the_rounding():

@@ -24,8 +24,7 @@ import time
 
 import aiohttp
 
-from ..exchange import make_rest_client
-from ..hibt import rest as hibt_rest
+from ..exchange import contract_specs, make_rest_client, ticker_price
 from .ladder import LadderConfig, LadderExecutor, plan_ladder
 
 LOGGER = logging.getLogger(__name__)
@@ -137,10 +136,14 @@ class LadderScheduler:
                     return f"немає ключів для {account.label}"
                 bucket.append((account.id, make_rest_client(creds, session=session)))
 
-        rules = (await hibt_rest.load_symbols(session)).get(symbol)
-        if not rules:
-            return f"{symbol} not listed on HIBT"
-        price = await hibt_rest.get_ticker_price(session, symbol)
+        folder = await self._store.get_folder(ladder["folder_id"], owner_id)
+        exchange = folder.exchange if folder else "mexc"
+        spec = (await contract_specs(session, exchange, symbol)).get(symbol)
+        if not spec:
+            return f"{symbol} not listed"
+        if not spec.api_allowed:
+            return f"{symbol}: біржа не дозволяє торгівлю цим контрактом через API"
+        price = await ticker_price(session, exchange, symbol)
         all_clients = [c for _, c in long + short]
         latency = await self._measure(all_clients[0])
         snaps = await asyncio.gather(*(c.get_usdt_snapshot() for c in all_clients))
@@ -150,8 +153,8 @@ class LadderScheduler:
             parts=ladder["parts"], step_seconds=ladder["step_seconds"], target_epoch=ladder["target_epoch"],
         )
         plan = plan_ladder(
-            config, price=price, size_precision=hibt_rest.size_precision(rules),
-            min_order=float(rules.get("marketMiniAmount") or 0), latency_seconds=latency,
+            config, price=price, size_precision=spec.vol_scale,
+            min_order=spec.min_vol, contract_size=spec.contract_size, latency_seconds=latency,
             available=[s.openable for s in snaps], now=time.time(),
         )
         if not plan.ok:

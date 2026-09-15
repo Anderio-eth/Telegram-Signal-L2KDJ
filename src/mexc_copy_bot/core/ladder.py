@@ -106,6 +106,7 @@ def plan_ladder(
     latency_seconds: float,
     available: list[float],
     now: float,
+    contract_size: float = 1.0,
 ) -> LadderPlan:
     """Work out the slices and their send times, or the reasons it cannot be done.
 
@@ -138,7 +139,11 @@ def plan_ladder(
     slices: list[Slice] = []
     total_amount = Decimal(0)
     if not errors:
-        total = _floor(_dec(target_notional) / _dec(price), size_precision)
+        # Size is in the venue's unit: HIBT counts the base asset (contract_size 1), MEXC counts
+        # contracts (contract_size e.g. 0.0001 BTC). notional = amount × contract_size × price, so
+        # amount = notional / (price × contract_size).
+        denom = _dec(price) * _dec(contract_size)
+        total = _floor(_dec(target_notional) / denom, size_precision) if denom > 0 else Decimal(0)
         per = _floor(total / config.parts, size_precision)
         if per <= 0 or float(per) < min_order:
             errors.append(
