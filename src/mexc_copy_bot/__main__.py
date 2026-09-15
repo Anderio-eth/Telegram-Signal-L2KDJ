@@ -72,7 +72,7 @@ def main() -> None:
     )
     bot = CopyBot(settings, store, registry)
     app = bot.build()
-    scheduler = LadderScheduler(store, on_report=bot.post_to_folder)
+    scheduler = LadderScheduler(store, on_report=bot.post_to_folder, registry=registry)
     app.bot_data["registry"] = registry
     app.bot_data["store"] = store
     app.bot_data["ladder_scheduler"] = scheduler

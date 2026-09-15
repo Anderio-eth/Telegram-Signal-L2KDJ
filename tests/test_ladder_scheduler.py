@@ -154,3 +154,59 @@ async def _tick_and_drain(sched):
     await sched._tick()
     for _ in range(5):
         await asyncio.sleep(0)
+
+
+class FakeService:
+    def __init__(self):
+        self.events = []
+
+    async def suspend_group_copy(self):
+        self.events.append("suspend")
+
+    async def resume_group_copy(self):
+        self.events.append("resume")
+
+
+class FakeRegistry:
+    def __init__(self, service=None):
+        self._service = service
+
+    def running_service(self, folder_id):
+        return self._service
+
+
+def test_a_running_group_poller_is_paused_around_the_fire_and_reseeded_after():
+    store = FakeStore([ladder(1, target_in=5)])
+    service = FakeService()
+    sched = LadderScheduler(store, registry=FakeRegistry(service))
+
+    async def fake_run(l, session):
+        service.events.append("fire")
+        return a_report(config_of(l))
+    sched._run = fake_run
+    asyncio.run(_tick_and_drain(sched))
+
+    assert service.events == ["suspend", "fire", "resume"]
+    assert store.ladders[1]["status"] == "DONE"
+
+
+def test_the_poller_is_resumed_even_if_the_fire_crashes():
+    store = FakeStore([ladder(1, target_in=5)])
+    service = FakeService()
+    sched = LadderScheduler(store, registry=FakeRegistry(service))
+
+    async def boom(l, session):
+        raise RuntimeError("kaboom")
+    sched._run = boom
+    asyncio.run(_tick_and_drain(sched))
+
+    assert "resume" in service.events
+    assert store.ladders[1]["status"] == "FAILED"
+
+
+def test_no_running_service_is_fine():
+    store = FakeStore([ladder(1, target_in=5)])
+    sched = LadderScheduler(store, registry=FakeRegistry(None))
+    sched._run = lambda l, s: _wrap(a_report(config_of(l)))
+    asyncio.run(_tick_and_drain(sched))
+    assert store.ladders[1]["status"] == "DONE"

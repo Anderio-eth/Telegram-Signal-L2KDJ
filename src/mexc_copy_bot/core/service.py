@@ -266,6 +266,10 @@ class CopyService:
                 await self._session.close()
                 self._session = None
                 return "Потрібно щонайменше два акаунти — по одному в кожній групі."
+            # Reseed before the poller's first tick: anything already open (a ladder that just fired,
+            # or a position from before) becomes the baseline, so it shows in the menu rather than
+            # being mistaken for a fresh manual trade and copied to the other group.
+            await self._reseed_group_trackers()
             self._start_loops()
             await self._store.set_running(self._folder_id, True)
             return "✅ Запущено — стежу за всіма акаунтами."
@@ -1136,6 +1140,17 @@ class CopyService:
             # this is the line between "copied once" and "copying forever".
             await self._reseed_group_trackers()
             self._copying = False
+
+    async def suspend_group_copy(self) -> None:
+        """Hold the group poller while a ladder fires on both legs at once, so it does not read the
+        ladder's own fills as a manual trade and copy them to the other group."""
+        self._copying = True
+
+    async def resume_group_copy(self) -> None:
+        """Let the poller run again, with the ladder's new positions folded in as the baseline."""
+        with contextlib.suppress(Exception):
+            await self._reseed_group_trackers()
+        self._copying = False
 
     async def _reseed_group_trackers(self) -> None:
         accounts = await self._group_accounts()

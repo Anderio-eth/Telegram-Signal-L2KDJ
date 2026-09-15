@@ -79,6 +79,12 @@ class ServiceRegistry:
             self._services[folder_id] = service
             return service
 
+    def running_service(self, folder_id: int) -> "CopyService | None":
+        """The live service for a folder, if one is running — for the ladder scheduler to pause its
+        group poller while it fires. None when nothing is running there."""
+        service = self._services.get(folder_id)
+        return service if service and service.running else None
+
     def active(self) -> list[CopyService]:
         """Services that currently hold a master socket."""
         return [s for s in self._services.values() if s.running]

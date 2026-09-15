@@ -40,9 +40,10 @@ LOOKAHEAD_SECONDS = CLAIM_LEAD_SECONDS + 3600.0
 
 
 class LadderScheduler:
-    def __init__(self, store, *, on_report=None) -> None:
+    def __init__(self, store, *, on_report=None, registry=None) -> None:
         self._store = store
         self._on_report = on_report        # async (owner_id, folder_id, text) -> None
+        self._registry = registry          # to pause a running group poller while a ladder fires
         self._task: asyncio.Task[None] | None = None
         self._running: set[int] = set()     # ladder ids firing in this process right now
         self._labels: dict[int, str] = {}   # account id -> label, for the report
@@ -83,7 +84,13 @@ class LadderScheduler:
 
     async def _fire(self, ladder: dict) -> None:
         ladder_id = ladder["id"]
+        # Hold the folder's group poller (if it is running) around the whole fire, so it never reads
+        # the ladder's own fills as a manual trade to copy; resume hands it the new positions as the
+        # baseline.
+        service = self._registry.running_service(ladder["folder_id"]) if self._registry else None
         try:
+            if service:
+                await service.suspend_group_copy()
             async with aiohttp.ClientSession() as session:
                 result = await self._run(ladder, session)
             if isinstance(result, str):
@@ -97,6 +104,10 @@ class LadderScheduler:
         except Exception as err:  # noqa: BLE001 — a firing that crashes must still be recorded
             LOGGER.exception("ladder %s failed", ladder_id)
             status, text = "FAILED", f"{type(err).__name__}: {err}"
+        finally:
+            if service:
+                with contextlib.suppress(Exception):
+                    await service.resume_group_copy()
         # One place records and reports, so every outcome — done, partial or failed — reaches the owner.
         await self._store.finish_ladder(ladder_id, status, text)
         await self._notify(ladder, f"⏱ <b>{ladder['symbol']}</b> запланований вхід — {status}\n\n{text}")

@@ -1064,6 +1064,13 @@ class CopyBot:
             leverage=int(d["leverage"]), margin_usd=float(d["margin_usd"]),
             parts=int(d["parts"]), step_seconds=float(d["step_seconds"]), target_epoch=float(d["target"]))
         self._ladder_drafts.pop(owner_id, None)
+        # Turn the bot on for this folder now, so when the entry fires its positions are watched:
+        # the menu shows them and closing through the bot works. Without this the folder would be
+        # idle and the fills would read as "no position".
+        service = await self._registry.get(self._folder(owner_id), owner_id)
+        if not service.running:
+            with contextlib.suppress(Exception):
+                await service.start()
         await update.callback_query.answer(t(lang, "ladder_armed_alert"), show_alert=True)
         await self._show_ladders(update, owner_id)
 
