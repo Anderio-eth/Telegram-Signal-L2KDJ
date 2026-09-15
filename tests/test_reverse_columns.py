@@ -46,33 +46,39 @@ def test_the_master_sits_with_the_accounts_trading_its_way():
     assert [c.account_id for c in right] == [2]
 
 
-def test_the_master_is_numbered_like_everyone_else():
-    """In this mode it holds no authority — only whichever leg somebody put it in — so calling it
-    "Master" on the screen would suggest a rank it does not have."""
+def test_the_master_sits_with_its_group_and_shows_its_name():
+    """No authority — just whichever group it was put in — and its own name is what shows, so a
+    rename is reflected here."""
     left, _ = reverse_columns(MASTER_ACC, [account(1), account(2)], {}, {})
-    assert [c.label for c in left] == ["1.1", "1.2", "1.3"]
+    assert [c.label for c in left] == ["Follower 9", "Follower 1", "Follower 2"]
 
 
-def test_each_leg_numbers_from_one():
+def test_each_account_lands_in_the_column_of_its_group():
     left, right = reverse_columns(
         MASTER_ACC,
         [account(1), account(2, direction="REVERSE"), account(3, direction="REVERSE"), account(4)],
         {}, {},
     )
-    assert [c.label for c in left] == ["1.1", "1.2", "1.3"]
-    assert [c.label for c in right] == ["2.1", "2.2"]
+    assert [c.label for c in left] == ["Follower 9", "Follower 1", "Follower 4"]
+    assert [c.label for c in right] == ["Follower 2", "Follower 3"]
+
+
+def test_a_master_in_group_two_shows_on_the_right():
+    left, right = reverse_columns(account(9, MASTER, direction="REVERSE"), [account(1)], {}, {})
+    assert [c.label for c in left] == ["Follower 1"]
+    assert [c.label for c in right] == ["Follower 9"]
 
 
 def test_a_folder_with_no_master_still_shows_its_legs():
     left, right = reverse_columns(None, [account(1), account(2, direction="REVERSE")], {}, {})
-    assert [c.label for c in left] == ["1.1"]
-    assert [c.label for c in right] == ["2.1"]
+    assert [c.label for c in left] == ["Follower 1"]
+    assert [c.label for c in right] == ["Follower 2"]
 
 
 # ── what a cell says ───────────────────────────────────────────────────────
 def test_a_cell_carries_the_name_the_balance_and_the_light():
     left, _ = reverse_columns(None, [account(1)], {1: Balance(equity=120.0, available=100.0)}, {1: True})
-    assert left[0].text() == "1.1  $100  🟢"
+    assert left[0].text() == "Follower 1  $100  🟢"
 
 
 def test_an_account_with_nothing_open_shows_red():

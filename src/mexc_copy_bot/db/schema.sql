@@ -425,3 +425,9 @@ CREATE INDEX IF NOT EXISTS copy_ladders_armed ON copy_ladders (status, target_ep
 -- are no longer required (kept nullable for old rows).
 ALTER TABLE copy_ladders ALTER COLUMN long_account DROP NOT NULL;
 ALTER TABLE copy_ladders ALTER COLUMN short_account DROP NOT NULL;
+
+-- A groups (REVERSE) folder has no master — every account is an equal member of a group. Demote any
+-- master that lingers there so nothing is treated as special. COPY folders keep their master.
+UPDATE copy_accounts a SET kind = 'FOLLOWER'
+FROM copy_folders f
+WHERE f.id = a.folder_id AND f.mode = 'REVERSE' AND a.kind = 'MASTER';

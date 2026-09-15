@@ -116,7 +116,10 @@ def main_menu(
     beforehand rather than in an error report afterwards.
     """
     balances = balances or {}
-    if not master:
+    if mode == MODE_REVERSE:
+        # A groups folder has no master; its status is simply on or off.
+        status = t(lang, "status_running" if running else "status_stopped")
+    elif not master:
         status = t(lang, "status_no_master")
     elif running and master_connected:
         status = t(lang, "status_running")
@@ -125,7 +128,7 @@ def main_menu(
     else:
         status = t(lang, "status_stopped")
 
-    lines = ["🤖 <b>MEXC COPY BOT</b>", "", t(lang, "menu_status", status=status)]
+    lines = ["🤖 <b>NDA-BOT</b>", "", t(lang, "menu_status", status=status)]
 
     if mode == MODE_REVERSE:
         # Counted over every account in the folder, master included. It was counting followers
@@ -145,9 +148,8 @@ def main_menu(
     if listed_in_columns:
         # The accounts are on the keyboard below, one cell each with a balance and a light.
         # Repeating them here would put the same numbers on screen twice, and the two copies
-        # would disagree the moment one of them was a moment older than the other.
-        if not master:
-            lines.append(t(lang, "master_not_set"))
+        # would disagree the moment one of them was a moment older than the other. No master line:
+        # a groups folder has none.
         return chr(10).join(lines).rstrip()
 
     if not master:
@@ -444,17 +446,12 @@ def reverse_columns(
     balances: dict[int, Balance],
     holding: dict[int, bool],
 ) -> tuple[list[Cell], list[Cell]]:
-    """Split a folder into the two legs the REVERSE screen shows.
+    """Split a folder into the two legs the groups screen shows.
 
-    Left is everything trading the master's way — the master itself included. It is listed there
-    rather than above because after the entry it is exactly that and nothing more: its own exit
-    moves no other account, so singling it out would suggest an authority it does not have.
-
-    Right is everything trading against the master.
-
-    Numbering runs within each column. The account's stored label is not used: "Follower #7" says
-    nothing about which way it trades, and which way it trades is the only thing this screen is
-    about.
+    Every account sits in the column of the group it is actually in — group 1 on the left, group 2
+    on the right — the master included, because in this mode it is just one more account in whichever
+    group it was put. Each cell shows the account's own name, so a rename is reflected here and an
+    account moved between groups moves columns.
     """
     def balance_of(account: Account) -> float | None:
         entry = balances.get(account.id)
@@ -462,20 +459,7 @@ def reverse_columns(
 
     left: list[Cell] = []
     right: list[Cell] = []
-
-    if master:
-        # Numbered with everyone else. In this mode it is one more account in whichever leg it was
-        # put, and calling it "Master" on the screen would suggest an authority it does not have.
-        left.append(Cell(master.id, "1.1", balance_of(master), holding.get(master.id, False)))
-
-    for account in followers:
+    for account in ([master] if master else []) + list(followers):
         column = right if account.is_reversed else left
-        side = "2." if account.is_reversed else "1."
-        # Counted over the accounts already placed in this column under the same heading, so the
-        # master sitting at the top of the left one does not consume a follower's number.
-        index = len(column) + 1
-        column.append(
-            Cell(account.id, f"{side}{index}", balance_of(account), holding.get(account.id, False))
-        )
-
+        column.append(Cell(account.id, account.label, balance_of(account), holding.get(account.id, False)))
     return left, right

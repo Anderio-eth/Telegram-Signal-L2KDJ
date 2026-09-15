@@ -80,7 +80,7 @@ def main() -> None:
     app.post_shutdown = _shutdown
 
     LOGGER.info(
-        "mexc copy bot starting (%d authorised user(s), followers max %d each)",
+        "NDA-BOT starting (%d authorised user(s), followers max %d each)",
         len(settings.allowed_user_ids),
         settings.max_followers,
     )
