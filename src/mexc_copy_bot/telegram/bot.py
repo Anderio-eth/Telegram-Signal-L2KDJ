@@ -1508,6 +1508,19 @@ class CopyBot:
                     DIRECTION_COPY if account.is_reversed else DIRECTION_REVERSE,
                 )
             await self._show_mode(update, owner_id)
+        elif action.startswith("gtog:"):
+            # Move an account to the other group, from the accounts screen. Same effect as dir: but
+            # returns to the accounts list rather than the mode screen.
+            if await self._refuse_while_running(update, owner_id):
+                return
+            account_id = int(action.split(":", 1)[1])
+            accounts = await self._store.folder_accounts(self._folder(owner_id))
+            account = next((a for a in accounts if a.id == account_id), None)
+            if account:
+                await self._store.set_direction(
+                    account_id, self._folder(owner_id),
+                    DIRECTION_COPY if account.is_reversed else DIRECTION_REVERSE)
+            await self._show_accounts(update, owner_id)
         elif action == "mode_reverse":
             if await self._refuse_while_running(update, owner_id):
                 return
@@ -2097,17 +2110,50 @@ class CopyBot:
         return ConversationHandler.END
 
     async def _show_accounts(self, update: Update, owner_id: int) -> None:
+        lang = await self._lang(owner_id)
+        mode, _ = await self._store.get_mode(self._folder(owner_id))
+        if mode == MODE_REVERSE:
+            await self._show_accounts_grouped(update, owner_id, lang)
+            return
         master = await self._store.get_master(self._folder(owner_id))
         followers = await self._store.list_accounts(self._folder(owner_id), FOLLOWER)
         await update.callback_query.edit_message_text(
-            messages.accounts_list(master, followers, await self._lang(owner_id)),
+            messages.accounts_list(master, followers, lang),
             reply_markup=_accounts_keyboard(
                 has_master=master is not None,
                 can_add_follower=len(followers) < self._settings.max_followers,
-                lang=await self._lang(owner_id),
+                lang=lang,
             ),
             parse_mode=ParseMode.HTML,
         )
+
+    async def _show_accounts_grouped(self, update: Update, owner_id: int, lang: str) -> None:
+        """One screen for a groups folder: every account equal — no master — with its group, a
+        rename and a remove, plus add. Tapping the group cell moves the account to the other side.
+
+        Group 1 opens long, group 2 short (that is what a scheduled entry uses, and what a manual
+        trade in one group mirrors into the other). So an account's side is just which group it is
+        in, set right here.
+        """
+        one, two = await self._group_names(owner_id)
+        accounts = await self._store.folder_accounts(self._folder(owner_id))
+        lines = [t(lang, "acc_grouped_title"), "", t(lang, "acc_grouped_hint", one=one, two=two)]
+        rows = []
+        for a in accounts:
+            in_two = a.is_reversed
+            chip = f"2️⃣ {two}" if in_two else f"1️⃣ {one}"
+            rows.append([
+                InlineKeyboardButton(f"{a.label} · {chip}", callback_data=f"gtog:{a.id}"),
+                InlineKeyboardButton("✏️", callback_data=f"ren:a:{a.id}"),
+                InlineKeyboardButton("🗑", callback_data=f"remove:{a.id}"),
+            ])
+        if not accounts:
+            lines.append("")
+            lines.append(t(lang, "acc_grouped_empty"))
+        rows.append([InlineKeyboardButton(t(lang, "btn_add_account"), callback_data="add_follower")])
+        rows.append([InlineKeyboardButton(t(lang, "btn_back"), callback_data="menu")])
+        await update.callback_query.edit_message_text(
+            NEWLINE.join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
     async def _show_remove_menu(self, update: Update, owner_id: int) -> None:
         accounts = await self._store.list_accounts(owner_id)
@@ -2286,7 +2332,14 @@ class CopyBot:
             )
 
         followers = await self._store.list_accounts(folder_id, FOLLOWER)
-        label = "Master" if kind == MASTER else f"Follower #{len(followers) + 1}"
+        # A groups folder has no master/follower roles — accounts are just numbered, and renamable.
+        folder_mode, _ = await self._store.get_mode(folder_id)
+        if kind == MASTER:
+            label = "Master"
+        elif folder_mode == MODE_REVERSE:
+            label = f"Акаунт {len(followers) + 1}"
+        else:
+            label = f"Follower #{len(followers) + 1}"
         replacing = kind == MASTER and master is not None
         try:
             if replacing:

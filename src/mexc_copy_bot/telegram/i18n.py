@@ -32,6 +32,15 @@ STRINGS: dict[str, dict[str, str]] = {
     "btn_refresh": {UK: "🔄 Оновити", EN: "🔄 Refresh"},
     "btn_emergency": {UK: "🛑 АВАРІЙНИЙ СТОП", EN: "🛑 EMERGENCY STOP"},
     "btn_ladder": {UK: "⏱ Запланований вхід", EN: "⏱ Scheduled entry"},
+    "btn_add_account": {UK: "➕ Додати акаунт", EN: "➕ Add account"},
+    "acc_grouped_title": {UK: "👥 <b>АКАУНТИ</b>", EN: "👥 <b>ACCOUNTS</b>"},
+    "acc_grouped_hint": {
+        UK: "Натисни на акаунт, щоб перекинути його між групами. "
+            "<b>{one}</b> відкриває ЛОНГ, <b>{two}</b> — ШОРТ. ✏️ — назва, 🗑 — видалити.",
+        EN: "Tap an account to move it between groups. "
+            "<b>{one}</b> opens LONG, <b>{two}</b> SHORT. ✏️ rename, 🗑 remove.",
+    },
+    "acc_grouped_empty": {UK: "Ще немає акаунтів. Додай перший.", EN: "No accounts yet. Add the first."},
     "btn_ladder_new": {UK: "➕ Новий вхід", EN: "➕ New entry"},
     "btn_ladder_cancel": {UK: "✖ Скасувати {symbol} {when}", EN: "✖ Cancel {symbol} {when}"},
     "btn_ladder_time": {UK: "🕒 Час T", EN: "🕒 Time T"},
