@@ -116,17 +116,17 @@ class LadderScheduler:
     async def _run(self, ladder: dict, session: aiohttp.ClientSession):
         """Returns a LadderReport, or a plain string reason it could not run at all.
 
-        The two sides are the folder's groups, resolved now: group 1 buys, group 2 sells. Resolved
-        at fire time so a group edited after arming is honoured, and so nothing is opened on a side
-        that has no accounts.
+        The sides are the folder's groups, resolved now: group 1 buys, group 2 sells. Both groups
+        filled is a hedge; only one filled opens just that side. Resolved at fire time so a group
+        edited after arming is honoured, and so nothing opens on a side that has no accounts.
         """
         symbol = ladder["symbol"]
         owner_id = ladder["owner_id"]
         accounts = await self._store.folder_accounts(ladder["folder_id"])
         group1 = [a for a in accounts if a.group == 1]
         group2 = [a for a in accounts if a.group == 2]
-        if not group1 or not group2:
-            return "потрібен щонайменше один акаунт у кожній групі (Група 1 → лонг, Група 2 → шорт)"
+        if not group1 and not group2:
+            return "потрібен щонайменше один акаунт у групі"
 
         self._labels = {a.id: a.label for a in accounts}
         long, short = [], []

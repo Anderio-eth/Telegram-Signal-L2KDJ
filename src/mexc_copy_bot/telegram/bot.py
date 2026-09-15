@@ -996,7 +996,8 @@ class CopyBot:
         or return (None, reason). The sides are the folder's groups."""
         d = self._draft(owner_id)
         group1, group2 = await self._groups(owner_id)
-        if not group1 or not group2:
+        # One group opens a single side; both open the hedge. Only nothing at all is a problem.
+        if not group1 and not group2:
             return None, "groups"
         if not (d.get("margin_usd") and d.get("target")):
             return None, "fields"

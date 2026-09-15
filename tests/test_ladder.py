@@ -80,9 +80,10 @@ def test_the_poorest_account_is_what_the_margin_is_checked_against():
     assert not plan.ok and any("only $100" in e and "needs $150" in e for e in plan.errors)
 
 
-def test_at_least_two_accounts_are_needed():
-    plan = make_plan(available=[500.0])
-    assert not plan.ok and any("two accounts" in e for e in plan.errors)
+def test_at_least_one_account_is_needed():
+    assert not make_plan(available=[]).ok
+    # a single account is allowed now — one group opens one side, no hedge
+    assert make_plan(available=[500.0]).ok
 
 
 def test_a_step_under_the_latency_warns_but_still_plans():
@@ -149,6 +150,15 @@ def test_multiple_accounts_in_a_group_all_fire():
     assert len(a.orders) == 2 and len(b.orders) == 2 and len(c.orders) == 2
     assert report.filled(1) == report.filled(2) == report.filled(3) == float(plan.total_amount)
     assert report.accounts == [1, 2, 3]
+
+
+def test_a_single_group_opens_just_one_side():
+    plan = make_plan(parts=3, available=[500.0])
+    long_c = FakeClient()
+    report = run_ladder(plan, [(1, long_c)], [])   # group 2 empty -> long only, no hedge
+    assert len(long_c.orders) == 3
+    assert {o["side"] for o in long_c.orders} == {SIDE_OPEN_LONG}
+    assert report.accounts == [1] and report.filled(1) == float(plan.total_amount)
 
 
 def test_both_sides_of_a_slice_carry_the_same_amount():

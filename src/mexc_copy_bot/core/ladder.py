@@ -127,8 +127,10 @@ def plan_ladder(
         errors.append("margin must be positive")
     if price <= 0:
         errors.append("no price for the symbol")
-    if len(available) < 2:
-        errors.append("need at least two accounts, one in each group")
+    if len(available) < 1:
+        # One account is enough — a single group opens one side (no hedge). Both groups filled
+        # opens the hedge. What matters is that at least one account will take part.
+        errors.append("need at least one account in a group")
     poorest = min(available) if available else 0.0
     if available and config.margin_usd > poorest + 1e-9:
         errors.append(f"an account has only ${poorest:,.2f} free, needs ${config.margin_usd:,.2f} margin")
