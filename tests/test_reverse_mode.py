@@ -91,6 +91,7 @@ class FakeClient:
     def __init__(self, *_a, **_kw):
         self.orders: list[dict] = []
         self.leverage_calls: list[dict] = []
+        self.leverage_by_side: dict[int, int] = {}
         self.closed: list[str] = []
         FakeClient.instances.append(self)
 
@@ -100,6 +101,12 @@ class FakeClient:
 
     async def set_leverage(self, **kw):
         self.leverage_calls.append(kw)
+        pt = kw.get("position_type")
+        if pt is not None:
+            self.leverage_by_side[int(pt)] = int(kw.get("leverage"))
+
+    async def get_leverage(self, symbol=None):
+        return [{"positionType": pt, "leverage": lev} for pt, lev in self.leverage_by_side.items()]
 
     async def close_all(self, symbol=None):
         self.closed.append(symbol)
@@ -153,6 +160,31 @@ def test_copy_mode_ignores_the_per_account_direction():
     engine = CopyEngine(store, session=None, retry_attempts=1)
     asyncio.run(engine.execute(event(Action.OPEN, LONG), 1, [follower()], reverse=False))
     assert FakeClient.instances[0].orders[0]["side"] == SIDE_OPEN_LONG
+
+
+class LeverageStuckClient(FakeClient):
+    """A client whose leverage never changes — mimics the venue silently keeping the account's old
+    leverage, which is what made the better-funded account fail to open."""
+    async def set_leverage(self, **kw):
+        self.leverage_calls.append(kw)   # accepted, but does not take
+
+
+def test_a_copy_refuses_to_open_when_the_leverage_did_not_take():
+    """Rather than opening at the account's old (lower) leverage — which needs far more margin and
+    is then refused as 'insufficient' — the copy fails with a clear leverage reason and sends no
+    order at the wrong leverage."""
+    import mexc_copy_bot.core.copy_engine as ce
+    orig = ce.make_rest_client
+    ce.make_rest_client = LeverageStuckClient
+    try:
+        store = FakeStore()
+        engine = CopyEngine(store, session=None, retry_attempts=1)
+        results = asyncio.run(engine.execute(event(Action.OPEN, LONG), 1, [follower()], reverse=False))
+    finally:
+        ce.make_rest_client = orig
+    assert not results[0].ok
+    assert "плече" in (results[0].error or "")
+    assert LeverageStuckClient.instances[-1].orders == []   # nothing opened at the wrong leverage
 
 
 def test_leverage_is_set_on_the_side_actually_being_opened():

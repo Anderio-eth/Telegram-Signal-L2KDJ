@@ -73,6 +73,7 @@ class FakeClient:
 
     def __init__(self, *_a, **_kw):
         self.orders: list[dict] = []
+        self.leverage_by_side: dict[int, int] = {}
         FakeClient.instances.append(self)
 
     async def submit_order(self, **kw):
@@ -80,7 +81,12 @@ class FakeClient:
         return {"ok": True}
 
     async def set_leverage(self, **kw):
-        pass
+        pt = kw.get("position_type")
+        if pt is not None:
+            self.leverage_by_side[int(pt)] = int(kw.get("leverage"))
+
+    async def get_leverage(self, symbol=None):
+        return [{"positionType": pt, "leverage": lev} for pt, lev in self.leverage_by_side.items()]
 
     async def close_all(self, symbol=None):
         pass

@@ -507,6 +507,53 @@ class CopyEngine:
         LOGGER.warning("follower %s refused: %s", follower.id, detail)
         return detail
 
+    async def _ensure_leverage(
+        self, client, *, symbol: str, position_type: int, leverage: int, open_type: int, label: str
+    ) -> None:
+        """Set the account's leverage for this symbol/side and confirm it actually took.
+
+        A silently-failed leverage change is the cause of "the account with more money didn't open":
+        the position falls back to the account's previous, lower leverage, so the same size demands
+        much more margin and the venue refuses it. So we set it, read it back, retry once (also by
+        position id, which is what the venue wants once a position exists), and only then give up —
+        with a reason — rather than opening at the wrong leverage.
+        """
+        target = int(leverage)
+
+        async def took() -> bool:
+            with contextlib.suppress(Exception):
+                for row in await client.get_leverage(symbol):
+                    if int(row.get("positionType") or 0) == position_type and int(row.get("leverage") or 0) == target:
+                        return True
+            return False
+
+        for _ in range(2):
+            with contextlib.suppress(MexcError):
+                await client.set_leverage(
+                    position_id=None, leverage=target, open_type=open_type,
+                    symbol=symbol, position_type=position_type,
+                )
+            if await took():
+                return
+            # An open position on the symbol makes the venue want the leverage change by position id.
+            with contextlib.suppress(Exception):
+                for p in await client.get_open_positions(symbol):
+                    if p.position_type == position_type and p.hold_vol > 0 and int(p.leverage) != target:
+                        with contextlib.suppress(MexcError):
+                            await client.set_leverage(
+                                position_id=p.position_id, leverage=target, open_type=open_type,
+                                symbol=symbol, position_type=position_type,
+                            )
+            if await took():
+                return
+
+        raise MexcError(
+            None,
+            f"не вдалось виставити плече {target}x на {label} для {symbol} "
+            f"(режим позиції або ліміт біржі) — не відкриваю під чужим плечем",
+            endpoint="change_leverage",
+        )
+
     async def _apply(
         self,
         client: MexcRestClient,
@@ -558,19 +605,14 @@ class CopyEngine:
         # (No realised PnL to report for these; the return below is the whole method's result.)
         order_side = SIDE_OPEN_LONG if side == 1 else SIDE_OPEN_SHORT
         if event.leverage:
-            # Leverage must be right BEFORE the order, or the position opens with the account's
-            # previous setting (spec §13). Failing to set it is not fatal on its own — MEXC
-            # rejects impossible leverage at order time anyway — so it is logged, not raised.
-            try:
-                await client.set_leverage(
-                    position_id=None,
-                    leverage=event.leverage,
-                    open_type=event.open_type,
-                    symbol=event.symbol,
-                    position_type=side,
-                )
-            except MexcError as err:
-                LOGGER.info("follower %s leverage set failed (continuing): %s", follower.id, err.message)
+            # Leverage must be right BEFORE the order. If it silently stays at the account's previous
+            # (usually lower) setting, the identical size needs far more margin and is refused — the
+            # account with MORE money failing while another with less opened fine. So set it and
+            # CONFIRM it took, rather than firing and hoping.
+            await self._ensure_leverage(
+                client, symbol=event.symbol, position_type=side,
+                leverage=int(event.leverage), open_type=event.open_type, label=follower.label,
+            )
 
         stop_loss, take_profit = stops
         await client.submit_order(

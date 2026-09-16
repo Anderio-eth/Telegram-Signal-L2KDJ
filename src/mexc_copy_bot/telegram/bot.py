@@ -889,16 +889,20 @@ class CopyBot:
 
     # ── scheduled hedged entry (the ladder) ───────────────────────────────────────────────────
     @staticmethod
-    def _new_draft() -> dict:
-        """A fresh entry form. Silver at 1000x in five slices is the case this was built for. The
-        sides are the folder's groups, not chosen here — group 1 goes long, group 2 short."""
-        return {"symbol": "XAG_USDT", "leverage": 1000, "margin_usd": None,
+    def _new_draft(exchange: str | None = None) -> dict:
+        """A fresh entry form. Silver at 1000x in five slices is the case this was built for, but the
+        default symbol must match the folder's exchange: XAG_USDT (silver) exists on HIBT, not on
+        MEXC, so a MEXC draft defaults to BTC_USDT — otherwise the prefilled ticker is a contract the
+        venue doesn't list and the live price comes back 0. The sides are the folder's groups, not
+        chosen here — group 1 goes long, group 2 short."""
+        symbol = "XAG_USDT" if exchange == EXCHANGE_HIBT else "BTC_USDT"
+        return {"symbol": symbol, "leverage": 1000, "margin_usd": None,
                 "parts": 5, "step_seconds": 1.0, "target": None, "sl": None, "tp": None}
 
     def _draft(self, owner_id: int) -> dict:
         """The entry being edited, kept off context.user_data so a Cancel that clears the
         conversation state does not wipe a half-filled form."""
-        return self._ladder_drafts.setdefault(owner_id, self._new_draft())
+        return self._ladder_drafts.setdefault(owner_id, self._new_draft(self._view(owner_id).exchange))
 
     async def _groups(self, owner_id: int) -> tuple[list, list]:
         """The folder's two groups (group 1, group 2), master included."""
@@ -1491,7 +1495,7 @@ class CopyBot:
         elif action == "ladder":
             await self._show_ladders(update, owner_id)
         elif action == "ldnew":
-            self._ladder_drafts[owner_id] = self._new_draft()
+            self._ladder_drafts[owner_id] = self._new_draft(self._view(owner_id).exchange)
             await self._show_ladder_form(update, owner_id)
         elif action == "ldform":
             await self._show_ladder_form(update, owner_id)

@@ -18,9 +18,17 @@ parse = CopyBot._parse_target
 bracket = CopyBot._parse_bracket
 
 
-def test_the_default_draft_is_the_silver_case():
-    d = CopyBot._new_draft()
-    assert d["symbol"] == "XAG_USDT" and d["leverage"] == 1000 and d["parts"] == 5
+def test_the_default_symbol_matches_the_exchange():
+    # Silver (XAG_USDT) exists on HIBT but not MEXC, so the prefilled ticker must follow the folder's
+    # exchange — otherwise a MEXC draft opens on a contract the venue doesn't list.
+    assert CopyBot._new_draft("hibt")["symbol"] == "XAG_USDT"
+    assert CopyBot._new_draft("mexc")["symbol"] == "BTC_USDT"
+    assert CopyBot._new_draft()["symbol"] == "BTC_USDT"   # default exchange is MEXC
+
+
+def test_the_default_draft_shape():
+    d = CopyBot._new_draft("hibt")
+    assert d["leverage"] == 1000 and d["parts"] == 5
     assert d["margin_usd"] is None and d["target"] is None  # the two that must be filled in
 
 
