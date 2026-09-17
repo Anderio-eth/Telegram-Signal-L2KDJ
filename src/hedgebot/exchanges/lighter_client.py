@@ -13,6 +13,8 @@ VERIFY on first live run (cannot be checked without keys):
 
 from __future__ import annotations
 
+import contextlib
+
 from lighter import SignerClient
 
 
@@ -25,12 +27,33 @@ class LighterClient:
 
     def __init__(self, api_url: str, account_index: int, api_key_private_key: str,
                  api_key_index: int = 0) -> None:
+        self._url = api_url
+        self._account_index = int(account_index)
         self._api_key_index = int(api_key_index)
         self._signer = SignerClient(
             url=api_url,
             account_index=int(account_index),
             api_private_keys={int(api_key_index): api_key_private_key},
         )
+
+    async def balance(self) -> dict:
+        """Best-effort account balance: total asset value and what's free. Field names vary by SDK
+        version, so several are tried; anything unknown comes back as None and the caller shows '—'.
+        VERIFY the exact fields against a live account."""
+        import lighter
+        api = lighter.ApiClient(configuration=lighter.Configuration(host=self._url))
+        try:
+            resp = await lighter.AccountApi(api).account(by="index", value=str(self._account_index))
+            acc = resp.accounts[0]
+            pick = lambda *names: next((float(getattr(acc, n)) for n in names
+                                        if getattr(acc, n, None) not in (None, "")), None)
+            return {
+                "total": pick("total_asset_value", "collateral", "portfolio_value"),
+                "available": pick("available_balance", "cross_asset_value", "collateral"),
+            }
+        finally:
+            with contextlib.suppress(Exception):
+                await api.close()
 
     async def limit_order(self, market_index: int, base_amount: int, price: int, is_ask: bool,
                           *, post_only: bool = False, reduce_only: bool = False,

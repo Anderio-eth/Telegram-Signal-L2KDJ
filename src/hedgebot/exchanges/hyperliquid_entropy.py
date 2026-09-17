@@ -41,6 +41,17 @@ class EntropyClient:
             self._exchange.order, market, is_buy, size, price, order_type, reduce_only,
         )
 
+    async def balance(self) -> dict:
+        """Account value and free (withdrawable) collateral in the io DEX. marginSummary is the
+        equity picture; withdrawable is what isn't tied up as margin."""
+        state = await asyncio.to_thread(self._info.user_state, self._address, self._dex)
+        ms = state.get("marginSummary", {}) or {}
+        return {
+            "total": float(ms.get("accountValue", 0) or 0),
+            "used": float(ms.get("totalMarginUsed", 0) or 0),
+            "free": float(state.get("withdrawable", 0) or 0),
+        }
+
     async def positions(self) -> list[dict]:
         """Open io positions for this account: [{coin, szi, entryPx, leverage, ...}]."""
         state = await asyncio.to_thread(self._info.user_state, self._address, self._dex)

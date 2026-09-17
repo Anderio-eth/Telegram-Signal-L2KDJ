@@ -11,6 +11,7 @@ Deliberately thin on polish — the plan is to run it and fix ergonomics against
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
 import aiohttp
@@ -77,10 +78,18 @@ class HedgeBot:
                 f"Хедж відкривається лімітками по спільних монетах (лонг на одній біржі, шорт на іншій).")
         rows = [
             [InlineKeyboardButton("🔑 Ключі", callback_data="keys")],
+            [InlineKeyboardButton("💰 Баланси", callback_data="balances")],
             [InlineKeyboardButton("📈 Відкрити хедж", callback_data="open")],
             [InlineKeyboardButton("📂 Позиції / Закрити", callback_data="positions")],
         ]
         return {"text": text, "reply_markup": InlineKeyboardMarkup(rows), "parse_mode": ParseMode.HTML}
+
+    async def _send_menu(self, update: Update, owner: int, prefix: str = "") -> None:
+        """Send the main menu as a fresh message (used after a text step, where there's no callback
+        query to edit). `prefix` prepends a short confirmation line."""
+        menu = await self._main_menu(owner)
+        text = (prefix + "\n\n" + menu["text"]) if prefix else menu["text"]
+        await update.effective_chat.send_message(text, reply_markup=menu["reply_markup"], parse_mode=ParseMode.HTML)
 
     async def _router(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if self._guard(update) is None:
@@ -94,6 +103,8 @@ class HedgeBot:
             await q.edit_message_text(**await self._main_menu(owner))
         elif data == "keys":
             await self._keys_menu(update, owner)
+        elif data == "balances":
+            await self._balances(update, owner)
         elif data == "open":
             await self._choose_pair(update)
         elif data in ("side:long", "side:short"):
@@ -116,6 +127,40 @@ class HedgeBot:
             "🔑 <b>Ключі</b>\n\nLighter: приватний ключ API-ключа, Account Index, API Key Index (0 за замовч.).\n"
             "Entropy: адреса гаманця + приватний ключ agent-гаманця (Hyperliquid).",
             reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+    async def _balances(self, update: Update, owner: int) -> None:
+        await update.callback_query.edit_message_text("⏳ Читаю баланси…")
+        lines = ["💰 <b>Баланси</b>", ""]
+        fmt = lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else "—"
+
+        ent = await self._entropy_client(owner)
+        if ent:
+            try:
+                b = await ent.balance()
+                lines.append(f"<b>Entropy (io)</b>: всього {fmt(b.get('total'))}, вільно {fmt(b.get('free'))}, "
+                             f"в позиціях {fmt(b.get('used'))}")
+            except Exception as err:  # noqa: BLE001
+                lines.append(f"<b>Entropy</b>: помилка — {str(err)[:80]}")
+        else:
+            lines.append("<b>Entropy</b>: ключ не заведено")
+
+        lit = await self._lighter_client(owner)
+        if lit:
+            try:
+                b = await lit.balance()
+                lines.append(f"<b>Lighter</b>: всього {fmt(b.get('total'))}, вільно {fmt(b.get('available'))}")
+            except Exception as err:  # noqa: BLE001
+                lines.append(f"<b>Lighter</b>: помилка — {str(err)[:80]}")
+            finally:
+                with contextlib.suppress(Exception):
+                    await lit.close()
+        else:
+            lines.append("<b>Lighter</b>: ключ не заведено")
+
+        lines.append("")
+        lines.append("<i>Обидві біржі — ф'ючерси; «всього» = еквіті рахунку, «вільно» = під нову позицію.</i>")
+        await update.callback_query.edit_message_text(
+            NL.join(lines), reply_markup=self._back(), parse_mode=ParseMode.HTML)
 
     # ── free-text input (keys + notional) ──────────────────────────────────────────────────────────
     async def _begin_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -147,6 +192,9 @@ class HedgeBot:
         if self._guard(update) is None:
             return ConversationHandler.END
         text = (update.message.text or "").strip()
+        # Wipe the user's message immediately — these carry private keys and must not linger in chat.
+        with contextlib.suppress(Exception):
+            await update.message.delete()
         flow = ctx.user_data.get("flow")
         owner = update.effective_user.id
 
@@ -155,18 +203,19 @@ class HedgeBot:
             if step == 0:
                 ctx.user_data["priv"] = text
                 ctx.user_data["step"] = 1
-                await update.message.reply_text("Тепер <b>Account Index</b> (число):", parse_mode=ParseMode.HTML)
+                await update.effective_chat.send_message("Тепер <b>Account Index</b> (число):", parse_mode=ParseMode.HTML)
                 return ASK
             if step == 1:
                 ctx.user_data["account_index"] = int(text)
                 ctx.user_data["step"] = 2
-                await update.message.reply_text("І <b>API Key Index</b> (Enter/0 якщо не знаєш):", parse_mode=ParseMode.HTML)
+                await update.effective_chat.send_message("І <b>API Key Index</b> (Enter/0 якщо не знаєш):", parse_mode=ParseMode.HTML)
                 return ASK
             api_key_index = int(text) if text.isdigit() else 0
             await self._store.set_credentials(
                 owner, "lighter", ctx.user_data["priv"],
                 {"account_index": ctx.user_data["account_index"], "api_key_index": api_key_index})
-            await update.message.reply_text("✅ Lighter збережено.", **(await self._main_menu(owner)))
+            ctx.user_data.clear()
+            await self._send_menu(update, owner, "✅ Lighter збережено.")
             return ConversationHandler.END
 
         if flow == "key_entropy":
@@ -174,19 +223,20 @@ class HedgeBot:
             if step == 0:
                 ctx.user_data["wallet"] = text
                 ctx.user_data["step"] = 1
-                await update.message.reply_text(
+                await update.effective_chat.send_message(
                     "Тепер <b>приватний ключ agent-гаманця</b> (0x…):", parse_mode=ParseMode.HTML)
                 return ASK
             await self._store.set_credentials(
                 owner, "entropy", text, {"wallet_address": ctx.user_data["wallet"]})
-            await update.message.reply_text("✅ Entropy збережено.", **(await self._main_menu(owner)))
+            ctx.user_data.clear()
+            await self._send_menu(update, owner, "✅ Entropy збережено.")
             return ConversationHandler.END
 
         if flow == "open":
             try:
                 notional = float(text.replace(",", "."))
             except ValueError:
-                await update.message.reply_text("Не зрозумів число, спробуй ще:")
+                await update.effective_chat.send_message("Не зрозумів число, спробуй ще:")
                 return ASK
             ctx.user_data["notional"] = notional
             pair = get_pair(ctx.user_data["pair"])
@@ -195,7 +245,7 @@ class HedgeBot:
                 [InlineKeyboardButton(f"Entropy ШОРТ / Lighter ЛОНГ", callback_data="side:short")],
                 [InlineKeyboardButton("⬅️ Скасувати", callback_data="menu")],
             ]
-            await update.message.reply_text(
+            await update.effective_chat.send_message(
                 f"<b>{pair.label}</b> · ${notional:g}/ногу\nОбери напрям:",
                 reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
