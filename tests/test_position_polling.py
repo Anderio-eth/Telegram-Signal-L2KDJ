@@ -93,6 +93,25 @@ def test_a_close_is_noticed_by_the_row_disappearing():
     assert [e.action.value for e, _ in seen] == ["OPEN", "CLOSE"]
 
 
+class ReverseStore:
+    """A REVERSE/groups folder — reconcile has nothing to mirror here and must not read accounts."""
+
+    async def get_mode(self, folder_id):
+        return ("REVERSE", None)
+
+    async def list_accounts(self, *a, **k):
+        raise AssertionError("reconcile must not read accounts in REVERSE mode")
+
+
+def test_reconcile_is_skipped_in_reverse_mode():
+    # In REVERSE mode expected is always empty, so reconcile would flag every real position as drift
+    # (and, on HIBT, hit the all-positions read it cannot do). It must short-circuit before touching
+    # any account.
+    svc = CopyService(store=ReverseStore(), folder_id=1, owner_id=1)
+    svc._session = object()  # truthy, so the no-session guard doesn't hide the mode check
+    assert asyncio.run(svc.reconcile()) == []
+
+
 def test_the_close_carries_the_masters_realised_pnl():
     client = Client([open_row()])
     svc, seen = service(client)

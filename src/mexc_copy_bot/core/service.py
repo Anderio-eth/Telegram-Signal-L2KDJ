@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
@@ -91,6 +92,16 @@ GROUP_POLL_SECONDS = 0.35
 # venue to get round to reporting it, short enough that a real trade by hand on the same account
 # and the same side is not swallowed hours later.
 EXPECTED_COPY_SECONDS = 30.0
+
+# HIBT has no "all open positions" call — /v2/account/position refuses without a symbol (210001
+# "param error"), same as its order endpoints (verified live 2026-09-14). So a HIBT folder's group
+# poller can only read positions per symbol. It watches this configured set (bot spelling, e.g.
+# XAG_USDT) UNION whatever it already holds. Set HIBT_WATCH_SYMBOLS to the coins you hedge; empty
+# means a HIBT folder watches only symbols it already has open (no first-open detection, but no
+# error spam either). MEXC is unaffected — it lists all positions in one call.
+HIBT_WATCH_SYMBOLS: list[str] = [
+    s.strip().upper() for s in os.getenv("HIBT_WATCH_SYMBOLS", "").replace(";", ",").split(",") if s.strip()
+]
 
 # How long a successful REST poll keeps counting as "the master is being watched". A few missed
 # polls are a blip; beyond this the reader should be told something is wrong.
@@ -951,6 +962,18 @@ class CopyService:
         )
         return [a for a in accounts if a.active]
 
+    def _hibt_watch_symbols(self, account_id: int) -> list[str]:
+        """Symbols to poll for a HIBT account: the configured watchlist UNION whatever this account
+        already holds (so once a position exists it keeps being tracked, closed and reconciled even
+        if it was never in the watchlist). HIBT can't list all positions, so this is how we know
+        what to ask for."""
+        symbols = set(HIBT_WATCH_SYMBOLS)
+        tracker = self._group_trackers.get(account_id)
+        if tracker:
+            symbols.update(key[0] for key in tracker.snapshot())
+        symbols.update(sym for (sym, _side) in self._expected_copies.get(account_id, {}))
+        return sorted(symbols)
+
     async def _read_snapshots(self, account: Account) -> list[PositionSnapshot] | None:
         """What this account is holding, or None if it could not be asked."""
         credentials = await self._store.get_credentials(account.id, self._owner_id)
@@ -958,7 +981,22 @@ class CopyService:
             return None
         client = make_rest_client(credentials, session=self._session)
         try:
-            rows = await client.get_open_positions_raw()
+            if await self.exchange() == EXCHANGE_HIBT:
+                # HIBT: no all-positions call, so read per watched symbol and merge. No symbols to
+                # watch yet -> nothing to report (and, crucially, no failing all-call to spam logs).
+                symbols = self._hibt_watch_symbols(account.id)
+                if not symbols:
+                    return []
+                gathered = await asyncio.gather(
+                    *(client.get_open_positions_raw(s) for s in symbols), return_exceptions=True)
+                rows = []
+                for result in gathered:
+                    if isinstance(result, list):
+                        rows.extend(result)
+                    elif isinstance(result, (MexcError, aiohttp.ClientError, asyncio.TimeoutError)):
+                        LOGGER.debug("could not read %s positions: %s", account.label, result)
+            else:
+                rows = await client.get_open_positions_raw()
         except (MexcError, aiohttp.ClientError, asyncio.TimeoutError) as err:
             LOGGER.info("could not read %s: %s", account.label, err)
             return None
@@ -1793,8 +1831,15 @@ class CopyService:
 
         Reports rather than auto-corrects: silently "fixing" a difference could just as easily
         double a position as repair one, and the user should decide.
+
+        Only in COPY mode. In REVERSE/groups mode there is no master to mirror, so "expected" is
+        always empty and every real position (a scheduled entry's, or a manual hedge leg) reads as
+        drift — pure noise. It also spares HIBT the all-positions read it cannot do.
         """
         if not self._session:
+            return []
+        mode, _ = await self._store.get_mode(self._folder_id)
+        if mode == MODE_REVERSE:
             return []
         drifts: list[Drift] = []
         for follower in await self._store.list_accounts(self._folder_id, FOLLOWER):
