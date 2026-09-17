@@ -68,6 +68,26 @@ run_forever "copy-bot" python -m mexc_copy_bot &
 PIDS+=("$!")
 set +m
 
+# Delta-points bot: a THIRD independent process (delta-neutral hedges on Lighter + Entropy). Off by
+# default so it never disturbs the copy bot; set DELTA_BOT_ENABLED=true once its keys are in. Its own
+# process for the same reason as the others — a stall or crash here must not touch order execution.
+if [ "${DELTA_BOT_ENABLED:-false}" = "true" ]; then
+  # Its heavy SDKs are installed here, once, at container start — kept out of the shared build so a
+  # failure can't block the copy bot's redeploy. If this install fails, the delta bot simply doesn't
+  # start; the copy bot is unaffected.
+  log "installing delta-bot deps"
+  if pip install -q -r requirements-delta.txt; then
+    set -m
+    run_forever "delta-bot" python -m hedgebot &
+    PIDS+=("$!")
+    set +m
+  else
+    log "delta-bot deps failed to install — not starting it (copy bot unaffected)"
+  fi
+else
+  log "delta-bot disabled (set DELTA_BOT_ENABLED=true to run it)"
+fi
+
 # Forward Render's shutdown signal, so a redeploy stops things cleanly instead of killing the copy
 # bot mid-order — and, just as importantly, leaves nothing behind that would keep trading.
 trap shutdown SIGTERM SIGINT

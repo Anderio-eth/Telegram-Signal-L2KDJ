@@ -37,3 +37,21 @@ services:
         sync: false
       - key: COPY_BOT_ENCRYPTION_KEY
         sync: false
+      # ── delta-points bot (third process in this worker) ─────────────────────────────────
+      # Off until DELTA_BOT_ENABLED=true. Delta-neutral hedges on Lighter + Entropy(io).
+      - key: DELTA_BOT_ENABLED
+        value: "false"
+      - key: DELTA_BOT_TOKEN
+        sync: false
+      - key: DELTA_BOT_ALLOWED_USER_IDS
+        sync: false
+      - key: DELTA_BOT_DATABASE_URL
+        sync: false          # can be the same Postgres as COPY_BOT_DATABASE_URL (hb_-prefixed tables)
+      - key: DELTA_BOT_ENCRYPTION_KEY
+        sync: false
+      - key: HYPERLIQUID_API_URL
+        value: https://api.hyperliquid.xyz
+      - key: LIGHTER_API_URL
+        value: https://mainnet.zklighter.elliot.ai
+      - key: ENTROPY_DEX
+        value: io

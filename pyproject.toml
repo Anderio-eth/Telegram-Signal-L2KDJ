@@ -13,6 +13,10 @@ dependencies = [
   # shared with the signal bot.
   "asyncpg>=0.29,<0.31",
   "cryptography>=42.0",
+  # NOTE: the delta-points bot (hedgebot) has its own heavy deps (Hyperliquid + Lighter SDKs). They
+  # are deliberately NOT here — installing them at build time (a git dep that can fail) would risk
+  # blocking the copy bot's redeploys. They live in requirements-delta.txt and are installed at
+  # runtime only when DELTA_BOT_ENABLED=true (see scripts/run_both.sh).
 ]
 
 [project.scripts]
