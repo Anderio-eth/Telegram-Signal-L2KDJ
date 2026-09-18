@@ -50,6 +50,18 @@ class HedgeBot:
             per_message=False,
         ))
         app.add_handler(CallbackQueryHandler(self._router))
+        # Catch-all for text typed OUTSIDE an active step flow (e.g. after a restart wiped the
+        # in-memory conversation state): delete it so nothing lingers, and re-show the menu. When a
+        # flow IS active the ConversationHandler above consumes the text first, so this won't fire.
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._stray_text))
+
+    async def _stray_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if self._guard(update) is None:
+            return
+        with contextlib.suppress(Exception):
+            await update.message.delete()
+        await self._refresh_menu(update, ctx, update.effective_user.id,
+                                 "⌨️ Керуй кнопками. Щоб відкрити хедж — тисни «📈 Відкрити хедж».")
 
     def _guard(self, update: Update) -> int | None:
         uid = update.effective_user.id if update.effective_user else None
