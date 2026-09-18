@@ -21,6 +21,10 @@ logging.basicConfig(
 )
 
 
+async def _on_error(update: object, context) -> None:
+    logging.getLogger(__name__).error("handler error", exc_info=context.error)
+
+
 async def _post_init(app: Application) -> None:
     await app.bot_data["store"].connect()
     logging.getLogger(__name__).info("store connected; bot ready")
@@ -41,6 +45,7 @@ def main() -> None:
         .build()
     )
     app.bot_data["store"] = store
+    app.add_error_handler(_on_error)
     HedgeBot(cfg, store).register(app)
     app.run_polling(drop_pending_updates=True)
 

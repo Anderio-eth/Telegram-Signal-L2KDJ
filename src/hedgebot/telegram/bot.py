@@ -145,29 +145,35 @@ class HedgeBot:
         lines = ["💰 <b>Баланси</b>", ""]
         fmt = lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else "—"
 
-        ent = await self._entropy_client(owner)
-        if ent:
-            try:
+        # Whole block guarded per venue — a failure BUILDING the client (e.g. an SDK kwarg or a bad
+        # key) must surface as text, not leave the message stuck on "reading…".
+        try:
+            ent = await self._entropy_client(owner)
+            if not ent:
+                lines.append("🟩 <b>Entropy</b>: ключ не заведено")
+            else:
                 b = await ent.balance()
-                lines.append(f"<b>Entropy (io)</b>: всього {fmt(b.get('total'))}, вільно {fmt(b.get('free'))}, "
+                lines.append(f"🟩 <b>Entropy (io)</b>: всього {fmt(b.get('total'))}, вільно {fmt(b.get('free'))}, "
                              f"в позиціях {fmt(b.get('used'))}")
-            except Exception as err:  # noqa: BLE001
-                lines.append(f"<b>Entropy</b>: помилка — {str(err)[:80]}")
-        else:
-            lines.append("<b>Entropy</b>: ключ не заведено")
+        except Exception as err:  # noqa: BLE001
+            LOGGER.exception("entropy balance failed")
+            lines.append(f"🟩 <b>Entropy</b>: помилка — {str(err)[:150]}")
 
-        lit = await self._lighter_client(owner)
-        if lit:
-            try:
+        lit = None
+        try:
+            lit = await self._lighter_client(owner)
+            if not lit:
+                lines.append("🟦 <b>Lighter</b>: ключ не заведено")
+            else:
                 b = await lit.balance()
-                lines.append(f"<b>Lighter</b>: всього {fmt(b.get('total'))}, вільно {fmt(b.get('available'))}")
-            except Exception as err:  # noqa: BLE001
-                lines.append(f"<b>Lighter</b>: помилка — {str(err)[:80]}")
-            finally:
+                lines.append(f"🟦 <b>Lighter</b>: всього {fmt(b.get('total'))}, вільно {fmt(b.get('available'))}")
+        except Exception as err:  # noqa: BLE001
+            LOGGER.exception("lighter balance failed")
+            lines.append(f"🟦 <b>Lighter</b>: помилка — {str(err)[:150]}")
+        finally:
+            if lit:
                 with contextlib.suppress(Exception):
                     await lit.close()
-        else:
-            lines.append("<b>Lighter</b>: ключ не заведено")
 
         lines.append("")
         lines.append("<i>Обидві біржі — ф'ючерси; «всього» = еквіті рахунку, «вільно» = під нову позицію.</i>")
