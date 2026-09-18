@@ -103,6 +103,10 @@ class HedgeBot:
             await q.edit_message_text(**await self._main_menu(owner))
         elif data == "keys":
             await self._keys_menu(update, owner)
+        elif data.startswith("unkey:"):
+            venue = data.split(":", 1)[1]
+            await self._store.delete_credentials(owner, venue)
+            await self._keys_menu(update, owner)   # already answered above; refreshed menu shows ❌
         elif data == "balances":
             await self._balances(update, owner)
         elif data == "open":
@@ -118,15 +122,26 @@ class HedgeBot:
 
     async def _keys_menu(self, update: Update, owner: int) -> None:
         venues = await self._store.venues_set(owner)
-        rows = [
-            [InlineKeyboardButton(f"Lighter {'✅' if 'lighter' in venues else '➕'}", callback_data="key:lighter")],
-            [InlineKeyboardButton(f"Entropy {'✅' if 'entropy' in venues else '➕'}", callback_data="key:entropy")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
-        ]
+        has_l, has_e = "lighter" in venues, "entropy" in venues
+        text = (
+            "🔑 <b>Ключі</b>\n\n"
+            f"🟦 Lighter: {'✅ заведено' if has_l else '❌ нема'}\n"
+            f"🟩 Entropy: {'✅ заведено' if has_e else '❌ нема'}\n\n"
+            "<b>Що куди:</b>\n"
+            "🟦 <b>Lighter</b> — 3 значення зі скрипта <code>create_lighter_key.py</code>: приватний "
+            "ключ API-ключа, Account Index, API Key Index.\n"
+            "🟩 <b>Entropy</b> — адреса твого ОСНОВНОГО гаманця + приватний ключ AGENT-ключа "
+            "(app.hyperliquid.xyz/API). Кошти депозиш на entropy.io основним гаманцем."
+        )
+        rows = [[InlineKeyboardButton(f"🟦 Lighter — {'перезавести' if has_l else 'завести'}", callback_data="key:lighter")]]
+        if has_l:
+            rows.append([InlineKeyboardButton("🗑 Відв'язати Lighter", callback_data="unkey:lighter")])
+        rows.append([InlineKeyboardButton(f"🟩 Entropy — {'перезавести' if has_e else 'завести'}", callback_data="key:entropy")])
+        if has_e:
+            rows.append([InlineKeyboardButton("🗑 Відв'язати Entropy", callback_data="unkey:entropy")])
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu")])
         await update.callback_query.edit_message_text(
-            "🔑 <b>Ключі</b>\n\nLighter: приватний ключ API-ключа, Account Index, API Key Index (0 за замовч.).\n"
-            "Entropy: адреса гаманця + приватний ключ agent-гаманця (Hyperliquid).",
-            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+            text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
     async def _balances(self, update: Update, owner: int) -> None:
         await update.callback_query.edit_message_text("⏳ Читаю баланси…")
@@ -173,13 +188,20 @@ class HedgeBot:
             ctx.user_data["flow"] = "key_lighter"
             ctx.user_data["step"] = 0
             await update.callback_query.edit_message_text(
-                "Lighter — надішли <b>приватний ключ API-ключа</b> (0x…):", parse_mode=ParseMode.HTML)
+                "🟦 <b>Lighter — крок 1/3</b>\n\n"
+                "Надішли <b>приватний ключ API-ключа</b> (0x…) — це ПЕРШЕ значення, яке вивів скрипт "
+                "<code>create_lighter_key.py</code> (рядок «API key's private key»).\n\n"
+                "⚠️ Це НЕ ключ твого гаманця — це згенерований API-ключ.",
+                parse_mode=ParseMode.HTML)
         elif data == "key:entropy":
             ctx.user_data.clear()
             ctx.user_data["flow"] = "key_entropy"
             ctx.user_data["step"] = 0
             await update.callback_query.edit_message_text(
-                "Entropy — надішли <b>адресу гаманця</b> (0x…):", parse_mode=ParseMode.HTML)
+                "🟩 <b>Entropy — крок 1/2</b>\n\n"
+                "Надішли <b>адресу свого ОСНОВНОГО гаманця</b> (0x…) — того, яким депозитив USDC на "
+                "entropy.io. Просто адреса, не ключ.",
+                parse_mode=ParseMode.HTML)
         elif data.startswith("pair:"):
             ctx.user_data.clear()
             ctx.user_data["flow"] = "open"
@@ -203,12 +225,16 @@ class HedgeBot:
             if step == 0:
                 ctx.user_data["priv"] = text
                 ctx.user_data["step"] = 1
-                await update.effective_chat.send_message("Тепер <b>Account Index</b> (число):", parse_mode=ParseMode.HTML)
+                await update.effective_chat.send_message(
+                    "🟦 <b>Lighter — крок 2/3</b>\n\nНадішли <b>Account Index</b> — число з рядка "
+                    "«Account Index» того ж скрипта.", parse_mode=ParseMode.HTML)
                 return ASK
             if step == 1:
                 ctx.user_data["account_index"] = int(text)
                 ctx.user_data["step"] = 2
-                await update.effective_chat.send_message("І <b>API Key Index</b> (Enter/0 якщо не знаєш):", parse_mode=ParseMode.HTML)
+                await update.effective_chat.send_message(
+                    "🟦 <b>Lighter — крок 3/3</b>\n\nНадішли <b>API Key Index</b> — число з рядка "
+                    "«API Key Index» (зазвичай <b>4</b>).", parse_mode=ParseMode.HTML)
                 return ASK
             api_key_index = int(text) if text.isdigit() else 0
             await self._store.set_credentials(
@@ -224,7 +250,10 @@ class HedgeBot:
                 ctx.user_data["wallet"] = text
                 ctx.user_data["step"] = 1
                 await update.effective_chat.send_message(
-                    "Тепер <b>приватний ключ agent-гаманця</b> (0x…):", parse_mode=ParseMode.HTML)
+                    "🟩 <b>Entropy — крок 2/2</b>\n\nНадішли <b>приватний ключ AGENT-ключа</b> (0x…) — "
+                    "з app.hyperliquid.xyz/API (Generate → Authorize).\n\n"
+                    "⚠️ Це ключ agent-а (торгового API), а НЕ приватний ключ твого основного гаманця.",
+                    parse_mode=ParseMode.HTML)
                 return ASK
             await self._store.set_credentials(
                 owner, "entropy", text, {"wallet_address": ctx.user_data["wallet"]})
