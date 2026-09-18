@@ -312,9 +312,20 @@ class HedgeBot:
 
     async def _preview(self, update: Update, ctx, owner: int, *, entropy_long: bool) -> None:
         ctx.user_data["entropy_long"] = entropy_long
-        pair = get_pair(ctx.user_data["pair"])
-        notional = ctx.user_data["notional"]
-        plan, reason = await self._build_plan(owner, pair, notional, entropy_long)
+        pair = get_pair(ctx.user_data.get("pair", ""))
+        notional = ctx.user_data.get("notional")
+        if not pair or notional is None:
+            await update.callback_query.edit_message_text(
+                "Сесія скинулась. Почни заново.", reply_markup=self._back())
+            return
+        await update.callback_query.edit_message_text("⏳ Рахую план…")
+        try:
+            plan, reason = await self._build_plan(owner, pair, notional, entropy_long)
+        except Exception as err:  # noqa: BLE001 — surface it instead of a silent dead button
+            LOGGER.exception("build_plan failed")
+            await update.callback_query.edit_message_text(
+                f"✗ Помилка розрахунку: {str(err)[:200]}", reply_markup=self._back())
+            return
         if plan is None:
             await update.callback_query.edit_message_text(f"✗ {reason}", reply_markup=self._back())
             return
@@ -330,7 +341,7 @@ class HedgeBot:
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
     async def _build_plan(self, owner: int, pair, notional: float, entropy_long: bool):
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
             emk = (await md.entropy_markets(s, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
             lmk = (await md.lighter_markets(s, self._cfg.lighter_api_url)).get(pair.lighter)
             if not emk or not lmk:
@@ -352,7 +363,12 @@ class HedgeBot:
         notional = ctx.user_data["notional"]
         entropy_long = ctx.user_data["entropy_long"]
         await update.callback_query.edit_message_text("⏳ Відкриваю обидві ноги…")
-        plan, reason = await self._build_plan(owner, pair, notional, entropy_long)
+        try:
+            plan, reason = await self._build_plan(owner, pair, notional, entropy_long)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.exception("build_plan (execute) failed")
+            await update.callback_query.edit_message_text(f"✗ Помилка: {str(err)[:200]}", reply_markup=self._back())
+            return
         if plan is None or not plan.ok:
             await update.callback_query.edit_message_text(f"✗ {reason or (plan.errors[0] if plan else '')}", reply_markup=self._back())
             return
