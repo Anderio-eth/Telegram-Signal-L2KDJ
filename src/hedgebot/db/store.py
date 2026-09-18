@@ -62,7 +62,11 @@ class Store:
             )
         if not row:
             return None
-        return Credentials(venue, self._cipher.decrypt(row["enc_secret"]), dict(row["meta"]))
+        # asyncpg returns JSONB as a str by default (no codec registered), so parse it.
+        meta = row["meta"]
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        return Credentials(venue, self._cipher.decrypt(row["enc_secret"]), dict(meta or {}))
 
     async def venues_set(self, owner_id: int) -> set[str]:
         async with self._pool.acquire() as conn:
