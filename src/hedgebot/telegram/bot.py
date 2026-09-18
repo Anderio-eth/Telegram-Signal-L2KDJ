@@ -62,12 +62,40 @@ class HedgeBot:
         if self._guard(update) is None:
             await update.message.reply_text("⛔ Доступ обмежено.")
             return
-        await update.message.reply_text(**await self._main_menu(update.effective_user.id))
+        m = await update.message.reply_text(**await self._main_menu(update.effective_user.id))
+        ctx.chat_data["menu_msg_id"] = m.message_id      # the single message we keep and edit
+        with contextlib.suppress(Exception):
+            await update.message.delete()                # drop the /start command too
 
     async def _menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(**await self._main_menu(update.effective_user.id))
+        ctx.chat_data["menu_msg_id"] = update.callback_query.message.message_id
         return ConversationHandler.END
+
+    @staticmethod
+    def _cancel_kb() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Скасувати", callback_data="menu")]])
+
+    async def _edit_anchor(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str, markup) -> None:
+        """Edit the one persistent menu message in place. Falls back to sending a new one (and
+        remembering it) only if the old message is gone. This is what keeps the chat to a single
+        message — every step of a flow edits this same message instead of sending new ones."""
+        mid = ctx.chat_data.get("menu_msg_id")
+        if mid:
+            try:
+                await ctx.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=mid,
+                                                text=text, reply_markup=markup, parse_mode=ParseMode.HTML)
+                return
+            except Exception:  # noqa: BLE001 — message gone/identical; fall through to a fresh one
+                pass
+        m = await update.effective_chat.send_message(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        ctx.chat_data["menu_msg_id"] = m.message_id
+
+    async def _refresh_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int, prefix: str = "") -> None:
+        menu = await self._main_menu(owner)
+        text = (prefix + "\n\n" + menu["text"]) if prefix else menu["text"]
+        await self._edit_anchor(update, ctx, text, menu["reply_markup"])
 
     async def _main_menu(self, owner: int) -> dict:
         venues = await self._store.venues_set(owner)
@@ -84,24 +112,6 @@ class HedgeBot:
         ]
         return {"text": text, "reply_markup": InlineKeyboardMarkup(rows), "parse_mode": ParseMode.HTML}
 
-    async def _send_menu(self, update: Update, owner: int, prefix: str = "") -> None:
-        """Send the main menu as a fresh message (used after a text step, where there's no callback
-        query to edit). `prefix` prepends a short confirmation line."""
-        menu = await self._main_menu(owner)
-        text = (prefix + "\n\n" + menu["text"]) if prefix else menu["text"]
-        await update.effective_chat.send_message(text, reply_markup=menu["reply_markup"], parse_mode=ParseMode.HTML)
-
-    async def _ask(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-        """Send a prompt and remember its id, so the whole exchange (bot prompts + user replies) can be
-        wiped once the step flow finishes — keeps the chat clean and keys off-screen."""
-        m = await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
-        ctx.user_data.setdefault("prompt_msgs", []).append(m.message_id)
-
-    async def _cleanup_prompts(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        for mid in ctx.user_data.pop("prompt_msgs", []):
-            with contextlib.suppress(Exception):
-                await update.effective_chat.delete_message(mid)
-
     async def _router(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if self._guard(update) is None:
             await update.callback_query.answer("⛔", show_alert=True)
@@ -110,6 +120,7 @@ class HedgeBot:
         data = q.data
         await q.answer()
         owner = update.effective_user.id
+        ctx.chat_data["menu_msg_id"] = q.message.message_id   # this message is the anchor we keep
         if data == "menu":
             await q.edit_message_text(**await self._main_menu(owner))
         elif data == "keys":
@@ -197,42 +208,39 @@ class HedgeBot:
             return ConversationHandler.END
         await update.callback_query.answer()
         data = update.callback_query.data
+        # This button lives on the persistent menu message — make it the anchor we keep editing.
+        ctx.chat_data["menu_msg_id"] = update.callback_query.message.message_id
         if data == "key:lighter":
             ctx.user_data.clear()
-            ctx.user_data["flow"] = "key_lighter"
-            ctx.user_data["step"] = 0
+            ctx.user_data.update(flow="key_lighter", step=0)
             await update.callback_query.edit_message_text(
                 "🟦 <b>Lighter (Robinhood Chain) — крок 1/3</b>\n\n"
-                "На <b>robinhoodchain.lighter.xyz</b> відкрий розділ <b>API</b> і створи/візьми "
-                "API-ключ. Надішли <b>приватний ключ API-ключа</b> (0x…).\n\n"
-                "⚠️ Це НЕ ключ твого гаманця — це згенерований API-ключ. І це саме RH-деплой, "
-                "не звичайний Lighter.",
-                parse_mode=ParseMode.HTML)
+                "На <b>robinhoodchain.lighter.xyz</b> відкрий розділ <b>API</b>, створи/візьми "
+                "API-ключ і надішли <b>приватний ключ API-ключа</b> (0x…).\n\n"
+                "⚠️ Це НЕ ключ гаманця — це згенерований API-ключ. І саме RH-деплой.",
+                reply_markup=self._cancel_kb(), parse_mode=ParseMode.HTML)
         elif data == "key:entropy":
             ctx.user_data.clear()
-            ctx.user_data["flow"] = "key_entropy"
-            ctx.user_data["step"] = 0
+            ctx.user_data.update(flow="key_entropy", step=0)
             await update.callback_query.edit_message_text(
                 "🟩 <b>Entropy — крок 1/2</b>\n\n"
                 "Надішли <b>адресу свого ОСНОВНОГО гаманця</b> (0x…) — того, яким депозитив USDC на "
                 "entropy.io. Просто адреса, не ключ.",
-                parse_mode=ParseMode.HTML)
-        # Remember this first prompt (the edited menu) so it's wiped with the rest when done.
-        if data in ("key:lighter", "key:entropy"):
-            ctx.user_data["prompt_msgs"] = [update.callback_query.message.message_id]
+                reply_markup=self._cancel_kb(), parse_mode=ParseMode.HTML)
         elif data.startswith("pair:"):
             ctx.user_data.clear()
-            ctx.user_data["flow"] = "open"
-            ctx.user_data["pair"] = data.split(":", 1)[1]
+            ctx.user_data.update(flow="open", pair=data.split(":", 1)[1])
             await update.callback_query.edit_message_text(
-                "Надішли <b>розмір хеджа в USD на ногу</b> (напр. 200):", parse_mode=ParseMode.HTML)
+                "Надішли <b>розмір хеджа в USD на ногу</b> (напр. 200):",
+                reply_markup=self._cancel_kb(), parse_mode=ParseMode.HTML)
         return ASK
 
     async def _got_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if self._guard(update) is None:
             return ConversationHandler.END
         text = (update.message.text or "").strip()
-        # Wipe the user's message immediately — these carry private keys and must not linger in chat.
+        # Delete the user's reply at once — these carry keys — and drive the whole flow by editing the
+        # single anchor message, so nothing new is ever left in the chat.
         with contextlib.suppress(Exception):
             await update.message.delete()
         flow = ctx.user_data.get("flow")
@@ -241,61 +249,56 @@ class HedgeBot:
         if flow == "key_lighter":
             step = ctx.user_data["step"]
             if step == 0:
-                ctx.user_data["priv"] = text
-                ctx.user_data["step"] = 1
-                await self._ask(update, ctx,
+                ctx.user_data.update(priv=text, step=1)
+                await self._edit_anchor(update, ctx,
                     "🟦 <b>Lighter — крок 2/3</b>\n\nНадішли <b>Account Index</b> — число зі сторінки "
-                    "API на robinhoodchain.lighter.xyz (ідентифікатор твого акаунта).")
+                    "API на robinhoodchain.lighter.xyz.", self._cancel_kb())
                 return ASK
             if step == 1:
-                ctx.user_data["account_index"] = int(text)
-                ctx.user_data["step"] = 2
-                await self._ask(update, ctx,
+                ctx.user_data.update(account_index=int(text), step=2)
+                await self._edit_anchor(update, ctx,
                     "🟦 <b>Lighter — крок 3/3</b>\n\nНадішли <b>API Key Index</b> — номер слота ключа "
-                    "зі сторінки API на robinhoodchain.lighter.xyz (число).")
+                    "зі сторінки API (число).", self._cancel_kb())
                 return ASK
             api_key_index = int(text) if text.isdigit() else 0
             await self._store.set_credentials(
                 owner, "lighter", ctx.user_data["priv"],
                 {"account_index": ctx.user_data["account_index"], "api_key_index": api_key_index})
-            await self._cleanup_prompts(update, ctx)
             ctx.user_data.clear()
-            await self._send_menu(update, owner, "✅ Lighter збережено.")
+            await self._refresh_menu(update, ctx, owner, "✅ Lighter збережено.")
             return ConversationHandler.END
 
         if flow == "key_entropy":
             step = ctx.user_data["step"]
             if step == 0:
-                ctx.user_data["wallet"] = text
-                ctx.user_data["step"] = 1
-                await self._ask(update, ctx,
+                ctx.user_data.update(wallet=text, step=1)
+                await self._edit_anchor(update, ctx,
                     "🟩 <b>Entropy — крок 2/2</b>\n\nНадішли <b>приватний ключ AGENT-ключа</b> (0x…) — "
                     "з app.hyperliquid.xyz/API (Generate → Authorize).\n\n"
-                    "⚠️ Це ключ agent-а (торгового API), а НЕ приватний ключ твого основного гаманця.")
+                    "⚠️ Це ключ agent-а, а НЕ приватний ключ основного гаманця.", self._cancel_kb())
                 return ASK
             await self._store.set_credentials(
                 owner, "entropy", text, {"wallet_address": ctx.user_data["wallet"]})
-            await self._cleanup_prompts(update, ctx)
             ctx.user_data.clear()
-            await self._send_menu(update, owner, "✅ Entropy збережено.")
+            await self._refresh_menu(update, ctx, owner, "✅ Entropy збережено.")
             return ConversationHandler.END
 
         if flow == "open":
             try:
                 notional = float(text.replace(",", "."))
             except ValueError:
-                await update.effective_chat.send_message("Не зрозумів число, спробуй ще:")
+                await self._edit_anchor(update, ctx, "Не зрозумів число. Надішли розмір у USD на ногу (напр. 200):",
+                                        self._cancel_kb())
                 return ASK
             ctx.user_data["notional"] = notional
             pair = get_pair(ctx.user_data["pair"])
             rows = [
-                [InlineKeyboardButton(f"Entropy ЛОНГ / Lighter ШОРТ", callback_data="side:long")],
-                [InlineKeyboardButton(f"Entropy ШОРТ / Lighter ЛОНГ", callback_data="side:short")],
+                [InlineKeyboardButton("Entropy ЛОНГ / Lighter ШОРТ", callback_data="side:long")],
+                [InlineKeyboardButton("Entropy ШОРТ / Lighter ЛОНГ", callback_data="side:short")],
                 [InlineKeyboardButton("⬅️ Скасувати", callback_data="menu")],
             ]
-            await update.effective_chat.send_message(
-                f"<b>{pair.label}</b> · ${notional:g}/ногу\nОбери напрям:",
-                reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+            await self._edit_anchor(update, ctx,
+                f"<b>{pair.label}</b> · ${notional:g}/ногу\nОбери напрям:", InlineKeyboardMarkup(rows))
             return ConversationHandler.END
 
         return ConversationHandler.END
