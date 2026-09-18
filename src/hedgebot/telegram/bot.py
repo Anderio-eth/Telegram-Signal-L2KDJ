@@ -127,19 +127,16 @@ class HedgeBot:
             "🔑 <b>Ключі</b>\n\n"
             f"🟦 Lighter: {'✅ заведено' if has_l else '❌ нема'}\n"
             f"🟩 Entropy: {'✅ заведено' if has_e else '❌ нема'}\n\n"
-            "<b>Що куди:</b>\n"
-            "🟦 <b>Lighter</b> — 3 значення зі скрипта <code>create_lighter_key.py</code>: приватний "
-            "ключ API-ключа, Account Index, API Key Index.\n"
-            "🟩 <b>Entropy</b> — адреса твого ОСНОВНОГО гаманця + приватний ключ AGENT-ключа "
-            "(app.hyperliquid.xyz/API). Кошти депозиш на entropy.io основним гаманцем."
+            "<i>Щоб змінити ключ — спершу відв'яжи, потім заведи знову.</i>"
         )
-        rows = [[InlineKeyboardButton(f"🟦 Lighter — {'перезавести' if has_l else 'завести'}", callback_data="key:lighter")]]
-        if has_l:
-            rows.append([InlineKeyboardButton("🗑 Відв'язати Lighter", callback_data="unkey:lighter")])
-        rows.append([InlineKeyboardButton(f"🟩 Entropy — {'перезавести' if has_e else 'завести'}", callback_data="key:entropy")])
-        if has_e:
-            rows.append([InlineKeyboardButton("🗑 Відв'язати Entropy", callback_data="unkey:entropy")])
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu")])
+        # One button per venue: unlink if set, add if not. Both set → three buttons total.
+        rows = [
+            [InlineKeyboardButton("🗑 Відв'язати Lighter" if has_l else "➕ Завести Lighter",
+                                  callback_data="unkey:lighter" if has_l else "key:lighter")],
+            [InlineKeyboardButton("🗑 Відв'язати Entropy" if has_e else "➕ Завести Entropy",
+                                  callback_data="unkey:entropy" if has_e else "key:entropy")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
+        ]
         await update.callback_query.edit_message_text(
             text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
