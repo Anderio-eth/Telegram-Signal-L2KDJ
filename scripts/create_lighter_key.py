@@ -22,7 +22,7 @@ import os
 import lighter
 from eth_account import Account as EthAccount
 
-API_URL = os.getenv("LIGHTER_API_URL", "https://mainnet.zklighter.elliot.ai").strip()
+API_URL = os.getenv("LIGHTER_API_URL", "https://api.rh.lighter.xyz").strip()
 ETH_KEY = os.getenv("LIGHTER_ETH_KEY", "").strip()
 API_KEY_INDEX = int(os.getenv("LIGHTER_API_KEY_INDEX", "4"))
 

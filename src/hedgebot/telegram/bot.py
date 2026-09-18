@@ -202,10 +202,11 @@ class HedgeBot:
             ctx.user_data["flow"] = "key_lighter"
             ctx.user_data["step"] = 0
             await update.callback_query.edit_message_text(
-                "🟦 <b>Lighter — крок 1/3</b>\n\n"
-                "На <b>app.lighter.xyz</b> відкрий розділ <b>API</b> і створи/візьми API-ключ. "
-                "Надішли <b>приватний ключ API-ключа</b> (0x…).\n\n"
-                "⚠️ Це НЕ ключ твого гаманця — це згенерований API-ключ.",
+                "🟦 <b>Lighter (Robinhood Chain) — крок 1/3</b>\n\n"
+                "На <b>robinhoodchain.lighter.xyz</b> відкрий розділ <b>API</b> і створи/візьми "
+                "API-ключ. Надішли <b>приватний ключ API-ключа</b> (0x…).\n\n"
+                "⚠️ Це НЕ ключ твого гаманця — це згенерований API-ключ. І це саме RH-деплой, "
+                "не звичайний Lighter.",
                 parse_mode=ParseMode.HTML)
         elif data == "key:entropy":
             ctx.user_data.clear()
@@ -244,14 +245,14 @@ class HedgeBot:
                 ctx.user_data["step"] = 1
                 await self._ask(update, ctx,
                     "🟦 <b>Lighter — крок 2/3</b>\n\nНадішли <b>Account Index</b> — число зі сторінки "
-                    "API на app.lighter.xyz (ідентифікатор твого акаунта).")
+                    "API на robinhoodchain.lighter.xyz (ідентифікатор твого акаунта).")
                 return ASK
             if step == 1:
                 ctx.user_data["account_index"] = int(text)
                 ctx.user_data["step"] = 2
                 await self._ask(update, ctx,
                     "🟦 <b>Lighter — крок 3/3</b>\n\nНадішли <b>API Key Index</b> — номер слота ключа "
-                    "зі сторінки API (число).")
+                    "зі сторінки API на robinhoodchain.lighter.xyz (число).")
                 return ASK
             api_key_index = int(text) if text.isdigit() else 0
             await self._store.set_credentials(

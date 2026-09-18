@@ -52,6 +52,6 @@ services:
       - key: HYPERLIQUID_API_URL
         value: https://api.hyperliquid.xyz
       - key: LIGHTER_API_URL
-        value: https://mainnet.zklighter.elliot.ai
+        value: https://api.rh.lighter.xyz
       - key: ENTROPY_DEX
         value: io

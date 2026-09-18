@@ -34,7 +34,7 @@ class Config:
     database_url: str
     encryption_key: str
     hyperliquid_api_url: str = "https://api.hyperliquid.xyz"
-    lighter_api_url: str = "https://mainnet.zklighter.elliot.ai"
+    lighter_api_url: str = "https://api.rh.lighter.xyz"
     entropy_dex: str = "io"
 
     @staticmethod
@@ -48,6 +48,6 @@ class Config:
             database_url=_required("DELTA_BOT_DATABASE_URL"),
             encryption_key=_required("DELTA_BOT_ENCRYPTION_KEY"),
             hyperliquid_api_url=os.getenv("HYPERLIQUID_API_URL", "https://api.hyperliquid.xyz").strip(),
-            lighter_api_url=os.getenv("LIGHTER_API_URL", "https://mainnet.zklighter.elliot.ai").strip(),
+            lighter_api_url=os.getenv("LIGHTER_API_URL", "https://api.rh.lighter.xyz").strip(),
             entropy_dex=os.getenv("ENTROPY_DEX", "io").strip(),
         )
