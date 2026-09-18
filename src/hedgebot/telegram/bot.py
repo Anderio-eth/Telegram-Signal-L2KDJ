@@ -91,6 +91,17 @@ class HedgeBot:
         text = (prefix + "\n\n" + menu["text"]) if prefix else menu["text"]
         await update.effective_chat.send_message(text, reply_markup=menu["reply_markup"], parse_mode=ParseMode.HTML)
 
+    async def _ask(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        """Send a prompt and remember its id, so the whole exchange (bot prompts + user replies) can be
+        wiped once the step flow finishes — keeps the chat clean and keys off-screen."""
+        m = await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
+        ctx.user_data.setdefault("prompt_msgs", []).append(m.message_id)
+
+    async def _cleanup_prompts(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        for mid in ctx.user_data.pop("prompt_msgs", []):
+            with contextlib.suppress(Exception):
+                await update.effective_chat.delete_message(mid)
+
     async def _router(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if self._guard(update) is None:
             await update.callback_query.answer("⛔", show_alert=True)
@@ -192,8 +203,8 @@ class HedgeBot:
             ctx.user_data["step"] = 0
             await update.callback_query.edit_message_text(
                 "🟦 <b>Lighter — крок 1/3</b>\n\n"
-                "Надішли <b>приватний ключ API-ключа</b> (0x…) — це ПЕРШЕ значення, яке вивів скрипт "
-                "<code>create_lighter_key.py</code> (рядок «API key's private key»).\n\n"
+                "На <b>app.lighter.xyz</b> відкрий розділ <b>API</b> і створи/візьми API-ключ. "
+                "Надішли <b>приватний ключ API-ключа</b> (0x…).\n\n"
                 "⚠️ Це НЕ ключ твого гаманця — це згенерований API-ключ.",
                 parse_mode=ParseMode.HTML)
         elif data == "key:entropy":
@@ -205,6 +216,9 @@ class HedgeBot:
                 "Надішли <b>адресу свого ОСНОВНОГО гаманця</b> (0x…) — того, яким депозитив USDC на "
                 "entropy.io. Просто адреса, не ключ.",
                 parse_mode=ParseMode.HTML)
+        # Remember this first prompt (the edited menu) so it's wiped with the rest when done.
+        if data in ("key:lighter", "key:entropy"):
+            ctx.user_data["prompt_msgs"] = [update.callback_query.message.message_id]
         elif data.startswith("pair:"):
             ctx.user_data.clear()
             ctx.user_data["flow"] = "open"
@@ -228,21 +242,22 @@ class HedgeBot:
             if step == 0:
                 ctx.user_data["priv"] = text
                 ctx.user_data["step"] = 1
-                await update.effective_chat.send_message(
-                    "🟦 <b>Lighter — крок 2/3</b>\n\nНадішли <b>Account Index</b> — число з рядка "
-                    "«Account Index» того ж скрипта.", parse_mode=ParseMode.HTML)
+                await self._ask(update, ctx,
+                    "🟦 <b>Lighter — крок 2/3</b>\n\nНадішли <b>Account Index</b> — число зі сторінки "
+                    "API на app.lighter.xyz (ідентифікатор твого акаунта).")
                 return ASK
             if step == 1:
                 ctx.user_data["account_index"] = int(text)
                 ctx.user_data["step"] = 2
-                await update.effective_chat.send_message(
-                    "🟦 <b>Lighter — крок 3/3</b>\n\nНадішли <b>API Key Index</b> — число з рядка "
-                    "«API Key Index» (зазвичай <b>4</b>).", parse_mode=ParseMode.HTML)
+                await self._ask(update, ctx,
+                    "🟦 <b>Lighter — крок 3/3</b>\n\nНадішли <b>API Key Index</b> — номер слота ключа "
+                    "зі сторінки API (число).")
                 return ASK
             api_key_index = int(text) if text.isdigit() else 0
             await self._store.set_credentials(
                 owner, "lighter", ctx.user_data["priv"],
                 {"account_index": ctx.user_data["account_index"], "api_key_index": api_key_index})
+            await self._cleanup_prompts(update, ctx)
             ctx.user_data.clear()
             await self._send_menu(update, owner, "✅ Lighter збережено.")
             return ConversationHandler.END
@@ -252,14 +267,14 @@ class HedgeBot:
             if step == 0:
                 ctx.user_data["wallet"] = text
                 ctx.user_data["step"] = 1
-                await update.effective_chat.send_message(
+                await self._ask(update, ctx,
                     "🟩 <b>Entropy — крок 2/2</b>\n\nНадішли <b>приватний ключ AGENT-ключа</b> (0x…) — "
                     "з app.hyperliquid.xyz/API (Generate → Authorize).\n\n"
-                    "⚠️ Це ключ agent-а (торгового API), а НЕ приватний ключ твого основного гаманця.",
-                    parse_mode=ParseMode.HTML)
+                    "⚠️ Це ключ agent-а (торгового API), а НЕ приватний ключ твого основного гаманця.")
                 return ASK
             await self._store.set_credentials(
                 owner, "entropy", text, {"wallet_address": ctx.user_data["wallet"]})
+            await self._cleanup_prompts(update, ctx)
             ctx.user_data.clear()
             await self._send_menu(update, owner, "✅ Entropy збережено.")
             return ConversationHandler.END
