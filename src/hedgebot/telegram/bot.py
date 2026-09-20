@@ -916,20 +916,26 @@ class HedgeBot:
                 await ent.set_leverage(e.market, leverage)
             with contextlib.suppress(Exception):
                 await lit.set_leverage(l.market_index, leverage)
+            # A rejected order does NOT raise (Hyperliquid returns an error IN the response), so check
+            # both the exception and the response body for each leg.
             try:
-                results["entropy"] = await ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=plan.post_only)
+                resp = await ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=plan.post_only)
+                err = ent.order_error(resp)
+                results["entropy"] = f"ERROR: {err}" if err else resp
             except Exception as err:  # noqa: BLE001
                 results["entropy"] = f"ERROR: {err}"
             try:
-                results["lighter"] = await lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=plan.post_only)
+                resp = await lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=plan.post_only)
+                err = lit.order_error(resp)
+                results["lighter"] = f"ERROR: {err}" if err else resp
             except Exception as err:  # noqa: BLE001
                 results["lighter"] = f"ERROR: {err}"
         finally:
             with contextlib.suppress(Exception):
                 await lit.close()
 
-        e_ok = "ERROR" not in str(results.get("entropy"))
-        l_ok = "ERROR" not in str(results.get("lighter"))
+        e_ok = not str(results.get("entropy")).startswith("ERROR")
+        l_ok = not str(results.get("lighter")).startswith("ERROR")
         status = "OPEN" if (e_ok and l_ok) else ("PARTIAL" if (e_ok or l_ok) else "FAILED")
         self._bal_cache.pop(owner, None)  # balance changed — next menu refetches
         await self._store.record_hedge(owner, pair.key, notional, "LONG" if entropy_long else "SHORT",

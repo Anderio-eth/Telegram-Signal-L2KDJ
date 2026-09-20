@@ -149,7 +149,8 @@ class SessionEngine:
         opened_at = datetime.now(timezone.utc)
         plan = await self._build_plan(pair, notional, entropy_long)
         if plan is None or not plan.ok:
-            await self._say(owner, f"⚠️ {pair.label}: не вдалось скласти план — пропускаю цикл.")
+            why = plan.errors[0] if (plan and plan.errors) else "не вдалось скласти план"
+            await self._say(owner, f"⚠️ {pair.label}: {why} — пропускаю цикл.")
             return
         close_at = opened_at + timedelta(seconds=hold)
         hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPENING",
@@ -166,13 +167,25 @@ class SessionEngine:
                 await ent.set_leverage(e.market, leverage)
             with contextlib.suppress(Exception):
                 await lit.set_leverage(l.market_index, leverage)
-            # Post both maker legs.
-            with contextlib.suppress(Exception):
-                await ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=True)
-            with contextlib.suppress(Exception):
-                await lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=True)
+            # Post both maker legs and CHECK each response — a rejected order (margin, min notional,
+            # post-only-would-cross) does not raise, so this is the only place the reason surfaces.
+            e_err = await self._place(lambda: ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=True),
+                                      ent.order_error)
+            l_err = await self._place(lambda: lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=True),
+                                      lit.order_error)
+            if e_err or l_err:
+                # At least one leg didn't rest — flatten anything that did and report why.
+                await self._cancel_hedge(ent, lit, pair)
+                await self._store.update_hedge(hid, status="FAILED")
+                parts = []
+                if e_err:
+                    parts.append(f"Entropy: {e_err}")
+                if l_err:
+                    parts.append(f"Lighter: {l_err}")
+                await self._say(owner, f"⛔ {pair.label}: ордер відхилено.\n" + "\n".join(parts))
+                return
 
-            # Wait for both to fill, applying the timeout-after-first-fill rule. VERIFY the fill reads.
+            # Wait for both to fill, applying the timeout-after-first-fill rule.
             ok = await self._await_fills(ent, lit, pair, e, l, cfg.get("fill_timeout", 20))
             if not ok:
                 res = await self._cancel_hedge(ent, lit, pair)
@@ -197,7 +210,20 @@ class SessionEngine:
             with contextlib.suppress(Exception):
                 await lit.close()
 
-    # ── live helpers (best-effort; VERIFY against the venues) ───────────────────────────────────────
+    # ── live helpers ────────────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    async def _place(do_order, error_parser) -> str | None:
+        """Run one leg's order and return a rejection reason (or None if accepted). Covers both a
+        raised exception and a response that merely reports an error without raising."""
+        try:
+            resp = await do_order()
+        except Exception as err:  # noqa: BLE001
+            return str(err)[:200]
+        try:
+            return error_parser(resp)
+        except Exception:  # noqa: BLE001
+            return None
+
     async def _await_fills(self, ent, lit, pair, e, l, timeout: float) -> bool:
         """True once both legs are fully filled. Timeout only counts from the first partial fill."""
         deadline = None

@@ -98,6 +98,16 @@ def plan_hedge(
     if e_size <= 0:
         errors.append("Entropy size rounds to zero — raise the notional")
 
+    # The exchange checks the ACTUAL rounded notional, not the requested one — a size rounded down can
+    # fall under the floor even when the request was fine (this is the "Min Trade Ntl Rejected" seen
+    # on Entropy). Validate both legs at their own price so the plan fails clearly instead of at order.
+    e_notional = e_size * entropy_price
+    l_notional = l_size * lighter_price
+    if e_size > 0 and e_notional < MIN_NOTIONAL_USD:
+        errors.append(f"Entropy notional ${e_notional:.2f} < ${MIN_NOTIONAL_USD:g} after rounding — raise the notional")
+    if lighter_market.min_quote and l_notional < lighter_market.min_quote:
+        errors.append(f"Lighter notional ${l_notional:.2f} < min ${lighter_market.min_quote:g} — raise the notional")
+
     e_is_buy = entropy_long
     l_is_ask = entropy_long  # opposite side: if Entropy is long, Lighter is short (ask)
 

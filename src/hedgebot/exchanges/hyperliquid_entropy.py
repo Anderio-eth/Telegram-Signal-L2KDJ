@@ -31,6 +31,23 @@ class EntropyClient:
         self._info = Info(api_url, skip_ws=True, perp_dexs=[dex])
         self._exchange = Exchange(self._agent, api_url, account_address=wallet_address, perp_dexs=[dex])
 
+    @staticmethod
+    def order_error(resp) -> str | None:
+        """Extract a rejection reason from an order() response, or None if it was accepted. Hyperliquid
+        does NOT raise on a rejected order — it returns {"status":"ok",...,"statuses":[{"error":...}]}
+        (or status "err"), so callers that only catch exceptions would think a reject succeeded."""
+        if not isinstance(resp, dict):
+            return None
+        if resp.get("status") != "ok":
+            return str(resp.get("response") or resp)[:200]
+        try:
+            for st in resp["response"]["data"]["statuses"]:
+                if isinstance(st, dict) and st.get("error"):
+                    return str(st["error"])[:200]
+        except (KeyError, TypeError, IndexError):
+            return None
+        return None
+
     async def limit_order(self, market: str, is_buy: bool, size: float, price: float,
                           *, post_only: bool = False, reduce_only: bool = False) -> dict:
         """Place a limit order on an io market. `market` is e.g. "io:ANTH". tif Alo = add-liquidity-only

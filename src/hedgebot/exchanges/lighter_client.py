@@ -84,6 +84,29 @@ class LighterClient:
                 await api.close()
 
     @staticmethod
+    def order_error(resp) -> str | None:
+        """Best-effort rejection reason from a create_order return, or None if it looks accepted.
+        The SDK's shape varies (object / tuple / (tx, hash, err)); we look for an error-ish field or
+        substring rather than assume one layout."""
+        if resp is None:
+            return None
+        # (result, tx_hash, err) tuple form
+        if isinstance(resp, tuple):
+            for part in resp:
+                if isinstance(part, Exception):
+                    return str(part)[:200]
+            resp = resp[-1] if resp else None
+        for attr in ("error", "err", "message", "reason"):
+            v = getattr(resp, attr, None)
+            if v:
+                return str(v)[:200]
+        s = str(resp)
+        low = s.lower()
+        if any(k in low for k in ("error", "rejected", "insufficient", "invalid", "fail")):
+            return s[:200]
+        return None
+
+    @staticmethod
     def _num(obj, *names):
         for n in names:
             v = getattr(obj, n, None)
