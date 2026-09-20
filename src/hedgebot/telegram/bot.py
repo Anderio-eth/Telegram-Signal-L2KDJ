@@ -14,6 +14,8 @@ import asyncio
 import contextlib
 import html
 import logging
+import time
+from datetime import datetime, timezone
 
 import aiohttp
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -44,16 +46,21 @@ SESS_DEFAULT = {
 
 
 class HedgeBot:
+    BAL_TTL = 60.0  # seconds a cached balance line stays fresh before the menu refetches
+
     def __init__(self, cfg: Config, store: Store, engine=None) -> None:
         self._cfg = cfg
         self._store = store
         self._engine = engine
+        # owner_id -> {"ts": monotonic, "at": "HH:MM:SS UTC", "text": str}. Keeps the main menu from
+        # hitting both exchanges on every navigation; the 🔄 button forces a refetch.
+        self._bal_cache: dict[int, dict] = {}
 
     # ── wiring ───────────────────────────────────────────────────────────────────────────────────
     def register(self, app: Application) -> None:
         app.add_handler(CommandHandler("start", self._start))
         app.add_handler(ConversationHandler(
-            entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy)|cfg:margin_custom|sess:(hold|pause|timeout|durcustom))$")],
+            entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy)|cfg:margin|sess:(hold|pause|timeout|margin))$")],
             states={ASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_input)]},
             fallbacks=[CallbackQueryHandler(self._menu, pattern=r"^menu$")],
             per_message=False,
@@ -118,21 +125,67 @@ class HedgeBot:
         text = (prefix + "\n\n" + menu["text"]) if prefix else menu["text"]
         await self._edit_anchor(update, ctx, text, menu["reply_markup"])
 
-    async def _main_menu(self, owner: int) -> dict:
+    async def _main_menu(self, owner: int, force_bal: bool = False) -> dict:
         venues = await self._store.venues_set(owner)
         l = "✅" if "lighter" in venues else "❌"
         e = "✅" if "entropy" in venues else "❌"
+        bal = await self._balances_cached(owner, force=force_bal)
         text = (f"🤖 <b>Delta-Points</b>{NL}{NL}"
-                f"Ключі: Lighter {l}  ·  Entropy {e}{NL}"
+                f"Ключі: Lighter {l}  ·  Entropy {e}{NL}{NL}"
+                f"{bal}{NL}{NL}"
                 f"Хедж відкривається лімітками по спільних монетах (лонг на одній біржі, шорт на іншій).")
         rows = [
+            [InlineKeyboardButton("🔄 Оновити баланси", callback_data="refresh")],
             [InlineKeyboardButton("🔑 Ключі", callback_data="keys")],
-            [InlineKeyboardButton("💰 Баланси", callback_data="balances")],
             [InlineKeyboardButton("📈 Відкрити хедж (ручний)", callback_data="open")],
             [InlineKeyboardButton("🤖 Авто-сесія", callback_data="sess")],
             [InlineKeyboardButton("📂 Позиції / Закрити", callback_data="positions")],
         ]
         return {"text": text, "reply_markup": InlineKeyboardMarkup(rows), "parse_mode": ParseMode.HTML}
+
+    async def _balances_cached(self, owner: int, force: bool = False) -> str:
+        """Formatted balance block for the main menu, cached for BAL_TTL so ordinary navigation is
+        instant; `force` (the 🔄 button) refetches now."""
+        hit = self._bal_cache.get(owner)
+        if hit and not force and (time.monotonic() - hit["ts"]) < self.BAL_TTL:
+            return hit["text"]
+        text = await self._fetch_balances_text(owner)
+        at = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        self._bal_cache[owner] = {"ts": time.monotonic(), "at": at, "text": f"{text}{NL}<i>оновлено {at}</i>"}
+        return self._bal_cache[owner]["text"]
+
+    async def _fetch_balances_text(self, owner: int) -> str:
+        """Read both venues' balances into one compact block. Each venue is guarded independently so
+        one failing client still shows the other's number instead of a stuck message."""
+        fmt = lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else "—"
+        lines = ["💰 <b>Баланси</b>"]
+        try:
+            ent = await self._entropy_client(owner)
+            if not ent:
+                lines.append("🟩 Entropy: ключ не заведено")
+            else:
+                b = await ent.balance()
+                lines.append(f"🟩 Entropy (io): {fmt(b.get('total'))} · вільно {fmt(b.get('free'))}")
+        except Exception as err:  # noqa: BLE001
+            LOGGER.exception("entropy balance failed")
+            lines.append(f"🟩 Entropy: помилка — {html.escape(str(err)[:120])}")
+
+        lit = None
+        try:
+            lit = await self._lighter_client(owner)
+            if not lit:
+                lines.append("🟦 Lighter: ключ не заведено")
+            else:
+                b = await lit.balance()
+                lines.append(f"🟦 Lighter: {fmt(b.get('total'))} · вільно {fmt(b.get('available'))}")
+        except Exception as err:  # noqa: BLE001
+            LOGGER.exception("lighter balance failed")
+            lines.append(f"🟦 Lighter: помилка — {html.escape(str(err)[:120])}")
+        finally:
+            if lit:
+                with contextlib.suppress(Exception):
+                    await lit.close()
+        return NL.join(lines)
 
     async def _router(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if self._guard(update) is None:
@@ -150,9 +203,10 @@ class HedgeBot:
         elif data.startswith("unkey:"):
             venue = data.split(":", 1)[1]
             await self._store.delete_credentials(owner, venue)
+            self._bal_cache.pop(owner, None)
             await self._keys_menu(update, owner)   # already answered above; refreshed menu shows ❌
-        elif data == "balances":
-            await self._balances(update, owner)
+        elif data == "refresh":
+            await q.edit_message_text(**await self._main_menu(owner, force_bal=True))
         elif data == "open":
             if "draft" not in ctx.chat_data:
                 saved = (await self._store.load_settings(owner)).get("draft") or {}
@@ -171,11 +225,6 @@ class HedgeBot:
             await self._lev_menu(update, ctx)
         elif data.startswith("setlev:"):
             ctx.chat_data["draft"]["leverage"] = int(data.split(":", 1)[1])
-            await self._open_config(update, ctx)
-        elif data == "cfg:margin":
-            await self._margin_menu(update, ctx)
-        elif data.startswith("setmargin:"):
-            ctx.chat_data["draft"]["margin"] = float(data.split(":", 1)[1])
             await self._open_config(update, ctx)
         elif data == "cfg:preview":
             await self._preview(update, ctx, owner)
@@ -197,11 +246,6 @@ class HedgeBot:
             await self._sess_lev(update, ctx)
         elif data.startswith("sslev:"):
             ctx.chat_data["sess"]["leverage"] = int(data.split(":", 1)[1])
-            await self._sess_config(update, ctx)
-        elif data == "sess:margin":
-            await self._sess_margin(update, ctx)
-        elif data.startswith("ssmargin:"):
-            ctx.chat_data["sess"]["margin"] = float(data.split(":", 1)[1])
             await self._sess_config(update, ctx)
         elif data == "sess:dur":
             await self._sess_dur(update, ctx)
@@ -243,50 +287,6 @@ class HedgeBot:
         await update.callback_query.edit_message_text(
             text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
-    async def _balances(self, update: Update, owner: int) -> None:
-        await update.callback_query.edit_message_text("⏳ Читаю баланси…")
-        lines = ["💰 <b>Баланси</b>", ""]
-        fmt = lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else "—"
-
-        # Whole block guarded per venue — a failure BUILDING the client (e.g. an SDK kwarg or a bad
-        # key) must surface as text, not leave the message stuck on "reading…".
-        try:
-            ent = await self._entropy_client(owner)
-            if not ent:
-                lines.append("🟩 <b>Entropy</b>: ключ не заведено")
-            else:
-                b = await ent.balance()
-                lines.append(f"🟩 <b>Entropy (io)</b>: всього {fmt(b.get('total'))}, вільно {fmt(b.get('free'))}, "
-                             f"в позиціях {fmt(b.get('used'))}")
-        except Exception as err:  # noqa: BLE001
-            LOGGER.exception("entropy balance failed")
-            lines.append(f"🟩 <b>Entropy</b>: помилка — {html.escape(str(err)[:150])}")
-
-        lit = None
-        try:
-            lit = await self._lighter_client(owner)
-            if not lit:
-                lines.append("🟦 <b>Lighter</b>: ключ не заведено")
-            else:
-                b = await lit.balance()
-                lines.append(f"🟦 <b>Lighter</b>: всього {fmt(b.get('total'))}, вільно {fmt(b.get('available'))}")
-        except Exception as err:  # noqa: BLE001
-            LOGGER.exception("lighter balance failed")
-            lines.append(f"🟦 <b>Lighter</b>: помилка — {html.escape(str(err)[:150])}")
-        finally:
-            if lit:
-                with contextlib.suppress(Exception):
-                    await lit.close()
-
-        lines.append("")
-        lines.append("<i>Обидві біржі — ф'ючерси; «всього» = еквіті рахунку, «вільно» = під нову позицію.</i>")
-        rows = [
-            [InlineKeyboardButton("🔄 Оновити", callback_data="balances")],
-            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
-        ]
-        await update.callback_query.edit_message_text(
-            NL.join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
-
     # ── free-text input (keys + notional) ──────────────────────────────────────────────────────────
     async def _begin_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if self._guard(update) is None:
@@ -312,19 +312,23 @@ class HedgeBot:
                 "Надішли <b>адресу свого ОСНОВНОГО гаманця</b> (0x…) — того, яким депозитив USDC на "
                 "entropy.io. Просто адреса, не ключ.",
                 reply_markup=self._cancel_kb(), parse_mode=ParseMode.HTML)
-        elif data == "cfg:margin_custom":
+        elif data == "cfg:margin":
             ctx.user_data.clear()
             ctx.user_data["flow"] = "cfg_margin"
             await update.callback_query.edit_message_text(
-                "💵 Надішли <b>свою маржу в USD на ногу</b> (число; розмір = маржа × плече):",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="cfg:margin")]]),
+                "💵 Надішли <b>маржу в USD на ногу</b> числом (розмір позиції = маржа × плече):",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="open")]]),
                 parse_mode=ParseMode.HTML)
-        elif data in ("sess:hold", "sess:pause", "sess:timeout"):
+        elif data in ("sess:hold", "sess:pause", "sess:timeout", "sess:margin"):
             ctx.user_data.clear()
             ctx.user_data["flow"] = "sess_" + data.split(":", 1)[1]
             back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
-            if data == "sess:timeout":
-                msg = "⏳ Надішли <b>таймаут заповнення в секундах</b> (напр. 20):"
+            if data == "sess:margin":
+                msg = "💵 Надішли <b>маржу в USD на ногу</b> числом (розмір = маржа × плече):"
+            elif data == "sess:timeout":
+                msg = ("⏳ Надішли <b>таймаут заповнення в секундах</b> (напр. 20).\n\n"
+                       "Це скільки чекати другу ногу після того, як перша <b>почала</b> заповнюватись; "
+                       "не встигла — скасовуємо хедж, щоб не лишитись з голою позицією.")
             else:
                 what = "утримання" if data == "sess:hold" else "паузи"
                 msg = (f"Надішли <b>діапазон {what} у хвилинах</b> — два числа через пробіл, напр. "
@@ -362,6 +366,7 @@ class HedgeBot:
                 owner, "lighter", ctx.user_data["priv"],
                 {"account_index": ctx.user_data["account_index"], "api_key_index": api_key_index})
             ctx.user_data.clear()
+            self._bal_cache.pop(owner, None)
             await self._refresh_menu(update, ctx, owner, "✅ Lighter збережено.")
             return ConversationHandler.END
 
@@ -377,6 +382,7 @@ class HedgeBot:
             await self._store.set_credentials(
                 owner, "entropy", text, {"wallet_address": ctx.user_data["wallet"]})
             ctx.user_data.clear()
+            self._bal_cache.pop(owner, None)
             await self._refresh_menu(update, ctx, owner, "✅ Entropy збережено.")
             return ConversationHandler.END
 
@@ -387,7 +393,7 @@ class HedgeBot:
                     raise ValueError
             except ValueError:
                 await self._edit_anchor(update, ctx, "Не зрозумів число, надішли ще раз:",
-                                        InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="cfg:margin")]]))
+                                        InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="open")]]))
                 return ASK
             ctx.chat_data.setdefault(
                 "draft", {"pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": True})["margin"] = value
@@ -395,11 +401,16 @@ class HedgeBot:
             await self._open_config(update, ctx)
             return ConversationHandler.END
 
-        if flow in ("sess_hold", "sess_pause", "sess_timeout"):
+        if flow in ("sess_hold", "sess_pause", "sess_timeout", "sess_margin"):
             s = ctx.chat_data.setdefault("sess", dict(SESS_DEFAULT))
             back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
             try:
-                if flow == "sess_timeout":
+                if flow == "sess_margin":
+                    value = float(text.replace(",", "."))
+                    if value <= 0:
+                        raise ValueError
+                    s["margin"] = value
+                elif flow == "sess_timeout":
                     s["fill_timeout"] = max(5, int(float(text)))
                 else:
                     a, b = (float(x) for x in text.replace(",", ".").split()[:2])
@@ -455,15 +466,6 @@ class HedgeBot:
         rows = [[b(1), b(2), b(3)], [b(4), b(5), b(6)],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="open")]]
         await self._edit_anchor(update, ctx, "⚙️ <b>Плече</b> (Entropy io макс 6x):", InlineKeyboardMarkup(rows))
-
-    async def _margin_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        cur = ctx.chat_data["draft"]["margin"]
-        def b(v): return InlineKeyboardButton(f"{'✅ ' if v == cur else ''}${v:g}", callback_data=f"setmargin:{v}")
-        rows = [[b(3), b(5), b(10)], [b(25), b(50), b(100)],
-                [InlineKeyboardButton("✍️ Своя сума", callback_data="cfg:margin_custom")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="open")]]
-        await self._edit_anchor(update, ctx, "💵 <b>Маржа на ногу</b> (розмір = маржа × плече):",
-                                InlineKeyboardMarkup(rows))
 
     # ── auto-session ───────────────────────────────────────────────────────────────────────────────
     def _fmt_secs(self, s: float) -> str:
@@ -545,12 +547,6 @@ class HedgeBot:
         def b(n): return InlineKeyboardButton(f"{'✅ ' if n == cur else ''}{n}x", callback_data=f"sslev:{n}")
         rows = [[b(1), b(2), b(3)], [b(4), b(5), b(6)], [InlineKeyboardButton("⬅️ Назад", callback_data="sess")]]
         await self._edit_anchor(update, ctx, "⚙️ <b>Плече</b> (io макс 6x):", InlineKeyboardMarkup(rows))
-
-    async def _sess_margin(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        cur = ctx.chat_data["sess"]["margin"]
-        def b(v): return InlineKeyboardButton(f"{'✅ ' if v == cur else ''}${v:g}", callback_data=f"ssmargin:{v}")
-        rows = [[b(3), b(5), b(10)], [b(25), b(50), b(100)], [InlineKeyboardButton("⬅️ Назад", callback_data="sess")]]
-        await self._edit_anchor(update, ctx, "💵 <b>Маржа на ногу</b>:", InlineKeyboardMarkup(rows))
 
     async def _sess_dur(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cur = ctx.chat_data["sess"]["duration"]
@@ -699,6 +695,7 @@ class HedgeBot:
         e_ok = "ERROR" not in str(results.get("entropy"))
         l_ok = "ERROR" not in str(results.get("lighter"))
         status = "OPEN" if (e_ok and l_ok) else ("PARTIAL" if (e_ok or l_ok) else "FAILED")
+        self._bal_cache.pop(owner, None)  # balance changed — next menu refetches
         await self._store.record_hedge(owner, pair.key, notional, "LONG" if entropy_long else "SHORT",
                                        status, {"results": {k: str(v) for k, v in results.items()}})
         warn = "" if status == "OPEN" else "\n⚠️ Одна нога не відкрилась — можлива гола дельта, перевір!"
@@ -745,6 +742,7 @@ class HedgeBot:
             with __import__("contextlib").suppress(Exception):
                 await lit.close()
         await self._store.mark_hedge(hedge_id, "CLOSED")
+        self._bal_cache.pop(owner, None)  # balance changed — next menu refetches
         note = "\n⚠️ Lighter: скасував ордери; закриття заповненої позиції звіримо на тесті." if not errs else ""
         await update.callback_query.edit_message_text(
             f"✅ Хедж #{hedge_id} {pair.label if pair else ''} закрито.{note}",
