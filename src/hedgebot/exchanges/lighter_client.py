@@ -85,13 +85,18 @@ class LighterClient:
 
     @staticmethod
     def order_error(resp) -> str | None:
-        """Best-effort rejection reason from a create_order return, or None if it looks accepted.
-        The SDK's shape varies (object / tuple / (tx, hash, err)); we look for an error-ish field or
-        substring rather than assume one layout."""
+        """Rejection reason from a create_order return, or None if accepted.
+
+        The SDK returns a 3-tuple: (CreateOrder, RespSendTx, None) on success and (None, None,
+        error_string) on failure — so the THIRD element is the authoritative error (any non-empty
+        value means the order did NOT go through, regardless of wording). Other shapes are handled
+        best-effort."""
         if resp is None:
             return None
-        # (result, tx_hash, err) tuple form
         if isinstance(resp, tuple):
+            if len(resp) >= 3:                       # canonical (result, tx_hash, err)
+                err = resp[2]
+                return str(err)[:200] if err else None
             for part in resp:
                 if isinstance(part, Exception):
                     return str(part)[:200]
