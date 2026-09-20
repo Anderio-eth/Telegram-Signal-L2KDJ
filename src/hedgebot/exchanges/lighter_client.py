@@ -97,7 +97,8 @@ class LighterClient:
                     return str(part)[:200]
             resp = resp[-1] if resp else None
         for attr in ("error", "err", "message", "reason"):
-            v = getattr(resp, attr, None)
+            # objects expose these as attributes, dict responses as keys — check both
+            v = resp.get(attr) if isinstance(resp, dict) else getattr(resp, attr, None)
             if v:
                 return str(v)[:200]
         s = str(resp)
