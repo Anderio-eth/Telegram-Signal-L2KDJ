@@ -44,11 +44,12 @@ LOGGER = logging.getLogger(__name__)
 
 
 class SessionEngine:
-    def __init__(self, store, cfg, notify=None, sheets=None) -> None:
+    def __init__(self, store, cfg, notify=None, sheets=None, feed=None) -> None:
         self._store = store
         self._cfg = cfg
         self._notify = notify                       # async (owner_id, text) -> None
         self._sheets = sheets                       # SheetsLogger | None — per-session stats to a sheet
+        self._feed = feed                           # PriceFeed | None — realtime io mids over WS
         self._tasks: dict[int, asyncio.Task] = {}
 
     async def start(self) -> None:
@@ -314,7 +315,10 @@ class SessionEngine:
                 lmk = (await md.lighter_markets(s, self._cfg.lighter_api_url)).get(pair.lighter)
                 if not emk or not lmk:
                     return None
-                eprice = (await md.entropy_marks(s, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
+                # Prefer the realtime WS mid; fall back to a REST mark if the feed is cold/stale.
+                eprice = (self._feed.mid(pair.entropy) if self._feed else None)
+                if not eprice:
+                    eprice = (await md.entropy_marks(s, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
                 lprice = await md.lighter_mark(s, self._cfg.lighter_api_url, lmk.market_id)
                 if not eprice or not lprice:
                     return None

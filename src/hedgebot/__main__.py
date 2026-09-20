@@ -6,6 +6,7 @@ and reuses the shared Postgres.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 from telegram.constants import ParseMode
@@ -13,6 +14,7 @@ from telegram.ext import Application
 
 from .config import Config
 from .core.crypto import CredentialCipher
+from .core.pricefeed import PriceFeed
 from .core.session import SessionEngine
 from .core.sheets import SheetsLogger
 from .db.store import Store
@@ -30,11 +32,14 @@ async def _on_error(update: object, context) -> None:
 
 async def _post_init(app: Application) -> None:
     await app.bot_data["store"].connect()
+    app.bot_data["feed"].start()           # realtime io price websocket (public)
     await app.bot_data["engine"].start()   # resume any session that was running before a restart
-    logging.getLogger(__name__).info("store + engine ready")
+    logging.getLogger(__name__).info("store + engine + pricefeed ready")
 
 
 async def _post_shutdown(app: Application) -> None:
+    with contextlib.suppress(Exception):
+        await app.bot_data["feed"].stop()
     await app.bot_data["store"].close()
 
 
@@ -53,11 +58,13 @@ def main() -> None:
         await app.bot.send_message(chat_id=owner_id, text=text, parse_mode=ParseMode.HTML)
 
     sheets = SheetsLogger(store, notify=notify)
-    engine = SessionEngine(store, cfg, notify=notify, sheets=sheets)
+    feed = PriceFeed(cfg.hyperliquid_api_url, cfg.entropy_dex)
+    engine = SessionEngine(store, cfg, notify=notify, sheets=sheets, feed=feed)
     app.bot_data["store"] = store
     app.bot_data["engine"] = engine
+    app.bot_data["feed"] = feed
     app.add_error_handler(_on_error)
-    HedgeBot(cfg, store, engine, sheets=sheets).register(app)
+    HedgeBot(cfg, store, engine, sheets=sheets, feed=feed).register(app)
     app.run_polling(drop_pending_updates=True)
 
 

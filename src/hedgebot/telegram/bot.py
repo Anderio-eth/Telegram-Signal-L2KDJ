@@ -51,16 +51,28 @@ SESS_DEFAULT = {
 
 
 class HedgeBot:
-    BAL_TTL = 60.0  # seconds a cached balance line stays fresh before the menu refetches
+    BAL_TTL = 60.0     # seconds a cached balance line stays fresh before the menu refetches
+    CLIENT_TTL = 600.0  # reuse a built exchange client for this long before rebuilding it
 
-    def __init__(self, cfg: Config, store: Store, engine=None, sheets=None) -> None:
+    def __init__(self, cfg: Config, store: Store, engine=None, sheets=None, feed=None) -> None:
         self._cfg = cfg
         self._store = store
         self._engine = engine
         self._sheets = sheets
+        self._feed = feed
         # owner_id -> {"ts": monotonic, "at": "HH:MM:SS UTC", "text": str}. Keeps the main menu from
         # hitting both exchanges on every navigation; the 🔄 button forces a refetch.
         self._bal_cache: dict[int, dict] = {}
+        # owner_id -> {"entropy": client|None, "lighter": client|None, "ts": monotonic}. Building a
+        # client is a network round-trip (Entropy loads meta); reusing it is what makes the menu snappy.
+        self._client_cache: dict[int, dict] = {}
+
+    async def _drop_clients(self, owner: int) -> None:
+        """Close and forget an owner's cached clients (on a key change or after an error)."""
+        entry = self._client_cache.pop(owner, None)
+        if entry and entry.get("lighter"):
+            with contextlib.suppress(Exception):
+                await entry["lighter"].close()
 
     # ── wiring ───────────────────────────────────────────────────────────────────────────────────
     def register(self, app: Application) -> None:
@@ -200,10 +212,10 @@ class HedgeBot:
                 return f"🟩 Entropy (io): {fmt(b.get('total'))} · вільно {fmt(b.get('free'))}"
             except Exception as err:  # noqa: BLE001
                 LOGGER.exception("entropy balance failed")
+                await self._drop_clients(owner)   # cached client may be dead — rebuild next time
                 return f"🟩 Entropy: помилка — {html.escape(str(err)[:120])}"
 
         async def lighter_line() -> str:
-            lit = None
             try:
                 lit = await self._lighter_client(owner)
                 if not lit:
@@ -212,11 +224,8 @@ class HedgeBot:
                 return f"🟦 Lighter: {fmt(b.get('total'))} · вільно {fmt(b.get('available'))}"
             except Exception as err:  # noqa: BLE001
                 LOGGER.exception("lighter balance failed")
+                await self._drop_clients(owner)   # cached client may be dead — rebuild next time
                 return f"🟦 Lighter: помилка — {html.escape(str(err)[:120])}"
-            finally:
-                if lit:
-                    with contextlib.suppress(Exception):
-                        await lit.close()
 
         e_line, l_line = await asyncio.gather(entropy_line(), lighter_line())
         return NL.join(["💰 <b>Баланси</b>", e_line, l_line])
@@ -238,6 +247,7 @@ class HedgeBot:
             venue = data.split(":", 1)[1]
             await self._store.delete_credentials(owner, venue)
             self._bal_cache.pop(owner, None)
+            await self._drop_clients(owner)
             await self._keys_menu(update, owner)   # already answered above; refreshed menu shows ❌
         elif data == "refresh":
             await q.edit_message_text(**await self._main_menu(owner, force_bal=True))
@@ -523,6 +533,7 @@ class HedgeBot:
                 {"account_index": ctx.user_data["account_index"], "api_key_index": api_key_index})
             ctx.user_data.clear()
             self._bal_cache.pop(owner, None)
+            await self._drop_clients(owner)
             await self._refresh_menu(update, ctx, owner, "✅ Lighter збережено.")
             return ConversationHandler.END
 
@@ -539,6 +550,7 @@ class HedgeBot:
                 owner, "entropy", text, {"wallet_address": ctx.user_data["wallet"]})
             ctx.user_data.clear()
             self._bal_cache.pop(owner, None)
+            await self._drop_clients(owner)
             await self._refresh_menu(update, ctx, owner, "✅ Entropy збережено.")
             return ConversationHandler.END
 
@@ -873,8 +885,11 @@ class HedgeBot:
             lmk = (await md.lighter_markets(s, self._cfg.lighter_api_url)).get(pair.lighter)
             if not emk or not lmk:
                 return None, "ринок не знайдено на одній із бірж"
-            LOGGER.info("build_plan: entropy_marks…")
-            eprice = (await md.entropy_marks(s, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
+            # Realtime WS mid first; REST mark only if the feed is cold/stale.
+            eprice = self._feed.mid(pair.entropy) if self._feed else None
+            if not eprice:
+                LOGGER.info("build_plan: entropy_marks (REST)…")
+                eprice = (await md.entropy_marks(s, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
             LOGGER.info("build_plan: lighter_mark…")
             lprice = await md.lighter_mark(s, self._cfg.lighter_api_url, lmk.market_id)
             LOGGER.info("build_plan: prices e=%s l=%s", eprice, lprice)
@@ -912,30 +927,27 @@ class HedgeBot:
         if not ent or not lit:
             await update.callback_query.edit_message_text("✗ Немає ключів для однієї з бірж.", reply_markup=self._back())
             return
+        e, l = plan.entropy, plan.lighter
+        # Set the chosen leverage before ordering (best-effort; a failure is reported per leg).
+        with contextlib.suppress(Exception):
+            await ent.set_leverage(e.market, leverage)
+        with contextlib.suppress(Exception):
+            await lit.set_leverage(l.market_index, leverage)
+        # A rejected order does NOT raise (Hyperliquid returns an error IN the response), so check
+        # both the exception and the response body for each leg.
         try:
-            e, l = plan.entropy, plan.lighter
-            # Set the chosen leverage before ordering (best-effort; a failure is reported per leg).
-            with contextlib.suppress(Exception):
-                await ent.set_leverage(e.market, leverage)
-            with contextlib.suppress(Exception):
-                await lit.set_leverage(l.market_index, leverage)
-            # A rejected order does NOT raise (Hyperliquid returns an error IN the response), so check
-            # both the exception and the response body for each leg.
-            try:
-                resp = await ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=plan.post_only)
-                err = ent.order_error(resp)
-                results["entropy"] = f"ERROR: {err}" if err else resp
-            except Exception as err:  # noqa: BLE001
-                results["entropy"] = f"ERROR: {err}"
-            try:
-                resp = await lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=plan.post_only)
-                err = lit.order_error(resp)
-                results["lighter"] = f"ERROR: {err}" if err else resp
-            except Exception as err:  # noqa: BLE001
-                results["lighter"] = f"ERROR: {err}"
-        finally:
-            with contextlib.suppress(Exception):
-                await lit.close()
+            resp = await ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=plan.post_only)
+            err = ent.order_error(resp)
+            results["entropy"] = f"ERROR: {err}" if err else resp
+        except Exception as err:  # noqa: BLE001
+            results["entropy"] = f"ERROR: {err}"
+        try:
+            resp = await lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=plan.post_only)
+            err = lit.order_error(resp)
+            results["lighter"] = f"ERROR: {err}" if err else resp
+        except Exception as err:  # noqa: BLE001
+            results["lighter"] = f"ERROR: {err}"
+        # ent/lit are cached and reused — not closed here.
 
         e_ok = not str(results.get("entropy")).startswith("ERROR")
         l_ok = not str(results.get("lighter")).startswith("ERROR")
@@ -976,17 +988,13 @@ class HedgeBot:
         ent = await self._entropy_client(owner)
         lit = await self._lighter_client(owner)
         res = {"pnl": None, "fees": None}
-        try:
-            if ent and lit and pair and self._engine:
-                # Reuse the engine's flatten: reduce-only close on BOTH venues + pull resting orders.
-                res = await self._engine._close_hedge(ent, lit, pair)
-            elif ent and pair:
-                with contextlib.suppress(Exception):
-                    await ent.close_market(pair.entropy)
-        finally:
-            if lit:
-                with contextlib.suppress(Exception):
-                    await lit.close()
+        if ent and lit and pair and self._engine:
+            # Reuse the engine's flatten: reduce-only close on BOTH venues + pull resting orders.
+            res = await self._engine._close_hedge(ent, lit, pair)
+        elif ent and pair:
+            with contextlib.suppress(Exception):
+                await ent.close_market(pair.entropy)
+        # ent/lit are cached and reused — not closed here.
         await self._store.mark_hedge(hedge_id, "CLOSED")
         self._bal_cache.pop(owner, None)  # balance changed — next menu refetches
         pnl_note = f"\nPnL ≈ ${res['pnl']:g}" if res.get("pnl") is not None else ""
@@ -998,19 +1006,40 @@ class HedgeBot:
     def _back(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="menu")]])
 
+    def _cache_get(self, owner: int, venue: str):
+        entry = self._client_cache.get(owner)
+        if entry and (time.monotonic() - entry["ts"]) < self.CLIENT_TTL:
+            return entry.get(venue)
+        return None
+
+    def _cache_put(self, owner: int, venue: str, client) -> None:
+        entry = self._client_cache.setdefault(owner, {"ts": time.monotonic()})
+        entry[venue] = client
+        entry["ts"] = time.monotonic()
+
     async def _entropy_client(self, owner: int) -> EntropyClient | None:
+        cached = self._cache_get(owner, "entropy")
+        if cached is not None:
+            return cached
         c = await self._store.get_credentials(owner, "entropy")
         if not c:
             return None
-        return await asyncio.to_thread(
+        client = await asyncio.to_thread(
             EntropyClient, self._cfg.hyperliquid_api_url, c.meta["wallet_address"], c.secret, self._cfg.entropy_dex)
+        self._cache_put(owner, "entropy", client)
+        return client
 
     async def _lighter_client(self, owner: int) -> LighterClient | None:
+        cached = self._cache_get(owner, "lighter")
+        if cached is not None:
+            return cached
         c = await self._store.get_credentials(owner, "lighter")
         if not c:
             return None
         # Build off the event loop — SignerClient's constructor does blocking setup, and running it
         # inline froze the whole bot (every other button lagged) until it finished.
-        return await asyncio.to_thread(
+        client = await asyncio.to_thread(
             LighterClient, self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
             int(c.meta.get("api_key_index", 0)))
+        self._cache_put(owner, "lighter", client)
+        return client
