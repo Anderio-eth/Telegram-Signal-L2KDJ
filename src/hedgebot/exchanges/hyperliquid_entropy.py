@@ -57,6 +57,29 @@ class EntropyClient:
         state = await asyncio.to_thread(self._info.user_state, self._address, self._dex)
         return [p["position"] for p in state.get("assetPositions", []) if p.get("position")]
 
+    async def position(self, market: str) -> dict | None:
+        """The open position on one io market, or None if flat. Carries `unrealizedPnl` for stats."""
+        for p in await self.positions():
+            if p.get("coin") == market:
+                return p
+        return None
+
+    async def cancel_all(self, market: str | None = None) -> None:
+        """Cancel this account's resting orders (optionally just one io market). Best-effort — used to
+        pull the unfilled maker leg after the position itself has been flattened."""
+        try:
+            orders = await asyncio.to_thread(self._info.open_orders, self._address, self._dex)
+        except TypeError:
+            orders = await asyncio.to_thread(self._info.open_orders, self._address)
+        for o in orders or []:
+            coin, oid = o.get("coin"), o.get("oid")
+            if oid is None or (market and coin != market):
+                continue
+            try:
+                await asyncio.to_thread(self._exchange.cancel, coin, oid)
+            except Exception:  # noqa: BLE001 — a single stuck cancel must not block the rest
+                continue
+
     async def close_market(self, market: str) -> dict:
         """Flatten one io market at market price (reduce-only, opposite side of the held size)."""
         for pos in await self.positions():

@@ -14,7 +14,13 @@ Fill-timeout rule (live): after BOTH legs are posted, we watch fills. The timeou
 least one leg has STARTED filling — because two resting orders that simply haven't been touched (the
 market didn't move) are no open position and no risk. But if one leg (partially) filled and the other
 hasn't completed within `fill_timeout`, we are exposed (naked delta), so we cancel: pull the unfilled
-order and flatten the filled leg. Live fill/PnL reads are marked VERIFY — confirm against the venues.
+order and flatten the filled leg.
+
+Live fill detection reads real positions on both venues; close is reduce-only on both (Entropy market
+close, Lighter reduce-only IOC crossing the book). PnL logged to the sheet is each leg's unrealised
+PnL read just before flattening; fee itemisation is still pending (RH-Lighter is 0%, Entropy maker is
+negligible), so the fees column is 0 for now. Field names on the Lighter position read are best-effort
+across SDK versions — confirm the numbers on the first small live run.
 """
 
 from __future__ import annotations
@@ -169,24 +175,24 @@ class SessionEngine:
             # Wait for both to fill, applying the timeout-after-first-fill rule. VERIFY the fill reads.
             ok = await self._await_fills(ent, lit, pair, e, l, cfg.get("fill_timeout", 20))
             if not ok:
-                await self._cancel_hedge(ent, lit, pair)
-                await self._store.update_hedge(hid, status="CANCELLED")
+                res = await self._cancel_hedge(ent, lit, pair)
+                await self._store.update_hedge(hid, status="CANCELLED",
+                                               realized_pnl=res["pnl"], fees=res["fees"])
                 await self._hedge_alert(cfg, owner, f"✖️ {pair.label}: одна нога не заповнилась вчасно — скасовано.")
                 await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
                                  coin=pair.label, side=side, open_status="CANCELLED", status="CANCELLED",
-                                 pnl=0.0, fees=0.0, lighter_vol=0.0, entropy_vol=0.0)
+                                 pnl=res["pnl"], fees=res["fees"], lighter_vol=0.0, entropy_vol=0.0)
                 return
             await self._store.update_hedge(hid, status="OPEN")
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (обидві ноги). Закрию через {self._fmt(hold)}.")
             await self._interruptible_sleep(sid, hold)
-            await self._close_hedge(ent, lit, pair)
-            await self._store.update_hedge(hid, status="CLOSED", entropy_vol=notional * 2, lighter_vol=notional * 2)
-            await self._hedge_alert(cfg, owner, f"✅ {pair.label} закрито.")
-            # PnL/fees reads are still VERIFY-pending on the live venues; log 0 for now so the sheet's
-            # timing/volume columns are correct and the money columns fill in once those reads land.
+            res = await self._close_hedge(ent, lit, pair)
+            await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
+                                           entropy_vol=notional * 2, lighter_vol=notional * 2)
+            await self._hedge_alert(cfg, owner, f"✅ {pair.label} закрито. PnL ≈ ${res['pnl']:g}.")
             await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
                              coin=pair.label, side=side, open_status="OK", status="CLOSED",
-                             pnl=0.0, fees=0.0, lighter_vol=notional * 2, entropy_vol=notional * 2)
+                             pnl=res["pnl"], fees=res["fees"], lighter_vol=notional * 2, entropy_vol=notional * 2)
         finally:
             with contextlib.suppress(Exception):
                 await lit.close()
@@ -196,10 +202,11 @@ class SessionEngine:
         """True once both legs are fully filled. Timeout only counts from the first partial fill."""
         deadline = None
         start = time.time()
+        e_target, l_target = e.size * 0.999, l.size * 0.999   # tolerance for size rounding
         while time.time() - start < 120:  # hard ceiling
             e_filled = await self._entropy_filled(ent, pair.entropy, e.size)
             l_filled = await self._lighter_filled(lit, l.market_index, l.size)
-            if e_filled >= e.size and l_filled >= l.size:
+            if e_filled >= e_target and l_filled >= l_target:
                 return True
             any_started = e_filled > 0 or l_filled > 0
             if any_started and deadline is None:
@@ -211,26 +218,66 @@ class SessionEngine:
 
     async def _entropy_filled(self, ent, market: str, target: float) -> float:
         with contextlib.suppress(Exception):
-            for p in await ent.positions():
-                if p.get("coin") == market:
-                    return abs(float(p.get("szi", 0)))
+            p = await ent.position(market)
+            if p:
+                return abs(float(p.get("szi", 0) or 0))
         return 0.0
 
     async def _lighter_filled(self, lit, market_index: int, target: float) -> float:
-        # VERIFY: Lighter position read shape. Best-effort; treated as unfilled on any error.
+        with contextlib.suppress(Exception):
+            pos = await lit.position(market_index)
+            if pos:
+                return float(pos.get("abs", 0) or 0)
         return 0.0
 
-    async def _cancel_hedge(self, ent, lit, pair) -> None:
-        with contextlib.suppress(Exception):
-            await ent.close_market(pair.entropy)   # flatten whatever filled
-        with contextlib.suppress(Exception):
-            await lit.cancel_all()
+    async def _cancel_hedge(self, ent, lit, pair) -> dict:
+        # Same flatten path as a normal close: flatten whatever filled on both venues and pull the
+        # unfilled maker legs, so a one-sided fill can never be left as naked delta.
+        return await self._close_hedge(ent, lit, pair)
 
-    async def _close_hedge(self, ent, lit, pair) -> None:
+    async def _close_hedge(self, ent, lit, pair) -> dict:
+        """Flatten both legs and return {pnl, fees}. PnL is each leg's unrealised PnL read just before
+        flattening (summed); RH-Lighter fees are 0% and Entropy maker fees are negligible, so fees is
+        reported 0 until per-fill fee reads are added."""
+        # Lighter market metadata + a fresh mark, for both the pnl read and the reduce-only close.
+        lmk = mark = None
+        with contextlib.suppress(Exception):
+            timeout = aiohttp.ClientTimeout(total=8, connect=5)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                lmk = (await md.lighter_markets(s, self._cfg.lighter_api_url)).get(pair.lighter)
+                if lmk:
+                    mark = await md.lighter_mark(s, self._cfg.lighter_api_url, lmk.market_id)
+
+        e_pnl = l_pnl = 0.0
+        with contextlib.suppress(Exception):
+            ep = await ent.position(pair.entropy)
+            if ep:
+                e_pnl = float(ep.get("unrealizedPnl", 0) or 0)
+        lpos = None
+        if lmk:
+            with contextlib.suppress(Exception):
+                lpos = await lit.position(lmk.market_id)
+        if lpos:
+            l_pnl = float(lpos.get("unrealized_pnl", 0) or 0)
+
+        # Flatten Entropy (reduce-only market close) and pull any resting maker remainder.
         with contextlib.suppress(Exception):
             await ent.close_market(pair.entropy)
         with contextlib.suppress(Exception):
-            await lit.cancel_all()   # VERIFY: proper reduce-only close on Lighter
+            await ent.cancel_all(pair.entropy)
+
+        # Flatten Lighter with a reduce-only IOC crossing the book, then cancel any resting order.
+        if lmk and lpos and lpos.get("abs", 0) > 0 and (mark or lpos.get("entry")):
+            ref = float(mark or lpos.get("entry"))
+            is_long = lpos["size"] > 0
+            px = ref * (0.97 if is_long else 1.03)     # aggressive so the IOC actually crosses
+            base_amount, price_int = md.lighter_amounts(lmk, lpos["abs"], px)
+            with contextlib.suppress(Exception):
+                await lit.limit_order(lmk.market_id, base_amount, price_int, is_long,
+                                      reduce_only=True, ioc=True)
+        with contextlib.suppress(Exception):
+            await lit.cancel_all()
+        return {"pnl": round(e_pnl + l_pnl, 4), "fees": 0.0}
 
     # ── shared build/clients (mirrors the bot's) ───────────────────────────────────────────────────
     async def _build_plan(self, pair, notional, entropy_long):
@@ -286,11 +333,13 @@ class SessionEngine:
                     ent = await self._entropy_client(owner)
                     lit = await self._lighter_client(owner)
                     pair = get_pair(h["pair_key"])
+                    res = {"pnl": None, "fees": None}
                     if ent and lit and pair:
-                        await self._close_hedge(ent, lit, pair)
+                        res = await self._close_hedge(ent, lit, pair)
                         with contextlib.suppress(Exception):
                             await lit.close()
-                    await self._store.update_hedge(h["id"], status="CLOSED")
+                    await self._store.update_hedge(h["id"], status="CLOSED",
+                                                   realized_pnl=res["pnl"], fees=res["fees"])
         await self._store.set_session_status(sid, "DONE")
         if self._sheets:
             with contextlib.suppress(Exception):

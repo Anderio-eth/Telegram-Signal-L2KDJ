@@ -966,22 +966,23 @@ class HedgeBot:
         pair = get_pair(h["pair_key"])
         ent = await self._entropy_client(owner)
         lit = await self._lighter_client(owner)
-        errs = []
+        res = {"pnl": None, "fees": None}
         try:
-            with __import__("contextlib").suppress(Exception):
-                await ent.close_market(pair.entropy)
-            # Lighter close: reduce-only market via cancel + opposite order is a testing-time detail;
-            # for now cancel resting orders and flag manual close of the filled size.
-            with __import__("contextlib").suppress(Exception):
-                await lit.cancel_all()
+            if ent and lit and pair and self._engine:
+                # Reuse the engine's flatten: reduce-only close on BOTH venues + pull resting orders.
+                res = await self._engine._close_hedge(ent, lit, pair)
+            elif ent and pair:
+                with contextlib.suppress(Exception):
+                    await ent.close_market(pair.entropy)
         finally:
-            with __import__("contextlib").suppress(Exception):
-                await lit.close()
+            if lit:
+                with contextlib.suppress(Exception):
+                    await lit.close()
         await self._store.mark_hedge(hedge_id, "CLOSED")
         self._bal_cache.pop(owner, None)  # balance changed — next menu refetches
-        note = "\n⚠️ Lighter: скасував ордери; закриття заповненої позиції звіримо на тесті." if not errs else ""
+        pnl_note = f"\nPnL ≈ ${res['pnl']:g}" if res.get("pnl") is not None else ""
         await update.callback_query.edit_message_text(
-            f"✅ Хедж #{hedge_id} {pair.label if pair else ''} закрито.{note}",
+            f"✅ Хедж #{hedge_id} {pair.label if pair else ''} закрито (обидві ноги).{pnl_note}",
             reply_markup=self._back(), parse_mode=ParseMode.HTML)
 
     # ── helpers ──────────────────────────────────────────────────────────────────────────────────
