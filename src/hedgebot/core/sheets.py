@@ -67,7 +67,8 @@ class SheetsLogger:
             title = await asyncio.to_thread(self._title_sync, info, spreadsheet_id)
             return True, title
         except Exception as err:  # noqa: BLE001
-            return False, str(err)[:200]
+            LOGGER.exception("gsheets test_connection failed for %s", owner_id)
+            return False, f"{type(err).__name__}: {err}"[:300]
 
     @staticmethod
     def _title_sync(info: dict, spreadsheet_id: str) -> str:

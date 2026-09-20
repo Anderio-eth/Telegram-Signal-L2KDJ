@@ -301,6 +301,8 @@ class HedgeBot:
             await self._stats_menu(update, owner)
         elif data == "stats:instr":
             await self._stats_instructions(update)
+        elif data == "stats:test":
+            await self._stats_test(update, owner)
         elif data == "unkey:gsheets":
             await self._store.delete_credentials(owner, "gsheets")
             await self._stats_menu(update, owner)
@@ -344,6 +346,7 @@ class HedgeBot:
                 "Хочеш пінги назад — увімкни «🔔 Алерти» в налаштуваннях сесії.</i>"
             )
             rows = [
+                [InlineKeyboardButton("🧪 Перевірити доступ", callback_data="stats:test")],
                 [InlineKeyboardButton("🗑 Відключити таблицю", callback_data="unkey:gsheets")],
                 [InlineKeyboardButton("ℹ️ Інструкція", callback_data="stats:instr")],
                 [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
@@ -361,6 +364,43 @@ class HedgeBot:
                 [InlineKeyboardButton("ℹ️ Інструкція", callback_data="stats:instr")],
                 [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
             ]
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+    @staticmethod
+    def _gsheets_hint(detail: str) -> str:
+        d = (detail or "").lower()
+        if "no module" in d or "modulenotfound" in d:
+            return ("Схоже, бібліотека для Google Sheets не встановлена на сервері — це на моїй "
+                    "стороні, напиши мені, я переставлю.")
+        if "has not been used" in d or "service_disabled" in d or "disabled" in d:
+            return ("Не ввімкнено <b>Google Sheets API</b>. Відкрий console.cloud.google.com → "
+                    "APIs &amp; Services → Enabled APIs → Enable APIs → знайди <b>Google Sheets API</b> → Enable.")
+        if "permission" in d or "permissiondenied" in d or "403" in d:
+            return ("Найімовірніше — <b>таблицею не поділено з сервіс-акаунтом</b>. Відкрий таблицю → "
+                    "Share → додай його email як <b>Editor</b>.")
+        if "not found" in d or "404" in d:
+            return ("Не той <b>ID таблиці</b>. Скопіюй посилання прямо з адресного рядка відкритої таблиці "
+                    "(…/spreadsheets/d/<b>ID</b>/…).")
+        if "invalid_grant" in d or "jwt" in d or "signature" in d:
+            return ("Проблема з ключем (можливо, ключ вимкнено або зіпсовано). Створи новий JSON-ключ "
+                    "сервіс-акаунта і додай його знову.")
+        return ("Перевір по черзі: (1) таблицею поділено з сервіс-акаунтом як Editor; "
+                "(2) ввімкнено Google Sheets API; (3) правильний лінк на таблицю.")
+
+    async def _stats_test(self, update: Update, owner: int) -> None:
+        await update.callback_query.edit_message_text("⏳ Перевіряю доступ до таблиці…")
+        ok, detail = (False, "рушій статистики недоступний")
+        if self._sheets:
+            ok, detail = await self._sheets.test_connection(owner)
+        if ok:
+            text = f"✅ Доступ є. Таблиця: «{html.escape(detail)}».\n\nСтатистика сесій піде туди."
+        else:
+            text = (f"❌ Немає доступу до таблиці.\n\n<b>Помилка:</b>\n<code>{html.escape(detail)}</code>\n\n"
+                    f"{self._gsheets_hint(detail)}")
+        rows = [[InlineKeyboardButton("🔁 Ще раз", callback_data="stats:test")],
+                [InlineKeyboardButton("ℹ️ Інструкція", callback_data="stats:instr")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="stats")]]
         await update.callback_query.edit_message_text(
             text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
@@ -539,11 +579,17 @@ class HedgeBot:
             if ok:
                 msg = (f"✅ Google-таблицю «{html.escape(detail)}» підключено. Статистика сесій піде туди."
                        if detail else "✅ Google-таблицю підключено. Статистика сесій піде туди.")
+                await self._refresh_menu(update, ctx, owner, msg)
             else:
-                msg = (f"⚠️ Ключ збережено, але доступу до таблиці немає:\n<code>{html.escape(detail)}</code>\n\n"
-                       f"Поділись таблицею з <code>{html.escape(email)}</code> (Editor) і перевір, що "
-                       "ввімкнено Google Sheets API, потім спробуй ще раз.")
-            await self._refresh_menu(update, ctx, owner, msg)
+                # Own screen, not folded into the menu, so the error and the fix are impossible to miss.
+                text = (f"❌ Ключ збережено, але доступу до таблиці немає.\n\n"
+                        f"<b>Помилка:</b>\n<code>{html.escape(detail)}</code>\n\n"
+                        f"{self._gsheets_hint(detail)}\n\n"
+                        f"Email сервіс-акаунта: <code>{html.escape(email)}</code>")
+                rows = [[InlineKeyboardButton("🔁 Перевірити ще раз", callback_data="stats:test")],
+                        [InlineKeyboardButton("ℹ️ Інструкція", callback_data="stats:instr")],
+                        [InlineKeyboardButton("⬅️ Меню", callback_data="menu")]]
+                await self._edit_anchor(update, ctx, text, InlineKeyboardMarkup(rows))
             return ConversationHandler.END
 
         if flow == "cfg_margin":
