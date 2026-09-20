@@ -335,8 +335,10 @@ class SessionEngine:
         c = await self._store.get_credentials(owner, "lighter")
         if not c:
             return None
-        return LighterClient(self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
-                             int(c.meta.get("api_key_index", 0)))
+        # Off the loop — SignerClient's constructor blocks; inline it would stall the tick/notifies.
+        return await asyncio.to_thread(
+            LighterClient, self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
+            int(c.meta.get("api_key_index", 0)))
 
     # ── lifecycle bits ─────────────────────────────────────────────────────────────────────────────
     async def _stopping(self, sid: int) -> bool:
@@ -344,12 +346,12 @@ class SessionEngine:
         return (fresh is None) or (fresh.get("status") == "STOPPING")
 
     async def _interruptible_sleep(self, sid: int, seconds: float) -> None:
-        """Sleep, but wake early (~every 5s) to notice a STOP so the user isn't left waiting."""
+        """Sleep, but wake often to notice a STOP so the user isn't left waiting when they hit stop."""
         end = time.time() + seconds
         while time.time() < end:
             if await self._stopping(sid):
                 return
-            await asyncio.sleep(min(5.0, end - time.time()))
+            await asyncio.sleep(min(1.5, max(0.05, end - time.time())))
 
     async def _finish(self, sid: int, owner: int) -> None:
         # Close any still-open hedge on stop, then mark the session done and report a summary.

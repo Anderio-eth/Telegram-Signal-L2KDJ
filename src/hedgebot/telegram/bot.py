@@ -186,37 +186,40 @@ class HedgeBot:
         return self._bal_cache[owner]["text"]
 
     async def _fetch_balances_text(self, owner: int) -> str:
-        """Read both venues' balances into one compact block. Each venue is guarded independently so
-        one failing client still shows the other's number instead of a stuck message."""
+        """Read both venues' balances into one compact block. The two venues are read CONCURRENTLY
+        (building a client is a network round-trip each) and guarded independently, so the refresh
+        takes as long as the slower one, not their sum."""
         fmt = lambda v: f"${v:,.2f}" if isinstance(v, (int, float)) else "—"
-        lines = ["💰 <b>Баланси</b>"]
-        try:
-            ent = await self._entropy_client(owner)
-            if not ent:
-                lines.append("🟩 Entropy: ключ не заведено")
-            else:
-                b = await ent.balance()
-                lines.append(f"🟩 Entropy (io): {fmt(b.get('total'))} · вільно {fmt(b.get('free'))}")
-        except Exception as err:  # noqa: BLE001
-            LOGGER.exception("entropy balance failed")
-            lines.append(f"🟩 Entropy: помилка — {html.escape(str(err)[:120])}")
 
-        lit = None
-        try:
-            lit = await self._lighter_client(owner)
-            if not lit:
-                lines.append("🟦 Lighter: ключ не заведено")
-            else:
+        async def entropy_line() -> str:
+            try:
+                ent = await self._entropy_client(owner)
+                if not ent:
+                    return "🟩 Entropy: ключ не заведено"
+                b = await ent.balance()
+                return f"🟩 Entropy (io): {fmt(b.get('total'))} · вільно {fmt(b.get('free'))}"
+            except Exception as err:  # noqa: BLE001
+                LOGGER.exception("entropy balance failed")
+                return f"🟩 Entropy: помилка — {html.escape(str(err)[:120])}"
+
+        async def lighter_line() -> str:
+            lit = None
+            try:
+                lit = await self._lighter_client(owner)
+                if not lit:
+                    return "🟦 Lighter: ключ не заведено"
                 b = await lit.balance()
-                lines.append(f"🟦 Lighter: {fmt(b.get('total'))} · вільно {fmt(b.get('available'))}")
-        except Exception as err:  # noqa: BLE001
-            LOGGER.exception("lighter balance failed")
-            lines.append(f"🟦 Lighter: помилка — {html.escape(str(err)[:120])}")
-        finally:
-            if lit:
-                with contextlib.suppress(Exception):
-                    await lit.close()
-        return NL.join(lines)
+                return f"🟦 Lighter: {fmt(b.get('total'))} · вільно {fmt(b.get('available'))}"
+            except Exception as err:  # noqa: BLE001
+                LOGGER.exception("lighter balance failed")
+                return f"🟦 Lighter: помилка — {html.escape(str(err)[:120])}"
+            finally:
+                if lit:
+                    with contextlib.suppress(Exception):
+                        await lit.close()
+
+        e_line, l_line = await asyncio.gather(entropy_line(), lighter_line())
+        return NL.join(["💰 <b>Баланси</b>", e_line, l_line])
 
     async def _router(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if self._guard(update) is None:
@@ -1006,5 +1009,8 @@ class HedgeBot:
         c = await self._store.get_credentials(owner, "lighter")
         if not c:
             return None
-        return LighterClient(self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
-                             int(c.meta.get("api_key_index", 0)))
+        # Build off the event loop — SignerClient's constructor does blocking setup, and running it
+        # inline froze the whole bot (every other button lagged) until it finished.
+        return await asyncio.to_thread(
+            LighterClient, self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
+            int(c.meta.get("api_key_index", 0)))
