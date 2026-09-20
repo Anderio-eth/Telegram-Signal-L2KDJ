@@ -332,7 +332,13 @@ class HedgeBot:
             return
         await update.callback_query.edit_message_text("⏳ Рахую план…")
         try:
-            plan, reason = await self._build_plan(owner, pair, notional, entropy_long)
+            plan, reason = await asyncio.wait_for(
+                self._build_plan(owner, pair, notional, entropy_long), timeout=25)
+        except asyncio.TimeoutError:
+            LOGGER.error("build_plan timed out")
+            await update.callback_query.edit_message_text(
+                "✗ Біржа не відповіла вчасно (таймаут). Спробуй ще раз.", reply_markup=self._back())
+            return
         except Exception as err:  # noqa: BLE001 — surface it instead of a silent dead button
             LOGGER.exception("build_plan failed")
             await update.callback_query.edit_message_text(
@@ -353,13 +359,21 @@ class HedgeBot:
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
     async def _build_plan(self, owner: int, pair, notional: float, entropy_long: bool):
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as s:
+        # Per-request timeout so one slow venue call can't wall the whole plan; each step is logged so
+        # a stall shows up in the logs as the last line printed.
+        timeout = aiohttp.ClientTimeout(total=8, connect=5)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            LOGGER.info("build_plan: entropy_markets…")
             emk = (await md.entropy_markets(s, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
+            LOGGER.info("build_plan: lighter_markets…")
             lmk = (await md.lighter_markets(s, self._cfg.lighter_api_url)).get(pair.lighter)
             if not emk or not lmk:
                 return None, "ринок не знайдено на одній із бірж"
+            LOGGER.info("build_plan: entropy_marks…")
             eprice = (await md.entropy_marks(s, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
+            LOGGER.info("build_plan: lighter_mark…")
             lprice = await md.lighter_mark(s, self._cfg.lighter_api_url, lmk.market_id)
+            LOGGER.info("build_plan: prices e=%s l=%s", eprice, lprice)
             if not eprice or not lprice:
                 return None, "немає ціни для однієї з бірж"
         plan = plan_hedge(pair, notional, entropy_long=entropy_long,
