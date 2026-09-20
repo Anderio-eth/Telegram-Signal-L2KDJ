@@ -110,3 +110,21 @@ class EntropyClient:
     async def set_leverage(self, market: str, leverage: int) -> dict:
         """Set isolated leverage for one io market (io markets are strictIsolated)."""
         return await asyncio.to_thread(self._exchange.update_leverage, leverage, market, False)
+
+    async def realized_since(self, market: str, start_ms: int) -> tuple[float, float]:
+        """Sum realized PnL and fees from this account's fills for one io market since `start_ms`
+        (ms). This is the exchange's own closedPnl/fee per fill — the accurate figure for a hedge
+        leg, not an unrealised estimate. Returns (pnl, fee); (0, 0) on any error."""
+        try:
+            fills = await asyncio.to_thread(self._info.user_fills, self._address)
+        except Exception:  # noqa: BLE001
+            return 0.0, 0.0
+        pnl = fee = 0.0
+        for f in fills or []:
+            if f.get("coin") != market:
+                continue
+            if int(f.get("time", 0) or 0) < start_ms - 2000:   # small buffer for clock skew
+                continue
+            pnl += float(f.get("closedPnl", 0) or 0)
+            fee += float(f.get("fee", 0) or 0)
+        return pnl, fee
