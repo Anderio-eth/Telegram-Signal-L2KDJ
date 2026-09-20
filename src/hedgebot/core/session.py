@@ -184,7 +184,7 @@ class SessionEngine:
                                       lit.order_error)
             if e_err or l_err:
                 # At least one leg didn't rest — flatten anything that did and report why.
-                await self._cancel_hedge(ent, lit, pair)
+                await self._cancel_hedge(ent, lit, pair, owner=owner)
                 await self._store.update_hedge(hid, status="FAILED")
                 parts = []
                 if e_err:
@@ -192,12 +192,15 @@ class SessionEngine:
                 if l_err:
                     parts.append(f"Lighter: {html.escape(str(l_err))}")
                 await self._say(owner, f"⛔ {pair.label}: ордер відхилено.\n" + "\n".join(parts))
+                await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+                                 coin=pair.label, side=side, open_status="FAILED", status="FAILED",
+                                 pnl=0.0, fees=0.0, lighter_vol=0.0, entropy_vol=0.0)
                 return
 
             # Wait for both to fill, applying the timeout-after-first-fill rule.
             ok = await self._await_fills(sid, ent, lit, pair, e, l, cfg.get("fill_timeout", 20))
             if not ok:
-                res = await self._cancel_hedge(ent, lit, pair)
+                res = await self._cancel_hedge(ent, lit, pair, owner=owner)
                 await self._store.update_hedge(hid, status="CANCELLED",
                                                realized_pnl=res["pnl"], fees=res["fees"])
                 await self._hedge_alert(cfg, owner, f"✖️ {pair.label}: одна нога не заповнилась вчасно — скасовано.")
@@ -208,7 +211,7 @@ class SessionEngine:
             await self._store.update_hedge(hid, status="OPEN")
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (обидві ноги). Закрию через {self._fmt(hold)}.")
             await self._interruptible_sleep(sid, hold)
-            res = await self._close_hedge(ent, lit, pair)
+            res = await self._close_hedge(ent, lit, pair, owner=owner)
             await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
                                            entropy_vol=notional * 2, lighter_vol=notional * 2)
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} закрито. PnL ≈ ${res['pnl']:g}.")
@@ -269,16 +272,16 @@ class SessionEngine:
                 return float(pos.get("abs", 0) or 0)
         return 0.0
 
-    async def _cancel_hedge(self, ent, lit, pair) -> dict:
+    async def _cancel_hedge(self, ent, lit, pair, owner=None) -> dict:
         # Same flatten path as a normal close: flatten whatever filled on both venues and pull the
         # unfilled maker legs, so a one-sided fill can never be left as naked delta.
-        return await self._close_hedge(ent, lit, pair)
+        return await self._close_hedge(ent, lit, pair, owner=owner)
 
-    async def _close_hedge(self, ent, lit, pair) -> dict:
-        """Flatten both legs and return {pnl, fees}. PnL is each leg's unrealised PnL read just before
-        flattening (summed); RH-Lighter fees are 0% and Entropy maker fees are negligible, so fees is
-        reported 0 until per-fill fee reads are added."""
-        # Lighter market metadata + a fresh mark, for both the pnl read and the reduce-only close.
+    async def _close_hedge(self, ent, lit, pair, owner=None) -> dict:
+        """Flatten both legs and return {pnl, fees, errors}. PnL is each leg's unrealised PnL read just
+        before flattening. Any close that fails is reported (returned + optionally messaged to owner),
+        never swallowed — a leg left open ties up margin and blocks the next hedge."""
+        errors: list[str] = []
         lmk = mark = None
         with contextlib.suppress(Exception):
             timeout = aiohttp.ClientTimeout(total=8, connect=5)
@@ -292,12 +295,11 @@ class SessionEngine:
             ep = await ent.position(pair.entropy)
             if ep:
                 e_pnl = float(ep.get("unrealizedPnl", 0) or 0)
-        lpos = None
         if lmk:
             with contextlib.suppress(Exception):
-                lpos = await lit.position(lmk.market_id)
-        if lpos:
-            l_pnl = float(lpos.get("unrealized_pnl", 0) or 0)
+                lp = await lit.position(lmk.market_id)
+                if lp:
+                    l_pnl = float(lp.get("unrealized_pnl", 0) or 0)
 
         # Flatten Entropy (reduce-only market close) and pull any resting maker remainder.
         with contextlib.suppress(Exception):
@@ -305,18 +307,47 @@ class SessionEngine:
         with contextlib.suppress(Exception):
             await ent.cancel_all(pair.entropy)
 
-        # Flatten Lighter with a reduce-only IOC crossing the book, then cancel any resting order.
-        if lmk and lpos and lpos.get("abs", 0) > 0 and (mark or lpos.get("entry")):
-            ref = float(mark or lpos.get("entry"))
-            is_long = lpos["size"] > 0
-            px = ref * (0.97 if is_long else 1.03)     # aggressive so the IOC actually crosses
-            base_amount, price_int = md.lighter_amounts(lmk, lpos["abs"], px)
-            with contextlib.suppress(Exception):
-                await lit.limit_order(lmk.market_id, base_amount, price_int, is_long,
-                                      reduce_only=True, ioc=True)
+        # Flatten Lighter reduce-only, checking the result and retrying more aggressively.
+        if lmk:
+            err = await self._close_lighter(lit, lmk, mark)
+            if err:
+                errors.append(f"Lighter не закрився: {err}")
         with contextlib.suppress(Exception):
             await lit.cancel_all()
-        return {"pnl": round(e_pnl + l_pnl, 4), "fees": 0.0}
+
+        if owner and errors:
+            await self._say(owner, f"⚠️ {pair.label}: " + "; ".join(html.escape(str(e)) for e in errors))
+        return {"pnl": round(e_pnl + l_pnl, 4), "fees": 0.0, "errors": errors}
+
+    async def _close_lighter(self, lit, lmk, mark) -> str | None:
+        """Reduce-only close crossing the book (IOC). Returns None once flat, or an error string if the
+        position is still open after retries — so the caller can surface it instead of hiding it."""
+        for attempt in range(2):
+            pos = None
+            with contextlib.suppress(Exception):
+                pos = await lit.position(lmk.market_id)
+            if not pos or pos.get("abs", 0) <= 0:
+                return None                                  # already flat
+            ref = float(mark or pos.get("entry") or 0)
+            if ref <= 0:
+                return "немає ціни для закриття"
+            is_long = pos["size"] > 0
+            off = 0.02 * (attempt + 1)                        # 2% then 4% — cross for sure
+            px = ref * (1 - off if is_long else 1 + off)
+            base_amount, price_int = md.lighter_amounts(lmk, pos["abs"], px)
+            try:
+                resp = await lit.limit_order(lmk.market_id, base_amount, price_int, is_long,
+                                             reduce_only=True, ioc=True)
+                err = lit.order_error(resp)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)[:200]
+            if err:
+                return err
+            await asyncio.sleep(1)                             # let the fill settle, then re-read
+        pos = None
+        with contextlib.suppress(Exception):
+            pos = await lit.position(lmk.market_id)
+        return "позиція ще відкрита після закриття" if (pos and pos.get("abs", 0) > 0) else None
 
     # ── shared build/clients (mirrors the bot's) ───────────────────────────────────────────────────
     async def _build_plan(self, pair, notional, entropy_long):
@@ -391,7 +422,7 @@ class SessionEngine:
                     pair = get_pair(key)
                     if ent and lit and pair:
                         with contextlib.suppress(Exception):
-                            await self._close_hedge(ent, lit, pair)
+                            await self._close_hedge(ent, lit, pair, owner=owner)
             finally:
                 if lit:
                     with contextlib.suppress(Exception):

@@ -24,6 +24,10 @@ class LighterClient:
     TIF_IOC = 0
     TIF_GTT = 1
     TIF_POST_ONLY = 2
+    # order_expiry MUST match the TIF: IOC needs 0, GTT/post-only the 28-day sentinel. Sending an IOC
+    # with the 28-day expiry gets the order rejected — which silently broke reduce-only closing.
+    IOC_EXPIRY = 0
+    GTT_EXPIRY = -1
 
     def __init__(self, api_url: str, account_index: int, api_key_private_key: str,
                  api_key_index: int = 0) -> None:
@@ -130,6 +134,7 @@ class LighterClient:
         `price` are already integer-scaled for this market. `ioc` crosses now-or-cancels the rest
         (used with a deliberately aggressive price + reduce_only to flatten a leg)."""
         tif = self.TIF_IOC if ioc else (self.TIF_POST_ONLY if post_only else self.TIF_GTT)
+        order_expiry = self.IOC_EXPIRY if ioc else self.GTT_EXPIRY
         return await self._signer.create_order(
             market_index=market_index,
             client_order_index=client_order_index,
@@ -139,6 +144,7 @@ class LighterClient:
             order_type=self.ORDER_TYPE_LIMIT,
             time_in_force=tif,
             reduce_only=reduce_only,
+            order_expiry=order_expiry,
             api_key_index=self._api_key_index,
         )
 

@@ -990,7 +990,7 @@ class HedgeBot:
         res = {"pnl": None, "fees": None}
         if ent and lit and pair and self._engine:
             # Reuse the engine's flatten: reduce-only close on BOTH venues + pull resting orders.
-            res = await self._engine._close_hedge(ent, lit, pair)
+            res = await self._engine._close_hedge(ent, lit, pair, owner=owner)
         elif ent and pair:
             with contextlib.suppress(Exception):
                 await ent.close_market(pair.entropy)
