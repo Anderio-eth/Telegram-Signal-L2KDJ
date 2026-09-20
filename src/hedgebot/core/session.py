@@ -54,12 +54,26 @@ class SessionEngine:
         self._tasks: dict[int, asyncio.Task] = {}
 
     async def start(self) -> None:
-        """Resume any session that was RUNNING before the restart."""
+        """Resume RUNNING sessions after a restart — but only ONE per owner. Earlier double-taps can
+        leave several RUNNING rows for the same user; resuming them all would recreate the margin
+        fight, so keep the newest and retire the rest."""
+        seen: set[int] = set()
         for s in await self._store.running_sessions():
+            owner = s.get("owner_id")
+            if owner in seen:
+                with contextlib.suppress(Exception):
+                    await self._store.set_session_status(s["id"], "STOPPED")  # retire the duplicate
+                continue
+            seen.add(owner)
             self._spawn(s)
         LOGGER.info("session engine started; resumed %d session(s)", len(self._tasks))
 
     async def start_session(self, owner_id: int, config: dict) -> int:
+        # Guard against stacking (double-tap / race): one running session per owner. Concurrent
+        # sessions fight over the same margin and flood "not enough margin".
+        existing = await self._store.active_session(owner_id)
+        if existing and existing.get("status") == "RUNNING":
+            return existing["id"]
         sid = await self._store.create_session(owner_id, config)
         self._spawn({"id": sid, "owner_id": owner_id, "config": config})
         return sid
@@ -112,6 +126,7 @@ class SessionEngine:
                     await self._interruptible_sleep(sid, 5)
                 if await self._stopping(sid):
                     break
+                await self._interruptible_sleep(sid, 5)   # small gap so a failing cycle can't tight-loop/spam
                 if cfg.get("pause_on"):
                     pause = random.uniform(cfg.get("pause_min", 300), cfg.get("pause_max", 1800))
                     await self._hedge_alert(cfg, owner, f"⏸ Пауза {self._fmt(pause)} до наступного хеджа.")

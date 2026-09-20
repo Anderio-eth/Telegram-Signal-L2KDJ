@@ -808,6 +808,13 @@ class HedgeBot:
 
     async def _sess_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
         s = ctx.chat_data.get("sess", dict(SESS_DEFAULT))
+        # Never stack sessions — two sessions fight over the same margin (the "not enough margin"
+        # flood). If one is already running, just show it.
+        active = await self._store.active_session(owner)
+        if active:
+            await update.callback_query.answer("Сесія вже активна — спершу зупини її.", show_alert=True)
+            await self._sess_active(update, ctx, active)
+            return
         if not s["coins"]:
             await update.callback_query.answer("Обери хоча б одну монету", show_alert=True)
             return
@@ -819,10 +826,17 @@ class HedgeBot:
         await self._sess_open(update, ctx, owner)
 
     async def _sess_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
-        active = await self._store.active_session(owner)
-        if active and self._engine:
-            await self._engine.stop_session(active["id"])
-            await update.callback_query.answer("⏹ Зупиняю (закриваю позиції)…", show_alert=True)
+        # Stop EVERY running session for this owner — earlier double-taps may have stacked several,
+        # and the user expects "Стоп" to wind them all down and flatten everything.
+        stopped = 0
+        if self._engine:
+            for srow in await self._store.running_sessions():
+                if srow.get("owner_id") == owner:
+                    await self._engine.stop_session(srow["id"])
+                    stopped += 1
+        await update.callback_query.answer(
+            f"⏹ Зупиняю {stopped} сесі(ю/ї), закриваю позиції…" if stopped else "Немає активних сесій",
+            show_alert=True)
         await self._sess_open(update, ctx, owner)
 
     async def _preview(self, update: Update, ctx, owner: int) -> None:
