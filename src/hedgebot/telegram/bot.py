@@ -1036,10 +1036,10 @@ class HedgeBot:
         c = await self._store.get_credentials(owner, "lighter")
         if not c:
             return None
-        # Build off the event loop — SignerClient's constructor does blocking setup, and running it
-        # inline froze the whole bot (every other button lagged) until it finished.
-        client = await asyncio.to_thread(
-            LighterClient, self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
-            int(c.meta.get("api_key_index", 0)))
+        # MUST build on the event loop: the Lighter SDK creates an aiohttp connector in its
+        # constructor (asyncio.get_running_loop()), so a worker thread raised "no running event loop".
+        # The constructor does no network, and clients are cached, so building inline is fine.
+        client = LighterClient(self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
+                               int(c.meta.get("api_key_index", 0)))
         self._cache_put(owner, "lighter", client)
         return client

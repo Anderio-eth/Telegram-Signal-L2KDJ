@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 import random
 import time
@@ -101,7 +102,14 @@ class SessionEngine:
             while time.time() < ends_at:
                 if await self._stopping(sid):
                     break
-                await self._one_cycle(owner, sid, cfg)
+                try:
+                    await self._one_cycle(owner, sid, cfg)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — one bad cycle must not end the whole session
+                    LOGGER.exception("cycle failed in session %s", sid)
+                    await self._say(owner, "⚠️ Цикл впав з помилкою — сесія триває, пробую далі.")
+                    await self._interruptible_sleep(sid, 5)
                 if await self._stopping(sid):
                     break
                 if cfg.get("pause_on"):
@@ -151,7 +159,7 @@ class SessionEngine:
         plan = await self._build_plan(pair, notional, entropy_long)
         if plan is None or not plan.ok:
             why = plan.errors[0] if (plan and plan.errors) else "не вдалось скласти план"
-            await self._say(owner, f"⚠️ {pair.label}: {why} — пропускаю цикл.")
+            await self._say(owner, f"⚠️ {pair.label}: {html.escape(str(why))} — пропускаю цикл.")
             return
         close_at = opened_at + timedelta(seconds=hold)
         hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPENING",
@@ -180,9 +188,9 @@ class SessionEngine:
                 await self._store.update_hedge(hid, status="FAILED")
                 parts = []
                 if e_err:
-                    parts.append(f"Entropy: {e_err}")
+                    parts.append(f"Entropy: {html.escape(str(e_err))}")
                 if l_err:
-                    parts.append(f"Lighter: {l_err}")
+                    parts.append(f"Lighter: {html.escape(str(l_err))}")
                 await self._say(owner, f"⛔ {pair.label}: ордер відхилено.\n" + "\n".join(parts))
                 return
 
@@ -339,10 +347,12 @@ class SessionEngine:
         c = await self._store.get_credentials(owner, "lighter")
         if not c:
             return None
-        # Off the loop — SignerClient's constructor blocks; inline it would stall the tick/notifies.
-        return await asyncio.to_thread(
-            LighterClient, self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
-            int(c.meta.get("api_key_index", 0)))
+        # MUST build on the event loop: the Lighter SDK creates an aiohttp connector in its
+        # constructor, which calls asyncio.get_running_loop() — a worker thread has none, so
+        # to_thread here raised "no running event loop" and killed every Lighter action. The
+        # constructor does no network, so building inline is cheap.
+        return LighterClient(self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
+                             int(c.meta.get("api_key_index", 0)))
 
     # ── lifecycle bits ─────────────────────────────────────────────────────────────────────────────
     async def _stopping(self, sid: int) -> bool:
