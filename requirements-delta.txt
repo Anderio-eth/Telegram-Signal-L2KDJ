@@ -8,3 +8,6 @@ hyperliquid-python-sdk>=0.19.0
 # Import name stays `lighter`. Requires Python ≥3.8, so fine on the 3.14 worker.
 git+https://github.com/elliottech/lighter-python.git
 eth-account>=0.13.0
+# Per-session stats to the user's own Google Sheet (service-account auth). gspread pulls google-auth.
+gspread>=6.0.0
+google-auth>=2.20.0

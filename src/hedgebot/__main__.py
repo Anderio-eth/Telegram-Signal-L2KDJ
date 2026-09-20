@@ -14,6 +14,7 @@ from telegram.ext import Application
 from .config import Config
 from .core.crypto import CredentialCipher
 from .core.session import SessionEngine
+from .core.sheets import SheetsLogger
 from .db.store import Store
 from .telegram.bot import HedgeBot
 
@@ -51,7 +52,7 @@ def main() -> None:
     async def notify(owner_id: int, text: str) -> None:
         await app.bot.send_message(chat_id=owner_id, text=text, parse_mode=ParseMode.HTML)
 
-    engine = SessionEngine(store, cfg, notify=notify)
+    engine = SessionEngine(store, cfg, notify=notify, sheets=SheetsLogger(store))
     app.bot_data["store"] = store
     app.bot_data["engine"] = engine
     app.add_error_handler(_on_error)

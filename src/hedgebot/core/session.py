@@ -24,6 +24,7 @@ import contextlib
 import logging
 import random
 import time
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -37,10 +38,11 @@ LOGGER = logging.getLogger(__name__)
 
 
 class SessionEngine:
-    def __init__(self, store, cfg, notify=None) -> None:
+    def __init__(self, store, cfg, notify=None, sheets=None) -> None:
         self._store = store
         self._cfg = cfg
         self._notify = notify                       # async (owner_id, text) -> None
+        self._sheets = sheets                       # SheetsLogger | None — per-session stats to a sheet
         self._tasks: dict[int, asyncio.Task] = {}
 
     async def start(self) -> None:
@@ -68,11 +70,25 @@ class SessionEngine:
             with contextlib.suppress(Exception):
                 await self._notify(owner_id, text)
 
+    async def _hedge_alert(self, cfg: dict, owner_id: int, text: str) -> None:
+        """Per-hedge open/close chatter. Off by default (stats go to the sheet instead of the chat);
+        the user can flip `notify_each` on in the session config if they want the pings back."""
+        if cfg.get("notify_each"):
+            await self._say(owner_id, text)
+
+    async def _stat(self, owner_id: int, sid: int, **row) -> None:
+        if self._sheets:
+            with contextlib.suppress(Exception):
+                await self._sheets.append_hedge(owner_id, sid, row)
+
     # ── the loop ─────────────────────────────────────────────────────────────────────────────────
     async def _run(self, s: dict) -> None:
         sid, owner, cfg = s["id"], s["owner_id"], s["config"]
         ends_at = time.time() + float(cfg.get("duration", 86400))
         mode = "DRY-RUN" if cfg.get("dry_run", True) else "LIVE"
+        if self._sheets:
+            with contextlib.suppress(Exception):
+                await self._sheets.ensure_sheet(owner, sid)
         await self._say(owner, f"▶️ Сесію запущено ({mode}). Триватиме ~{self._fmt(cfg.get('duration',86400))}.")
         try:
             while time.time() < ends_at:
@@ -83,7 +99,7 @@ class SessionEngine:
                     break
                 if cfg.get("pause_on"):
                     pause = random.uniform(cfg.get("pause_min", 300), cfg.get("pause_max", 1800))
-                    await self._say(owner, f"⏸ Пауза {self._fmt(pause)} до наступного хеджа.")
+                    await self._hedge_alert(cfg, owner, f"⏸ Пауза {self._fmt(pause)} до наступного хеджа.")
                     await self._interruptible_sleep(sid, pause)
         except asyncio.CancelledError:
             raise
@@ -104,26 +120,31 @@ class SessionEngine:
         side = "LONG" if entropy_long else "SHORT"
 
         if cfg.get("dry_run", True):
+            opened_at = datetime.now(timezone.utc)
             hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPEN",
                                               {"mode": "dry"})
-            await self._say(owner, f"🧪 [dry] Відкрив {pair.label} Entropy {side} ${notional:g}. "
-                                   f"Закрию через {self._fmt(hold)}.")
+            await self._hedge_alert(cfg, owner, f"🧪 [dry] Відкрив {pair.label} Entropy {side} ${notional:g}. "
+                                                f"Закрию через {self._fmt(hold)}.")
             await self._interruptible_sleep(sid, hold)
             await self._store.update_hedge(hid, status="CLOSED", realized_pnl=0.0, fees=0.0,
                                            entropy_vol=notional * 2, lighter_vol=notional * 2)
-            await self._say(owner, f"🧪 [dry] Закрив {pair.label}. (симуляція)")
+            await self._hedge_alert(cfg, owner, f"🧪 [dry] Закрив {pair.label}. (симуляція)")
+            await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+                             coin=pair.label, side=side, open_status="OK", status="CLOSED (dry)",
+                             pnl=0.0, fees=0.0, lighter_vol=notional * 2, entropy_vol=notional * 2)
             return
 
         # ── live ──────────────────────────────────────────────────────────────────────────────────
         await self._live_cycle(owner, sid, pair, leverage, notional, entropy_long, hold, cfg)
 
     async def _live_cycle(self, owner, sid, pair, leverage, notional, entropy_long, hold, cfg) -> None:
+        side = "LONG" if entropy_long else "SHORT"
+        opened_at = datetime.now(timezone.utc)
         plan = await self._build_plan(pair, notional, entropy_long)
         if plan is None or not plan.ok:
             await self._say(owner, f"⚠️ {pair.label}: не вдалось скласти план — пропускаю цикл.")
             return
-        hid = await self._store.new_hedge(owner, sid, pair.key, notional,
-                                          "LONG" if entropy_long else "SHORT", "OPENING", {})
+        hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPENING", {})
         ent = await self._entropy_client(owner)
         lit = await self._lighter_client(owner)
         if not ent or not lit:
@@ -147,14 +168,22 @@ class SessionEngine:
             if not ok:
                 await self._cancel_hedge(ent, lit, pair)
                 await self._store.update_hedge(hid, status="CANCELLED")
-                await self._say(owner, f"✖️ {pair.label}: одна нога не заповнилась вчасно — хедж скасовано.")
+                await self._hedge_alert(cfg, owner, f"✖️ {pair.label}: одна нога не заповнилась вчасно — скасовано.")
+                await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+                                 coin=pair.label, side=side, open_status="CANCELLED", status="CANCELLED",
+                                 pnl=0.0, fees=0.0, lighter_vol=0.0, entropy_vol=0.0)
                 return
             await self._store.update_hedge(hid, status="OPEN")
-            await self._say(owner, f"✅ {pair.label} відкрито (обидві ноги). Закрию через {self._fmt(hold)}.")
+            await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (обидві ноги). Закрию через {self._fmt(hold)}.")
             await self._interruptible_sleep(sid, hold)
             await self._close_hedge(ent, lit, pair)
             await self._store.update_hedge(hid, status="CLOSED", entropy_vol=notional * 2, lighter_vol=notional * 2)
-            await self._say(owner, f"✅ {pair.label} закрито.")
+            await self._hedge_alert(cfg, owner, f"✅ {pair.label} закрито.")
+            # PnL/fees reads are still VERIFY-pending on the live venues; log 0 for now so the sheet's
+            # timing/volume columns are correct and the money columns fill in once those reads land.
+            await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+                             coin=pair.label, side=side, open_status="OK", status="CLOSED",
+                             pnl=0.0, fees=0.0, lighter_vol=notional * 2, entropy_vol=notional * 2)
         finally:
             with contextlib.suppress(Exception):
                 await lit.close()
@@ -260,6 +289,13 @@ class SessionEngine:
                             await lit.close()
                     await self._store.update_hedge(h["id"], status="CLOSED")
         await self._store.set_session_status(sid, "DONE")
+        if self._sheets:
+            with contextlib.suppress(Exception):
+                closed = [h for h in await self._store.session_hedges(sid) if h["status"] == "CLOSED"]
+                rows = [{"pnl": h.get("realized_pnl"), "fees": h.get("fees"),
+                         "lighter_vol": h.get("lighter_vol"), "entropy_vol": h.get("entropy_vol")}
+                        for h in closed]
+                await self._sheets.append_totals(owner, sid, rows)
         await self._say(owner, await self._summary(sid))
 
     async def _summary(self, sid: int) -> str:

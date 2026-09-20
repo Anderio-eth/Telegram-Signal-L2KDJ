@@ -13,12 +13,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
 import aiohttp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
@@ -36,12 +40,13 @@ from ..pairs import PAIRS, get as get_pair
 LOGGER = logging.getLogger(__name__)
 ASK = 1  # single conversation state for all free-text prompts
 NL = "\n"
+MENU_BTN = "☰ Меню"  # the one persistent reply-keyboard button, always at the bottom of the chat
 
 
 SESS_DEFAULT = {
     "coins": [PAIRS[0].key], "leverage": 3, "margin": 5.0,
     "hold_min": 1800, "hold_max": 7200, "pause_on": False, "pause_min": 300, "pause_max": 1800,
-    "duration": 86400, "fill_timeout": 20, "dry_run": True,
+    "duration": 86400, "fill_timeout": 20, "dry_run": True, "notify_each": False,
 }
 
 
@@ -60,7 +65,7 @@ class HedgeBot:
     def register(self, app: Application) -> None:
         app.add_handler(CommandHandler("start", self._start))
         app.add_handler(ConversationHandler(
-            entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy)|cfg:margin|sess:(hold|pause|timeout|margin))$")],
+            entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy|gsheets)|cfg:margin|sess:(hold|pause|timeout|margin))$")],
             states={ASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_input)]},
             fallbacks=[CallbackQueryHandler(self._menu, pattern=r"^menu$")],
             per_message=False,
@@ -74,10 +79,29 @@ class HedgeBot:
     async def _stray_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if self._guard(update) is None:
             return
+        text = (update.message.text or "").strip()
         with contextlib.suppress(Exception):
             await update.message.delete()
+        if text == MENU_BTN:
+            await self._reanchor_menu(update, ctx, update.effective_user.id)
+            return
         await self._refresh_menu(update, ctx, update.effective_user.id,
                                  "⌨️ Керуй кнопками. Щоб відкрити хедж — тисни «📈 Відкрити хедж».")
+
+    @staticmethod
+    def _reply_kb() -> ReplyKeyboardMarkup:
+        # One button that lives at the bottom of the chat for good, so the menu is always one tap away
+        # no matter how far the anchor has scrolled up.
+        return ReplyKeyboardMarkup([[KeyboardButton(MENU_BTN)]], resize_keyboard=True, is_persistent=True)
+
+    async def _reanchor_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
+        """Drop the old anchor and post a fresh main menu at the bottom of the chat."""
+        old = ctx.chat_data.get("menu_msg_id")
+        if old:
+            with contextlib.suppress(Exception):
+                await ctx.bot.delete_message(update.effective_chat.id, old)
+        m = await update.effective_chat.send_message(**await self._main_menu(owner))
+        ctx.chat_data["menu_msg_id"] = m.message_id
 
     def _guard(self, update: Update) -> int | None:
         uid = update.effective_user.id if update.effective_user else None
@@ -90,6 +114,11 @@ class HedgeBot:
         if self._guard(update) is None:
             await update.message.reply_text("⛔ Доступ обмежено.")
             return
+        # Establish the persistent bottom keyboard, then delete its carrier — the keyboard stays put
+        # even without the message, so nothing lingers in the chat.
+        with contextlib.suppress(Exception):
+            carrier = await update.message.reply_text("⌨️", reply_markup=self._reply_kb())
+            await carrier.delete()
         m = await update.message.reply_text(**await self._main_menu(update.effective_user.id))
         ctx.chat_data["menu_msg_id"] = m.message_id      # the single message we keep and edit
         with contextlib.suppress(Exception):
@@ -139,6 +168,7 @@ class HedgeBot:
             [InlineKeyboardButton("🔑 Ключі", callback_data="keys")],
             [InlineKeyboardButton("📈 Відкрити хедж (ручний)", callback_data="open")],
             [InlineKeyboardButton("🤖 Авто-сесія", callback_data="sess")],
+            [InlineKeyboardButton("📊 Статистика (Google Sheets)", callback_data="stats")],
             [InlineKeyboardButton("📂 Позиції / Закрити", callback_data="positions")],
         ]
         return {"text": text, "reply_markup": InlineKeyboardMarkup(rows), "parse_mode": ParseMode.HTML}
@@ -200,7 +230,7 @@ class HedgeBot:
             await q.edit_message_text(**await self._main_menu(owner))
         elif data == "keys":
             await self._keys_menu(update, owner)
-        elif data.startswith("unkey:"):
+        elif data.startswith("unkey:") and data != "unkey:gsheets":
             venue = data.split(":", 1)[1]
             await self._store.delete_credentials(owner, venue)
             self._bal_cache.pop(owner, None)
@@ -258,10 +288,21 @@ class HedgeBot:
         elif data == "sess:dry":
             ctx.chat_data["sess"]["dry_run"] = not ctx.chat_data["sess"]["dry_run"]
             await self._sess_config(update, ctx)
+        elif data == "sess:notify":
+            s = ctx.chat_data.setdefault("sess", dict(SESS_DEFAULT))
+            s["notify_each"] = not s.get("notify_each", False)
+            await self._sess_config(update, ctx)
         elif data == "sess:start":
             await self._sess_start(update, ctx, owner)
         elif data == "sess:stop":
             await self._sess_stop(update, ctx, owner)
+        elif data == "stats":
+            await self._stats_menu(update, owner)
+        elif data == "stats:instr":
+            await self._stats_instructions(update)
+        elif data == "unkey:gsheets":
+            await self._store.delete_credentials(owner, "gsheets")
+            await self._stats_menu(update, owner)
         elif data == "positions":
             await self._positions(update, owner)
         elif data.startswith("close:"):
@@ -284,6 +325,65 @@ class HedgeBot:
                                   callback_data="unkey:entropy" if has_e else "key:entropy")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
         ]
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+    # ── stats / Google Sheets ──────────────────────────────────────────────────────────────────────
+    async def _stats_menu(self, update: Update, owner: int) -> None:
+        creds = await self._store.get_credentials(owner, "gsheets")
+        if creds:
+            email = creds.meta.get("client_email", "—")
+            text = (
+                "📊 <b>Статистика — Google Sheets</b>\n\n"
+                "✅ Таблицю підключено.\n"
+                f"Сервісний акаунт: <code>{html.escape(str(email))}</code>\n\n"
+                "На кожну авто-сесію бот створює вкладку «Сесія N» і пише туди по рядку на кожен хедж "
+                "(час, статус, PnL, комісії, обсяги) + підсумковий рядок.\n\n"
+                "<i>Саме тому в чат не сиплються алерти на кожен вхід/вихід — усе йде в таблицю. "
+                "Хочеш пінги назад — увімкни «🔔 Алерти» в налаштуваннях сесії.</i>"
+            )
+            rows = [
+                [InlineKeyboardButton("🗑 Відключити таблицю", callback_data="unkey:gsheets")],
+                [InlineKeyboardButton("ℹ️ Інструкція", callback_data="stats:instr")],
+                [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
+            ]
+        else:
+            text = (
+                "📊 <b>Статистика — Google Sheets</b>\n\n"
+                "❌ Таблицю ще не підключено.\n\n"
+                "Підключиш свою Google-таблицю — і бот вестиме туди повну статистику сесій "
+                "(окрема вкладка на сесію, рядок на кожен хедж + підсумки), а в чат не спамитиме.\n\n"
+                "Тисни «ℹ️ Інструкція» — там покроково, де взяти ключ."
+            )
+            rows = [
+                [InlineKeyboardButton("➕ Підключити таблицю", callback_data="key:gsheets")],
+                [InlineKeyboardButton("ℹ️ Інструкція", callback_data="stats:instr")],
+                [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
+            ]
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+    async def _stats_instructions(self, update: Update) -> None:
+        text = (
+            "ℹ️ <b>Як підключити Google-таблицю (5 хв, безкоштовно)</b>\n\n"
+            "1️⃣ Зайди на <b>console.cloud.google.com</b> → створи проєкт (будь-яку назву).\n"
+            "2️⃣ У пошуку зверху знайди <b>Google Sheets API</b> → <b>Enable</b>.\n"
+            "3️⃣ Меню → <b>APIs &amp; Services → Credentials → Create credentials → "
+            "Service account</b>. Назву будь-яку, ролі можна пропустити → <b>Done</b>.\n"
+            "4️⃣ Відкрий створений сервіс-акаунт → вкладка <b>Keys → Add key → Create new key → "
+            "JSON</b>. Завантажиться <b>.json</b> файл — це і є ключ.\n"
+            "5️⃣ Створи звичайну <b>Google-таблицю</b> (sheets.new). Скопіюй <b>email сервіс-акаунта</b> "
+            "(вигляд <code>...@...gserviceaccount.com</code>, він у тому ж json, поле "
+            "<code>client_email</code>) і <b>поділись</b> таблицею з ним як <b>Editor</b> "
+            "(кнопка Share).\n\n"
+            "6️⃣ Повертайся сюди → «➕ Підключити таблицю»:\n"
+            "  • спершу надішли <b>вміст .json файлу</b> (відкрий його блокнотом, скопіюй усе, встав "
+            "одним повідомленням);\n"
+            "  • потім надішли <b>посилання на таблицю</b> (або її ID).\n\n"
+            "⚠️ JSON — це секрет; бот його шифрує. Після додавання я одразу видаляю твоє повідомлення."
+        )
+        rows = [[InlineKeyboardButton("➕ Підключити таблицю", callback_data="key:gsheets")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="stats")]]
         await update.callback_query.edit_message_text(
             text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
@@ -312,6 +412,14 @@ class HedgeBot:
                 "Надішли <b>адресу свого ОСНОВНОГО гаманця</b> (0x…) — того, яким депозитив USDC на "
                 "entropy.io. Просто адреса, не ключ.",
                 reply_markup=self._cancel_kb(), parse_mode=ParseMode.HTML)
+        elif data == "key:gsheets":
+            ctx.user_data.clear()
+            ctx.user_data.update(flow="key_gsheets", step=0)
+            await update.callback_query.edit_message_text(
+                "📊 <b>Google Sheets — крок 1/2</b>\n\nНадішли <b>весь вміст .json файлу</b> сервіс-акаунта "
+                "(відкрий його блокнотом, скопіюй усе й встав одним повідомленням).",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="stats")]]),
+                parse_mode=ParseMode.HTML)
         elif data == "cfg:margin":
             ctx.user_data.clear()
             ctx.user_data["flow"] = "cfg_margin"
@@ -344,8 +452,12 @@ class HedgeBot:
         # single anchor message, so nothing new is ever left in the chat.
         with contextlib.suppress(Exception):
             await update.message.delete()
-        flow = ctx.user_data.get("flow")
         owner = update.effective_user.id
+        if text == MENU_BTN:            # bottom keyboard tapped mid-flow — bail out to the menu
+            ctx.user_data.clear()
+            await self._reanchor_menu(update, ctx, owner)
+            return ConversationHandler.END
+        flow = ctx.user_data.get("flow")
 
         if flow == "key_lighter":
             step = ctx.user_data["step"]
@@ -384,6 +496,41 @@ class HedgeBot:
             ctx.user_data.clear()
             self._bal_cache.pop(owner, None)
             await self._refresh_menu(update, ctx, owner, "✅ Entropy збережено.")
+            return ConversationHandler.END
+
+        if flow == "key_gsheets":
+            back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="stats")]])
+            if ctx.user_data["step"] == 0:
+                try:
+                    info = json.loads(text)
+                    email = info.get("client_email")
+                    if not email or "private_key" not in info:
+                        raise ValueError
+                except (ValueError, TypeError):
+                    await self._edit_anchor(update, ctx,
+                        "Це не схоже на JSON сервіс-акаунта (має бути з полями <code>client_email</code> "
+                        "та <code>private_key</code>). Скопіюй увесь файл і надішли ще раз:", back)
+                    return ASK
+                ctx.user_data.update(gs_json=text, gs_email=email, step=1)
+                await self._edit_anchor(update, ctx,
+                    "📊 <b>Google Sheets — крок 2/2</b>\n\n✅ Ключ прийнято.\n"
+                    f"Не забудь <b>поділитись таблицею</b> з <code>{html.escape(email)}</code> (Editor).\n\n"
+                    "Тепер надішли <b>посилання на таблицю</b> (або її ID):", back)
+                return ASK
+            # step 1 — extract the spreadsheet id from a full URL or a bare id
+            m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", text)
+            spreadsheet_id = m.group(1) if m else text.strip()
+            if not re.fullmatch(r"[a-zA-Z0-9_-]{20,}", spreadsheet_id):
+                await self._edit_anchor(update, ctx,
+                    "Не розібрав ID таблиці. Надішли повне посилання (…/spreadsheets/d/<b>ID</b>/…) "
+                    "або сам ID:", back)
+                return ASK
+            await self._store.set_credentials(
+                owner, "gsheets", ctx.user_data["gs_json"],
+                {"spreadsheet_id": spreadsheet_id, "client_email": ctx.user_data["gs_email"]})
+            ctx.user_data.clear()
+            await self._refresh_menu(update, ctx, owner,
+                                     "✅ Google-таблицю підключено. Статистика сесій піде туди.")
             return ConversationHandler.END
 
         if flow == "cfg_margin":
@@ -498,6 +645,7 @@ class HedgeBot:
             f"⏸ Пауза: <b>{pause}</b>\n"
             f"🗓 Тривалість: <b>{self._fmt_secs(s['duration'])}</b>\n"
             f"⏳ Таймаут філа: <b>{s['fill_timeout']}с</b>\n"
+            f"🔔 Алерти по хеджах: <b>{'увімк' if s.get('notify_each') else 'вимк (у таблицю)'}</b>\n"
             f"🧪 Режим: <b>{'DRY-RUN (тест)' if s['dry_run'] else 'LIVE (реальні ордери)'}</b>\n\n"
             "<i>Хеджі відкриваються/закриваються самі, час — рандом у межах утримання.</i>"
         )
@@ -510,7 +658,8 @@ class HedgeBot:
             [InlineKeyboardButton(f"⏸ Пауза: {'увімк' if s['pause_on'] else 'вимк'}", callback_data="sess:pausetoggle")],
             [InlineKeyboardButton("🗓 Тривалість", callback_data="sess:dur"),
              InlineKeyboardButton("⏳ Таймаут", callback_data="sess:timeout")],
-            [InlineKeyboardButton(f"🧪 Режим: {'DRY-RUN' if s['dry_run'] else 'LIVE'}", callback_data="sess:dry")],
+            [InlineKeyboardButton(f"🔔 Алерти: {'увімк' if s.get('notify_each') else 'вимк'}", callback_data="sess:notify"),
+             InlineKeyboardButton(f"🧪 {'DRY-RUN' if s['dry_run'] else 'LIVE'}", callback_data="sess:dry")],
             [InlineKeyboardButton("▶️ Старт", callback_data="sess:start")],
             [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
         ]
