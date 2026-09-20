@@ -45,7 +45,7 @@ class HedgeBot:
     def register(self, app: Application) -> None:
         app.add_handler(CommandHandler("start", self._start))
         app.add_handler(ConversationHandler(
-            entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy)|pair:[a-z]+)$")],
+            entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy)|cfg:(lev|margin))$")],
             states={ASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_input)]},
             fallbacks=[CallbackQueryHandler(self._menu, pattern=r"^menu$")],
             per_message=False,
@@ -145,9 +145,18 @@ class HedgeBot:
         elif data == "balances":
             await self._balances(update, owner)
         elif data == "open":
-            await self._choose_pair(update)
-        elif data in ("side:long", "side:short"):
-            await self._preview(update, ctx, owner, entropy_long=(data == "side:long"))
+            ctx.chat_data.setdefault("draft", {"pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": True})
+            await self._open_config(update, ctx)
+        elif data == "cfg:pair":
+            d = ctx.chat_data["draft"]
+            keys = [p.key for p in PAIRS]
+            d["pair"] = keys[(keys.index(d["pair"]) + 1) % len(keys)]
+            await self._open_config(update, ctx)
+        elif data == "cfg:side":
+            ctx.chat_data["draft"]["entropy_long"] = not ctx.chat_data["draft"]["entropy_long"]
+            await self._open_config(update, ctx)
+        elif data == "cfg:preview":
+            await self._preview(update, ctx, owner)
         elif data == "confirm":
             await self._execute(update, ctx, owner)
         elif data == "positions":
@@ -240,11 +249,17 @@ class HedgeBot:
                 "Надішли <b>адресу свого ОСНОВНОГО гаманця</b> (0x…) — того, яким депозитив USDC на "
                 "entropy.io. Просто адреса, не ключ.",
                 reply_markup=self._cancel_kb(), parse_mode=ParseMode.HTML)
-        elif data.startswith("pair:"):
+        elif data == "cfg:lev":
             ctx.user_data.clear()
-            ctx.user_data.update(flow="open", pair=data.split(":", 1)[1])
+            ctx.user_data["flow"] = "cfg_lev"
             await update.callback_query.edit_message_text(
-                "Надішли <b>розмір хеджа в USD на ногу</b> (напр. 200):",
+                "⚙️ Надішли <b>плече</b> (число). На Entropy io максимум <b>6x</b>.",
+                reply_markup=self._cancel_kb(), parse_mode=ParseMode.HTML)
+        elif data == "cfg:margin":
+            ctx.user_data.clear()
+            ctx.user_data["flow"] = "cfg_margin"
+            await update.callback_query.edit_message_text(
+                "💵 Надішли <b>маржу в USD на ногу</b> (скільки застосувати; розмір = маржа × плече):",
                 reply_markup=self._cancel_kb(), parse_mode=ParseMode.HTML)
         return ASK
 
@@ -296,41 +311,61 @@ class HedgeBot:
             await self._refresh_menu(update, ctx, owner, "✅ Entropy збережено.")
             return ConversationHandler.END
 
-        if flow == "open":
+        if flow in ("cfg_lev", "cfg_margin"):
             try:
-                notional = float(text.replace(",", "."))
+                value = float(text.replace(",", "."))
+                if value <= 0:
+                    raise ValueError
             except ValueError:
-                await self._edit_anchor(update, ctx, "Не зрозумів число. Надішли розмір у USD на ногу (напр. 200):",
-                                        self._cancel_kb())
+                await self._edit_anchor(update, ctx, "Не зрозумів число, надішли ще раз:", self._cancel_kb())
                 return ASK
-            ctx.user_data["notional"] = notional
-            pair = get_pair(ctx.user_data["pair"])
-            rows = [
-                [InlineKeyboardButton("Entropy ЛОНГ / Lighter ШОРТ", callback_data="side:long")],
-                [InlineKeyboardButton("Entropy ШОРТ / Lighter ЛОНГ", callback_data="side:short")],
-                [InlineKeyboardButton("⬅️ Скасувати", callback_data="menu")],
-            ]
-            await self._edit_anchor(update, ctx,
-                f"<b>{pair.label}</b> · ${notional:g}/ногу\nОбери напрям:", InlineKeyboardMarkup(rows))
+            draft = ctx.chat_data.setdefault(
+                "draft", {"pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": True})
+            if flow == "cfg_lev":
+                draft["leverage"] = max(1, min(6, int(value)))   # Entropy io caps at 6x
+            else:
+                draft["margin"] = value
+            ctx.user_data.clear()
+            await self._open_config(update, ctx)
             return ConversationHandler.END
 
         return ConversationHandler.END
 
-    # ── open hedge ─────────────────────────────────────────────────────────────────────────────────
-    async def _choose_pair(self, update: Update) -> None:
-        rows = [[InlineKeyboardButton(p.label, callback_data=f"pair:{p.key}")] for p in PAIRS]
-        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu")])
-        await update.callback_query.edit_message_text(
-            "Обери монету для хеджа:", reply_markup=InlineKeyboardMarkup(rows))
+    # ── open hedge (config screen) ───────────────────────────────────────────────────────────────
+    async def _open_config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        d = ctx.chat_data["draft"]
+        pair = get_pair(d["pair"])
+        notional = d["margin"] * d["leverage"]
+        e_side, l_side = ("LONG", "SHORT") if d["entropy_long"] else ("SHORT", "LONG")
+        text = (
+            "📈 <b>Новий хедж</b>\n\n"
+            f"Монета: <b>{pair.label}</b>\n"
+            f"Плече: <b>{d['leverage']}x</b>\n"
+            f"Маржа: <b>${d['margin']:g}</b>/ногу\n"
+            f"→ Розмір позиції: <b>${notional:g}</b>/ногу\n"
+            f"Напрям: Entropy <b>{e_side}</b> / Lighter <b>{l_side}</b>\n\n"
+            "<i>Лімітки-maker (чекають заповнення, менша комса). Плече макс на Entropy io = 6x.</i>"
+        )
+        rows = [
+            [InlineKeyboardButton(f"🪙 Монета: {pair.label}", callback_data="cfg:pair")],
+            [InlineKeyboardButton(f"⚙️ Плече: {d['leverage']}x", callback_data="cfg:lev"),
+             InlineKeyboardButton(f"💵 Маржа: ${d['margin']:g}", callback_data="cfg:margin")],
+            [InlineKeyboardButton(f"🔄 Напрям: Entropy {e_side}", callback_data="cfg:side")],
+            [InlineKeyboardButton("👁 Прев'ю / Відкрити", callback_data="cfg:preview")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
+        ]
+        # _edit_anchor (not callback edit) so it works after a text step too.
+        await self._edit_anchor(update, ctx, text, InlineKeyboardMarkup(rows))
 
-    async def _preview(self, update: Update, ctx, owner: int, *, entropy_long: bool) -> None:
-        ctx.user_data["entropy_long"] = entropy_long
-        pair = get_pair(ctx.user_data.get("pair", ""))
-        notional = ctx.user_data.get("notional")
-        if not pair or notional is None:
+    async def _preview(self, update: Update, ctx, owner: int) -> None:
+        d = ctx.chat_data.get("draft")
+        pair = get_pair(d["pair"]) if d else None
+        if not pair:
             await update.callback_query.edit_message_text(
                 "Сесія скинулась. Почни заново.", reply_markup=self._back())
             return
+        entropy_long = d["entropy_long"]
+        notional = d["margin"] * d["leverage"]
         await update.callback_query.edit_message_text("⏳ Рахую план…")
         try:
             plan, reason = await asyncio.wait_for(
@@ -343,14 +378,14 @@ class HedgeBot:
         except Exception as err:  # noqa: BLE001 — surface it instead of a silent dead button
             LOGGER.exception("build_plan failed")
             await update.callback_query.edit_message_text(
-                f"✗ Помилка розрахунку: {str(err)[:200]}", reply_markup=self._back())
+                f"✗ Помилка розрахунку: {html.escape(str(err)[:200])}", reply_markup=self._back())
             return
         if plan is None:
-            await update.callback_query.edit_message_text(f"✗ {reason}", reply_markup=self._back())
+            await update.callback_query.edit_message_text(f"✗ {html.escape(reason)}", reply_markup=self._back())
             return
-        ctx.user_data["plan_ready"] = True
+        ctx.chat_data["plan_ready"] = True
         e, l = plan.entropy, plan.lighter
-        text = (f"👁 <b>{pair.label}</b> · ${notional:g}/ногу\n\n"
+        text = (f"👁 <b>{pair.label}</b> · {d['leverage']}x · маржа ${d['margin']:g} → ${notional:g}/ногу\n\n"
                 f"Entropy {e.market}: {'BUY' if e.is_buy else 'SELL'} {e.size:g} @ {e.limit_px:g}\n"
                 f"Lighter {pair.lighter}: {'SELL' if l.is_ask else 'BUY'} {l.size:g} @ {l.limit_px:g}\n")
         if plan.errors:
@@ -384,12 +419,14 @@ class HedgeBot:
         return plan, None
 
     async def _execute(self, update: Update, ctx, owner: int) -> None:
-        if not ctx.user_data.get("plan_ready"):
-            await update.callback_query.answer("Спершу preview", show_alert=True)
+        d = ctx.chat_data.get("draft")
+        if not ctx.chat_data.get("plan_ready") or not d:
+            await update.callback_query.answer("Спершу прев'ю", show_alert=True)
             return
-        pair = get_pair(ctx.user_data["pair"])
-        notional = ctx.user_data["notional"]
-        entropy_long = ctx.user_data["entropy_long"]
+        pair = get_pair(d["pair"])
+        leverage = int(d["leverage"])
+        notional = d["margin"] * leverage
+        entropy_long = d["entropy_long"]
         await update.callback_query.edit_message_text("⏳ Відкриваю обидві ноги…")
         try:
             plan, reason = await self._build_plan(owner, pair, notional, entropy_long)
@@ -410,16 +447,21 @@ class HedgeBot:
             return
         try:
             e, l = plan.entropy, plan.lighter
+            # Set the chosen leverage before ordering (best-effort; a failure is reported per leg).
+            with contextlib.suppress(Exception):
+                await ent.set_leverage(e.market, leverage)
+            with contextlib.suppress(Exception):
+                await lit.set_leverage(l.market_index, leverage)
             try:
-                results["entropy"] = await ent.limit_order(e.market, e.is_buy, e.size, e.limit_px)
+                results["entropy"] = await ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=plan.post_only)
             except Exception as err:  # noqa: BLE001
                 results["entropy"] = f"ERROR: {err}"
             try:
-                results["lighter"] = await lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask)
+                results["lighter"] = await lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=plan.post_only)
             except Exception as err:  # noqa: BLE001
                 results["lighter"] = f"ERROR: {err}"
         finally:
-            with __import__("contextlib").suppress(Exception):
+            with contextlib.suppress(Exception):
                 await lit.close()
 
         e_ok = "ERROR" not in str(results.get("entropy"))

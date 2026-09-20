@@ -73,6 +73,18 @@ class LighterClient:
             api_key_index=self._api_key_index,
         )
 
+    async def set_leverage(self, market_index: int, leverage: int) -> object | None:
+        """Best-effort leverage set. The SDK method/signature varies by version, so try the common
+        names and swallow anything unsupported (the caller also guards). VERIFY against the live SDK."""
+        fn = getattr(self._signer, "update_leverage", None) or getattr(self._signer, "change_leverage", None)
+        if fn is None:
+            return None
+        try:
+            return await fn(market_index=market_index, leverage=int(leverage))
+        except TypeError:
+            # some versions take (market_index, margin_mode, leverage)
+            return await fn(market_index, 0, int(leverage))
+
     async def cancel_all(self) -> object:
         return await self._signer.cancel_all_orders()
 

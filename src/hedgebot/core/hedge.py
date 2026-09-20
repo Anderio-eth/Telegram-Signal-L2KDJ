@@ -42,15 +42,24 @@ class HedgePlan:
     entropy: EntropyLeg
     lighter: LighterLeg
     errors: list[str]
+    post_only: bool = True   # maker orders that rest and wait (lower fees) vs crossing takers
 
     @property
     def ok(self) -> bool:
         return not self.errors
 
 
-def _cross(price: float, is_buy: bool, offset_pct: float) -> float:
-    """A limit price that leans into the book so it fills: above mid to buy, below to sell."""
-    return price * (1 + offset_pct / 100) if is_buy else price * (1 - offset_pct / 100)
+def _limit_px(price: float, is_buy: bool, offset_pct: float, maker: bool) -> float:
+    """Where to put the limit.
+
+    Taker (maker=False): lean INTO the book so it fills now — above mid to buy, below to sell.
+    Maker (maker=True): rest PASSIVELY so it waits for the market and pays the maker fee — below mid
+    to buy, above mid to sell (a post-only order that would cross is rejected, so it must sit back)."""
+    up = 1 + offset_pct / 100
+    down = 1 - offset_pct / 100
+    if maker:
+        return price * down if is_buy else price * up
+    return price * up if is_buy else price * down
 
 
 def _round_px(price: float) -> float:
@@ -71,8 +80,8 @@ def plan_hedge(
     lighter_price: float,
     entropy_market: EntropyMarket,
     lighter_market: LighterMarket,
-    offset_pct: float = 0.3,
-    post_only: bool = False,
+    offset_pct: float = 0.05,
+    post_only: bool = True,
 ) -> HedgePlan:
     errors: list[str] = []
     if notional_usd < MIN_NOTIONAL_USD:
@@ -92,10 +101,9 @@ def plan_hedge(
     e_is_buy = entropy_long
     l_is_ask = entropy_long  # opposite side: if Entropy is long, Lighter is short (ask)
 
-    e_px = _round_px(_cross(entropy_price, e_is_buy, 0.0 if post_only else offset_pct))
-    l_px_raw = _cross(lighter_price, not l_is_ask, 0.0 if post_only else offset_pct)  # buy=lower ask? see note
-    # For Lighter: a sell (ask) should sit at/below mid to fill, a buy above. `not l_is_ask` is the
-    # buy flag, so _cross gives the crossing price for that direction.
+    e_px = _round_px(_limit_px(entropy_price, e_is_buy, offset_pct, post_only))
+    # Lighter: `not l_is_ask` is the buy flag, so _limit_px prices for that direction.
+    l_px_raw = _limit_px(lighter_price, not l_is_ask, offset_pct, post_only)
     l_base, l_price_int = lighter_amounts(lighter_market, l_size, l_px_raw)
 
     return HedgePlan(
@@ -104,4 +112,5 @@ def plan_hedge(
         entropy=EntropyLeg(pair.entropy, e_is_buy, e_size, e_px),
         lighter=LighterLeg(lighter_market.market_id, l_is_ask, l_size, l_px_raw, l_base, l_price_int),
         errors=errors,
+        post_only=post_only,
     )
