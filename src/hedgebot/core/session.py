@@ -39,7 +39,7 @@ from ..exchanges import market_data as md
 from ..exchanges.hyperliquid_entropy import EntropyClient
 from ..exchanges.lighter_client import LighterClient
 from .hedge import plan_hedge
-from ..pairs import get as get_pair
+from ..pairs import PAIRS, get as get_pair
 
 LOGGER = logging.getLogger(__name__)
 
@@ -178,9 +178,9 @@ class SessionEngine:
                 await lit.set_leverage(l.market_index, leverage)
             # Post both maker legs and CHECK each response — a rejected order (margin, min notional,
             # post-only-would-cross) does not raise, so this is the only place the reason surfaces.
-            e_err = await self._place(lambda: ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=True),
+            e_err = await self._place(lambda: ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=plan.post_only),
                                       ent.order_error)
-            l_err = await self._place(lambda: lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=True),
+            l_err = await self._place(lambda: lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=plan.post_only),
                                       lit.order_error)
             if e_err or l_err:
                 # At least one leg didn't rest — flatten anything that did and report why.
@@ -195,7 +195,7 @@ class SessionEngine:
                 return
 
             # Wait for both to fill, applying the timeout-after-first-fill rule.
-            ok = await self._await_fills(ent, lit, pair, e, l, cfg.get("fill_timeout", 20))
+            ok = await self._await_fills(sid, ent, lit, pair, e, l, cfg.get("fill_timeout", 20))
             if not ok:
                 res = await self._cancel_hedge(ent, lit, pair)
                 await self._store.update_hedge(hid, status="CANCELLED",
@@ -233,12 +233,16 @@ class SessionEngine:
         except Exception:  # noqa: BLE001
             return None
 
-    async def _await_fills(self, ent, lit, pair, e, l, timeout: float) -> bool:
-        """True once both legs are fully filled. Timeout only counts from the first partial fill."""
+    async def _await_fills(self, sid: int, ent, lit, pair, e, l, timeout: float) -> bool:
+        """True once both legs are fully filled. Timeout only counts from the first partial fill.
+        Bails out early (returns False) when the user hits STOP, so a stop isn't stuck behind a fill
+        wait — the caller then flattens whatever filled."""
         deadline = None
         start = time.time()
         e_target, l_target = e.size * 0.999, l.size * 0.999   # tolerance for size rounding
         while time.time() - start < 120:  # hard ceiling
+            if await self._stopping(sid):
+                return False
             e_filled = await self._entropy_filled(ent, pair.entropy, e.size)
             l_filled = await self._lighter_filled(lit, l.market_index, l.size)
             if e_filled >= e_target and l_filled >= l_target:
@@ -248,7 +252,7 @@ class SessionEngine:
                 deadline = time.time() + timeout
             if deadline and time.time() > deadline:
                 return False
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
         return False
 
     async def _entropy_filled(self, ent, market: str, target: float) -> float:
@@ -368,20 +372,35 @@ class SessionEngine:
             await asyncio.sleep(min(1.5, max(0.05, end - time.time())))
 
     async def _finish(self, sid: int, owner: int) -> None:
-        # Close any still-open hedge on stop, then mark the session done and report a summary.
+        # STOP means: pull EVERY resting order and flatten EVERY position on both venues — not just
+        # the hedges the DB knows about (a cancelled cycle can leave a resting leg behind).
+        sess = await self._store.active_session_by_id(sid)
+        coins = list((sess or {}).get("config", {}).get("coins", []) or [p.key for p in PAIRS])
+        with contextlib.suppress(Exception):
+            ent = await self._entropy_client(owner)
+            lit = await self._lighter_client(owner)
+            try:
+                if ent:
+                    with contextlib.suppress(Exception):
+                        await ent.cancel_all()          # cancel all resting Entropy orders
+                if lit:
+                    with contextlib.suppress(Exception):
+                        await lit.cancel_all()          # cancel all resting Lighter orders
+                # Flatten any open position for every coin the session could have touched.
+                for key in coins:
+                    pair = get_pair(key)
+                    if ent and lit and pair:
+                        with contextlib.suppress(Exception):
+                            await self._close_hedge(ent, lit, pair)
+            finally:
+                if lit:
+                    with contextlib.suppress(Exception):
+                        await lit.close()
+        # Mark any DB hedges still marked open as closed.
         with contextlib.suppress(Exception):
             for h in await self._store.session_hedges(sid):
                 if h["status"] in ("OPEN", "OPENING"):
-                    ent = await self._entropy_client(owner)
-                    lit = await self._lighter_client(owner)
-                    pair = get_pair(h["pair_key"])
-                    res = {"pnl": None, "fees": None}
-                    if ent and lit and pair:
-                        res = await self._close_hedge(ent, lit, pair)
-                        with contextlib.suppress(Exception):
-                            await lit.close()
-                    await self._store.update_hedge(h["id"], status="CLOSED",
-                                                   realized_pnl=res["pnl"], fees=res["fees"])
+                    await self._store.update_hedge(h["id"], status="CLOSED")
         await self._store.set_session_status(sid, "DONE")
         if self._sheets:
             with contextlib.suppress(Exception):

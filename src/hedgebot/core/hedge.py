@@ -42,7 +42,7 @@ class HedgePlan:
     entropy: EntropyLeg
     lighter: LighterLeg
     errors: list[str]
-    post_only: bool = True   # maker orders that rest and wait (lower fees) vs crossing takers
+    post_only: bool = False   # cross the book so both legs actually fill (RH-Lighter taker is 0%)
 
     @property
     def ok(self) -> bool:
@@ -80,8 +80,8 @@ def plan_hedge(
     lighter_price: float,
     entropy_market: EntropyMarket,
     lighter_market: LighterMarket,
-    offset_pct: float = 0.05,
-    post_only: bool = True,
+    offset_pct: float = 0.3,
+    post_only: bool = False,
 ) -> HedgePlan:
     errors: list[str] = []
     if notional_usd < MIN_NOTIONAL_USD:
