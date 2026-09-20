@@ -134,3 +134,78 @@ class Store:
                 " WHERE id = $1",
                 hedge_id, status,
             )
+
+    # ── sessions ─────────────────────────────────────────────────────────────────────────────────
+    async def create_session(self, owner_id: int, config: dict) -> int:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                "INSERT INTO hb_sessions (owner_id, config) VALUES ($1, $2::jsonb) RETURNING id",
+                owner_id, json.dumps(config),
+            )
+
+    @staticmethod
+    def _session_row(row) -> dict:
+        d = dict(row)
+        if isinstance(d.get("config"), str):
+            d["config"] = json.loads(d["config"])
+        return d
+
+    async def active_session(self, owner_id: int) -> dict | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM hb_sessions WHERE owner_id = $1 AND status IN ('RUNNING','STOPPING')"
+                " ORDER BY started_at DESC LIMIT 1",
+                owner_id,
+            )
+        return self._session_row(row) if row else None
+
+    async def active_session_by_id(self, session_id: int) -> dict | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM hb_sessions WHERE id = $1", session_id)
+        return self._session_row(row) if row else None
+
+    async def running_sessions(self) -> list[dict]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM hb_sessions WHERE status IN ('RUNNING','STOPPING')")
+        return [self._session_row(r) for r in rows]
+
+    async def set_session_status(self, session_id: int, status: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE hb_sessions SET status = $2, ended_at = CASE WHEN $2 IN ('STOPPED','DONE') THEN now() ELSE ended_at END"
+                " WHERE id = $1",
+                session_id, status,
+            )
+
+    # ── hedge lifecycle (session-aware) ──────────────────────────────────────────────────────────
+    async def new_hedge(self, owner_id: int, session_id: int | None, pair_key: str,
+                        notional_usd: float, entropy_side: str, status: str, detail: dict) -> int:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                INSERT INTO hb_hedges (owner_id, session_id, pair_key, notional_usd, entropy_side,
+                                       status, detail, opened_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, now()) RETURNING id
+                """,
+                owner_id, session_id, pair_key, notional_usd, entropy_side, status, json.dumps(detail),
+            )
+
+    async def update_hedge(self, hedge_id: int, **fields) -> None:
+        cols = {"status", "realized_pnl", "fees", "entropy_vol", "lighter_vol"}
+        sets, vals = [], []
+        for k, v in fields.items():
+            if k in cols:
+                vals.append(v)
+                sets.append(f"{k} = ${len(vals)+1}")
+        if not sets:
+            return
+        if fields.get("status") == "CLOSED":
+            sets.append("closed_at = now()")
+        async with self._pool.acquire() as conn:
+            await conn.execute(f"UPDATE hb_hedges SET {', '.join(sets)} WHERE id = $1", hedge_id, *vals)
+
+    async def session_hedges(self, session_id: int) -> list[dict]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM hb_hedges WHERE session_id = $1 ORDER BY created_at", session_id)
+        return [dict(r) for r in rows]

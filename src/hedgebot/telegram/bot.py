@@ -36,16 +36,24 @@ ASK = 1  # single conversation state for all free-text prompts
 NL = "\n"
 
 
+SESS_DEFAULT = {
+    "coins": [PAIRS[0].key], "leverage": 3, "margin": 5.0,
+    "hold_min": 1800, "hold_max": 7200, "pause_on": False, "pause_min": 300, "pause_max": 1800,
+    "duration": 86400, "fill_timeout": 20, "dry_run": True,
+}
+
+
 class HedgeBot:
-    def __init__(self, cfg: Config, store: Store) -> None:
+    def __init__(self, cfg: Config, store: Store, engine=None) -> None:
         self._cfg = cfg
         self._store = store
+        self._engine = engine
 
     # ── wiring ───────────────────────────────────────────────────────────────────────────────────
     def register(self, app: Application) -> None:
         app.add_handler(CommandHandler("start", self._start))
         app.add_handler(ConversationHandler(
-            entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy)|cfg:margin_custom)$")],
+            entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy)|cfg:margin_custom|sess:(hold|pause|timeout|durcustom))$")],
             states={ASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_input)]},
             fallbacks=[CallbackQueryHandler(self._menu, pattern=r"^menu$")],
             per_message=False,
@@ -120,7 +128,8 @@ class HedgeBot:
         rows = [
             [InlineKeyboardButton("🔑 Ключі", callback_data="keys")],
             [InlineKeyboardButton("💰 Баланси", callback_data="balances")],
-            [InlineKeyboardButton("📈 Відкрити хедж", callback_data="open")],
+            [InlineKeyboardButton("📈 Відкрити хедж (ручний)", callback_data="open")],
+            [InlineKeyboardButton("🤖 Авто-сесія", callback_data="sess")],
             [InlineKeyboardButton("📂 Позиції / Закрити", callback_data="positions")],
         ]
         return {"text": text, "reply_markup": InlineKeyboardMarkup(rows), "parse_mode": ParseMode.HTML}
@@ -172,6 +181,43 @@ class HedgeBot:
             await self._preview(update, ctx, owner)
         elif data == "confirm":
             await self._execute(update, ctx, owner)
+        elif data == "sess":
+            await self._sess_open(update, ctx, owner)
+        elif data == "sess:coins":
+            await self._sess_coins(update, ctx)
+        elif data.startswith("scoin:"):
+            key = data.split(":", 1)[1]
+            coins = ctx.chat_data["sess"]["coins"]
+            if key in coins:
+                coins.remove(key)
+            else:
+                coins.append(key)
+            await self._sess_coins(update, ctx)
+        elif data == "sess:lev":
+            await self._sess_lev(update, ctx)
+        elif data.startswith("sslev:"):
+            ctx.chat_data["sess"]["leverage"] = int(data.split(":", 1)[1])
+            await self._sess_config(update, ctx)
+        elif data == "sess:margin":
+            await self._sess_margin(update, ctx)
+        elif data.startswith("ssmargin:"):
+            ctx.chat_data["sess"]["margin"] = float(data.split(":", 1)[1])
+            await self._sess_config(update, ctx)
+        elif data == "sess:dur":
+            await self._sess_dur(update, ctx)
+        elif data.startswith("ssdur:"):
+            ctx.chat_data["sess"]["duration"] = int(data.split(":", 1)[1])
+            await self._sess_config(update, ctx)
+        elif data == "sess:pausetoggle":
+            ctx.chat_data["sess"]["pause_on"] = not ctx.chat_data["sess"]["pause_on"]
+            await self._sess_config(update, ctx)
+        elif data == "sess:dry":
+            ctx.chat_data["sess"]["dry_run"] = not ctx.chat_data["sess"]["dry_run"]
+            await self._sess_config(update, ctx)
+        elif data == "sess:start":
+            await self._sess_start(update, ctx, owner)
+        elif data == "sess:stop":
+            await self._sess_stop(update, ctx, owner)
         elif data == "positions":
             await self._positions(update, owner)
         elif data.startswith("close:"):
@@ -273,6 +319,17 @@ class HedgeBot:
                 "💵 Надішли <b>свою маржу в USD на ногу</b> (число; розмір = маржа × плече):",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="cfg:margin")]]),
                 parse_mode=ParseMode.HTML)
+        elif data in ("sess:hold", "sess:pause", "sess:timeout"):
+            ctx.user_data.clear()
+            ctx.user_data["flow"] = "sess_" + data.split(":", 1)[1]
+            back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
+            if data == "sess:timeout":
+                msg = "⏳ Надішли <b>таймаут заповнення в секундах</b> (напр. 20):"
+            else:
+                what = "утримання" if data == "sess:hold" else "паузи"
+                msg = (f"Надішли <b>діапазон {what} у хвилинах</b> — два числа через пробіл, напр. "
+                       f"<code>30 120</code> (від 30хв до 2г):")
+            await update.callback_query.edit_message_text(msg, reply_markup=back, parse_mode=ParseMode.HTML)
         return ASK
 
     async def _got_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -338,6 +395,30 @@ class HedgeBot:
             await self._open_config(update, ctx)
             return ConversationHandler.END
 
+        if flow in ("sess_hold", "sess_pause", "sess_timeout"):
+            s = ctx.chat_data.setdefault("sess", dict(SESS_DEFAULT))
+            back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
+            try:
+                if flow == "sess_timeout":
+                    s["fill_timeout"] = max(5, int(float(text)))
+                else:
+                    a, b = (float(x) for x in text.replace(",", ".").split()[:2])
+                    lo, hi = sorted((a, b))
+                    if lo <= 0:
+                        raise ValueError
+                    if flow == "sess_hold":
+                        s["hold_min"], s["hold_max"] = lo * 60, hi * 60
+                    else:
+                        s["pause_min"], s["pause_max"] = lo * 60, hi * 60
+                        s["pause_on"] = True
+            except (ValueError, IndexError):
+                await self._edit_anchor(update, ctx, "Не зрозумів. Для діапазону — два числа через пробіл "
+                                        "(напр. <code>30 120</code>); для таймауту — одне число:", back)
+                return ASK
+            ctx.user_data.clear()
+            await self._sess_config(update, ctx)
+            return ConversationHandler.END
+
         return ConversationHandler.END
 
     # ── open hedge (config screen) ───────────────────────────────────────────────────────────────
@@ -383,6 +464,119 @@ class HedgeBot:
                 [InlineKeyboardButton("⬅️ Назад", callback_data="open")]]
         await self._edit_anchor(update, ctx, "💵 <b>Маржа на ногу</b> (розмір = маржа × плече):",
                                 InlineKeyboardMarkup(rows))
+
+    # ── auto-session ───────────────────────────────────────────────────────────────────────────────
+    def _fmt_secs(self, s: float) -> str:
+        s = int(s)
+        return f"{s/86400:.0f}д" if s >= 86400 else (f"{s/3600:.0f}г" if s >= 3600 else f"{s/60:.0f}хв")
+
+    async def _sess_open(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
+        active = await self._store.active_session(owner)
+        if active:
+            await self._sess_active(update, ctx, active)
+            return
+        if "sess" not in ctx.chat_data:
+            saved = (await self._store.load_settings(owner)).get("session_cfg") or {}
+            ctx.chat_data["sess"] = {**SESS_DEFAULT, **saved, "coins": list(saved.get("coins") or SESS_DEFAULT["coins"])}
+        await self._sess_config(update, ctx)
+
+    async def _sess_config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        s = ctx.chat_data["sess"]
+        with contextlib.suppress(Exception):
+            await self._store.save_session_cfg(update.effective_user.id, s)
+        coins = ", ".join(get_pair(k).label for k in s["coins"]) or "—"
+        hold = f"{self._fmt_secs(s['hold_min'])}–{self._fmt_secs(s['hold_max'])}"
+        pause = (f"увімк {self._fmt_secs(s['pause_min'])}–{self._fmt_secs(s['pause_max'])}"
+                 if s["pause_on"] else "вимкнено")
+        text = (
+            "🤖 <b>Авто-сесія — налаштування</b>\n\n"
+            f"🪙 Монети: <b>{coins}</b>\n"
+            f"⚙️ Плече: <b>{s['leverage']}x</b>   💵 Маржа: <b>${s['margin']:g}</b>\n"
+            f"⏱ Утримання: <b>{hold}</b>\n"
+            f"⏸ Пауза: <b>{pause}</b>\n"
+            f"🗓 Тривалість: <b>{self._fmt_secs(s['duration'])}</b>\n"
+            f"⏳ Таймаут філа: <b>{s['fill_timeout']}с</b>\n"
+            f"🧪 Режим: <b>{'DRY-RUN (тест)' if s['dry_run'] else 'LIVE (реальні ордери)'}</b>\n\n"
+            "<i>Хеджі відкриваються/закриваються самі, час — рандом у межах утримання.</i>"
+        )
+        rows = [
+            [InlineKeyboardButton("🪙 Монети", callback_data="sess:coins")],
+            [InlineKeyboardButton(f"⚙️ Плече {s['leverage']}x", callback_data="sess:lev"),
+             InlineKeyboardButton(f"💵 Маржа ${s['margin']:g}", callback_data="sess:margin")],
+            [InlineKeyboardButton("⏱ Утримання", callback_data="sess:hold"),
+             InlineKeyboardButton("⏸ Пауза", callback_data="sess:pause")],
+            [InlineKeyboardButton(f"⏸ Пауза: {'увімк' if s['pause_on'] else 'вимк'}", callback_data="sess:pausetoggle")],
+            [InlineKeyboardButton("🗓 Тривалість", callback_data="sess:dur"),
+             InlineKeyboardButton("⏳ Таймаут", callback_data="sess:timeout")],
+            [InlineKeyboardButton(f"🧪 Режим: {'DRY-RUN' if s['dry_run'] else 'LIVE'}", callback_data="sess:dry")],
+            [InlineKeyboardButton("▶️ Старт", callback_data="sess:start")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
+        ]
+        await self._edit_anchor(update, ctx, text, InlineKeyboardMarkup(rows))
+
+    async def _sess_active(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, sess_row: dict) -> None:
+        cfg = sess_row["config"]
+        hedges = await self._store.session_hedges(sess_row["id"])
+        opened = [h for h in hedges if h["status"] in ("OPEN", "OPENING")]
+        closed = [h for h in hedges if h["status"] == "CLOSED"]
+        text = (
+            f"🤖 <b>Авто-сесія — {'⏹ зупиняється…' if sess_row['status']=='STOPPING' else '🟢 активна'}</b>\n\n"
+            f"Режим: {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}\n"
+            f"Хеджів: {len(hedges)} (відкрито {len(opened)}, закрито {len(closed)})\n"
+            f"Монети: {', '.join(get_pair(k).label for k in cfg.get('coins', []))}\n"
+        )
+        rows = [
+            [InlineKeyboardButton("⏹ Стоп (закрити все)", callback_data="sess:stop")],
+            [InlineKeyboardButton("🔄 Оновити", callback_data="sess")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
+        ]
+        await self._edit_anchor(update, ctx, text, InlineKeyboardMarkup(rows))
+
+    async def _sess_coins(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        chosen = ctx.chat_data["sess"]["coins"]
+        rows = [[InlineKeyboardButton(f"{'✅ ' if p.key in chosen else '⬜ '}{p.label}", callback_data=f"scoin:{p.key}")]
+                for p in PAIRS]
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="sess")])
+        await self._edit_anchor(update, ctx, "🪙 Обери монети (одну або кілька). Якщо кілька — наступний хедж на "
+                                "рандомній з обраних:", InlineKeyboardMarkup(rows))
+
+    async def _sess_lev(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        cur = ctx.chat_data["sess"]["leverage"]
+        def b(n): return InlineKeyboardButton(f"{'✅ ' if n == cur else ''}{n}x", callback_data=f"sslev:{n}")
+        rows = [[b(1), b(2), b(3)], [b(4), b(5), b(6)], [InlineKeyboardButton("⬅️ Назад", callback_data="sess")]]
+        await self._edit_anchor(update, ctx, "⚙️ <b>Плече</b> (io макс 6x):", InlineKeyboardMarkup(rows))
+
+    async def _sess_margin(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        cur = ctx.chat_data["sess"]["margin"]
+        def b(v): return InlineKeyboardButton(f"{'✅ ' if v == cur else ''}${v:g}", callback_data=f"ssmargin:{v}")
+        rows = [[b(3), b(5), b(10)], [b(25), b(50), b(100)], [InlineKeyboardButton("⬅️ Назад", callback_data="sess")]]
+        await self._edit_anchor(update, ctx, "💵 <b>Маржа на ногу</b>:", InlineKeyboardMarkup(rows))
+
+    async def _sess_dur(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        cur = ctx.chat_data["sess"]["duration"]
+        opts = [("12г", 43200), ("1д", 86400), ("3д", 259200), ("7д", 604800)]
+        rows = [[InlineKeyboardButton(f"{'✅ ' if v == cur else ''}{lbl}", callback_data=f"ssdur:{v}") for lbl, v in opts],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="sess")]]
+        await self._edit_anchor(update, ctx, "🗓 <b>Тривалість сесії</b>:", InlineKeyboardMarkup(rows))
+
+    async def _sess_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
+        s = ctx.chat_data.get("sess", dict(SESS_DEFAULT))
+        if not s["coins"]:
+            await update.callback_query.answer("Обери хоча б одну монету", show_alert=True)
+            return
+        if not self._engine:
+            await update.callback_query.answer("Рушій недоступний", show_alert=True)
+            return
+        sid = await self._engine.start_session(owner, dict(s))
+        await update.callback_query.answer(f"▶️ Сесію #{sid} запущено", show_alert=True)
+        await self._sess_open(update, ctx, owner)
+
+    async def _sess_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
+        active = await self._store.active_session(owner)
+        if active and self._engine:
+            await self._engine.stop_session(active["id"])
+            await update.callback_query.answer("⏹ Зупиняю (закриваю позиції)…", show_alert=True)
+        await self._sess_open(update, ctx, owner)
 
     async def _preview(self, update: Update, ctx, owner: int) -> None:
         d = ctx.chat_data.get("draft")
