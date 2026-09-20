@@ -65,7 +65,7 @@ class SessionEngine:
                     await self._store.set_session_status(s["id"], "STOPPED")  # retire the duplicate
                 continue
             seen.add(owner)
-            self._spawn(s)
+            self._spawn(s, resumed=True)
         LOGGER.info("session engine started; resumed %d session(s)", len(self._tasks))
 
     async def start_session(self, owner_id: int, config: dict) -> int:
@@ -82,10 +82,10 @@ class SessionEngine:
         # The running task polls its status and winds down (closes the open hedge) when it sees this.
         await self._store.set_session_status(session_id, "STOPPING")
 
-    def _spawn(self, s: dict) -> None:
+    def _spawn(self, s: dict, resumed: bool = False) -> None:
         if s["id"] in self._tasks:
             return
-        self._tasks[s["id"]] = asyncio.create_task(self._run(s), name=f"session-{s['id']}")
+        self._tasks[s["id"]] = asyncio.create_task(self._run(s, resumed), name=f"session-{s['id']}")
 
     async def _say(self, owner_id: int, text: str) -> None:
         if self._notify:
@@ -104,14 +104,15 @@ class SessionEngine:
                 await self._sheets.append_hedge(owner_id, sid, row)
 
     # ── the loop ─────────────────────────────────────────────────────────────────────────────────
-    async def _run(self, s: dict) -> None:
+    async def _run(self, s: dict, resumed: bool = False) -> None:
         sid, owner, cfg = s["id"], s["owner_id"], s["config"]
         ends_at = time.time() + float(cfg.get("duration", 86400))
         mode = "DRY-RUN" if cfg.get("dry_run", True) else "LIVE"
         if self._sheets:
             with contextlib.suppress(Exception):
                 await self._sheets.ensure_sheet(owner, sid)
-        await self._say(owner, f"▶️ Сесію запущено ({mode}). Триватиме ~{self._fmt(cfg.get('duration',86400))}.")
+        verb = "🔄 Сесію відновлено після перезапуску" if resumed else "▶️ Сесію запущено"
+        await self._say(owner, f"{verb} ({mode}). Триватиме ~{self._fmt(cfg.get('duration',86400))}.")
         try:
             while time.time() < ends_at:
                 if await self._stopping(sid):
