@@ -68,6 +68,35 @@ class Store:
             meta = json.loads(meta)
         return Credentials(venue, self._cipher.decrypt(row["enc_secret"]), dict(meta or {}))
 
+    # ── remembered settings ──────────────────────────────────────────────────────────────────────
+    async def load_settings(self, owner_id: int) -> dict:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT draft, session_cfg FROM hb_settings WHERE owner_id = $1", owner_id)
+        if not row:
+            return {"draft": {}, "session_cfg": {}}
+        parse = lambda v: (json.loads(v) if isinstance(v, str) else v) or {}
+        return {"draft": parse(row["draft"]), "session_cfg": parse(row["session_cfg"])}
+
+    async def save_draft(self, owner_id: int, draft: dict) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO hb_settings (owner_id, draft) VALUES ($1, $2::jsonb)
+                ON CONFLICT (owner_id) DO UPDATE SET draft = EXCLUDED.draft, updated_at = now()
+                """,
+                owner_id, json.dumps(draft),
+            )
+
+    async def save_session_cfg(self, owner_id: int, cfg: dict) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO hb_settings (owner_id, session_cfg) VALUES ($1, $2::jsonb)
+                ON CONFLICT (owner_id) DO UPDATE SET session_cfg = EXCLUDED.session_cfg, updated_at = now()
+                """,
+                owner_id, json.dumps(cfg),
+            )
+
     async def venues_set(self, owner_id: int) -> set[str]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("SELECT venue FROM hb_credentials WHERE owner_id = $1", owner_id)

@@ -26,3 +26,32 @@ CREATE TABLE IF NOT EXISTS hb_hedges (
 );
 
 CREATE INDEX IF NOT EXISTS hb_hedges_owner ON hb_hedges (owner_id, status);
+
+-- Remembered per-user settings: the last hedge draft and the last auto-session config, so the
+-- config screens come back pre-filled after a restart.
+CREATE TABLE IF NOT EXISTS hb_settings (
+    owner_id     BIGINT      PRIMARY KEY,
+    draft        JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    session_cfg  JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Auto-trading sessions. The engine (added next) reads RUNNING rows and drives hedges under them;
+-- persisting here is what lets a session survive a redeploy instead of being abandoned mid-flight.
+CREATE TABLE IF NOT EXISTS hb_sessions (
+    id          BIGSERIAL   PRIMARY KEY,
+    owner_id    BIGINT      NOT NULL,
+    status      TEXT        NOT NULL DEFAULT 'RUNNING',  -- RUNNING | STOPPING | STOPPED | DONE
+    config      JSONB       NOT NULL,
+    started_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS hb_sessions_owner ON hb_sessions (owner_id, status);
+
+-- Per-hedge accounting for the stats/Sheets report (columns fill in over a hedge's life).
+ALTER TABLE hb_hedges ADD COLUMN IF NOT EXISTS session_id    BIGINT;
+ALTER TABLE hb_hedges ADD COLUMN IF NOT EXISTS opened_at     TIMESTAMPTZ;
+ALTER TABLE hb_hedges ADD COLUMN IF NOT EXISTS realized_pnl  DOUBLE PRECISION;
+ALTER TABLE hb_hedges ADD COLUMN IF NOT EXISTS fees          DOUBLE PRECISION;
+ALTER TABLE hb_hedges ADD COLUMN IF NOT EXISTS entropy_vol   DOUBLE PRECISION;
+ALTER TABLE hb_hedges ADD COLUMN IF NOT EXISTS lighter_vol   DOUBLE PRECISION;

@@ -145,7 +145,10 @@ class HedgeBot:
         elif data == "balances":
             await self._balances(update, owner)
         elif data == "open":
-            ctx.chat_data.setdefault("draft", {"pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": True})
+            if "draft" not in ctx.chat_data:
+                saved = (await self._store.load_settings(owner)).get("draft") or {}
+                ctx.chat_data["draft"] = {
+                    "pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": True, **saved}
             await self._open_config(update, ctx)
         elif data == "cfg:pair":
             d = ctx.chat_data["draft"]
@@ -231,8 +234,12 @@ class HedgeBot:
 
         lines.append("")
         lines.append("<i>Обидві біржі — ф'ючерси; «всього» = еквіті рахунку, «вільно» = під нову позицію.</i>")
+        rows = [
+            [InlineKeyboardButton("🔄 Оновити", callback_data="balances")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
+        ]
         await update.callback_query.edit_message_text(
-            NL.join(lines), reply_markup=self._back(), parse_mode=ParseMode.HTML)
+            NL.join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
     # ── free-text input (keys + notional) ──────────────────────────────────────────────────────────
     async def _begin_input(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -336,6 +343,8 @@ class HedgeBot:
     # ── open hedge (config screen) ───────────────────────────────────────────────────────────────
     async def _open_config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         d = ctx.chat_data["draft"]
+        with contextlib.suppress(Exception):
+            await self._store.save_draft(update.effective_user.id, d)  # remember last settings
         pair = get_pair(d["pair"])
         notional = d["margin"] * d["leverage"]
         e_side, l_side = ("LONG", "SHORT") if d["entropy_long"] else ("SHORT", "LONG")
