@@ -92,6 +92,30 @@ class SessionEngine:
             with contextlib.suppress(Exception):
                 await self._notify(owner_id, text)
 
+    @staticmethod
+    async def _lit_equity(lit) -> float | None:
+        """Lighter account equity (total asset value), or None. Flat-to-flat, its change across a hedge
+        is that leg's exact realized PnL (RH fee is 0), which beats reading authed trade history."""
+        try:
+            b = await lit.balance()
+            v = b.get("total")
+            return float(v) if v is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    async def _noop(default=None):
+        return default
+
+    @staticmethod
+    async def _guard(coro, default=None):
+        """Await a coroutine, swallowing errors and returning a default — for concurrent best-effort
+        cleanup where one failure must not abort the gather."""
+        try:
+            return await coro
+        except Exception:  # noqa: BLE001
+            return default
+
     async def _hedge_alert(self, cfg: dict, owner_id: int, text: str) -> None:
         """Per-hedge open/close chatter. Off by default (stats go to the sheet instead of the chat);
         the user can flip `notify_each` on in the session config if they want the pings back."""
@@ -189,6 +213,7 @@ class SessionEngine:
             return
         try:
             e, l = plan.entropy, plan.lighter
+            lit_equity_before = await self._lit_equity(lit)   # for exact Lighter PnL (equity delta)
             with contextlib.suppress(Exception):
                 await ent.set_leverage(e.market, leverage)
             with contextlib.suppress(Exception):
@@ -220,7 +245,8 @@ class SessionEngine:
             # Wait for both to fill, applying the timeout-after-first-fill rule.
             ok = await self._await_fills(sid, ent, lit, pair, e, l, cfg.get("fill_timeout", 20))
             if not ok:
-                res = await self._cancel_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms)
+                res = await self._cancel_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
+                                               lit_equity_before=lit_equity_before)
                 await self._store.update_hedge(hid, status="CANCELLED",
                                                realized_pnl=res["pnl"], fees=res["fees"])
                 await self._hedge_alert(cfg, owner, f"✖️ {pair.label}: одна нога не заповнилась вчасно — скасовано.")
@@ -231,7 +257,8 @@ class SessionEngine:
             await self._store.update_hedge(hid, status="OPEN")
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (обидві ноги). Закрию через {self._fmt(hold)}.")
             await self._interruptible_sleep(sid, hold)
-            res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms)
+            res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
+                                          lit_equity_before=lit_equity_before)
             await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
                                            entropy_vol=notional * 2, lighter_vol=notional * 2)
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} закрито. PnL ≈ ${res['pnl']:g}.")
@@ -292,12 +319,13 @@ class SessionEngine:
                 return float(pos.get("abs", 0) or 0)
         return 0.0
 
-    async def _cancel_hedge(self, ent, lit, pair, owner=None, since_ms=None) -> dict:
+    async def _cancel_hedge(self, ent, lit, pair, owner=None, since_ms=None, lit_equity_before=None) -> dict:
         # Same flatten path as a normal close: flatten whatever filled on both venues and pull the
         # unfilled maker legs, so a one-sided fill can never be left as naked delta.
-        return await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms)
+        return await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms,
+                                       lit_equity_before=lit_equity_before)
 
-    async def _close_hedge(self, ent, lit, pair, owner=None, since_ms=None) -> dict:
+    async def _close_hedge(self, ent, lit, pair, owner=None, since_ms=None, lit_equity_before=None) -> dict:
         """Flatten BOTH legs simultaneously and return {pnl, fees, errors}.
 
         PnL/fees: the Entropy leg's realized PnL and fee are read from the exchange's own fills since
@@ -313,13 +341,14 @@ class SessionEngine:
                 if lmk:
                     mark = await md.lighter_mark(s, self._cfg.lighter_api_url, lmk.market_id)
 
-        # Lighter directional PnL, captured just before we flatten it (fee = 0 on RH).
-        l_pnl = 0.0
+        # Lighter directional PnL fallback: unrealised value just before we flatten (fee = 0 on RH).
+        # Preferred is the exact equity delta computed after the flatten (below).
+        l_pnl_unrealized = 0.0
         if lmk:
             with contextlib.suppress(Exception):
                 lp = await lit.position(lmk.market_id)
                 if lp:
-                    l_pnl = float(lp.get("unrealized_pnl", 0) or 0)
+                    l_pnl_unrealized = float(lp.get("unrealized_pnl", 0) or 0)
 
         # Flatten both venues AT ONCE so neither leg sits naked while the other closes.
         async def _close_ent():
@@ -338,12 +367,20 @@ class SessionEngine:
         if l_err:
             errors.append(f"Lighter не закрився: {l_err}")
 
-        # Accurate Entropy realized PnL + fee from the exchange's fills (give them a moment to register).
+        # Let both venues settle, then read exact figures.
         e_pnl = e_fee = 0.0
         if since_ms is not None:
             await asyncio.sleep(1.5)
             with contextlib.suppress(Exception):
                 e_pnl, e_fee = await ent.realized_since(pair.entropy, since_ms)
+
+        # Exact Lighter PnL = equity change across the (flat→flat) hedge; fall back to the unrealised
+        # read if we couldn't measure equity on both ends.
+        l_pnl = l_pnl_unrealized
+        if lit_equity_before is not None:
+            after = await self._lit_equity(lit)
+            if after is not None:
+                l_pnl = after - lit_equity_before
 
         if owner and errors:
             await self._say(owner, f"⚠️ {pair.label}: " + "; ".join(html.escape(str(e)) for e in errors))
@@ -433,26 +470,41 @@ class SessionEngine:
             await asyncio.sleep(min(1.5, max(0.05, end - time.time())))
 
     async def _finish(self, sid: int, owner: int) -> None:
-        # STOP means: pull EVERY resting order and flatten EVERY position on both venues — not just
-        # the hedges the DB knows about (a cancelled cycle can leave a resting leg behind).
-        sess = await self._store.active_session_by_id(sid)
-        coins = list((sess or {}).get("config", {}).get("coins", []) or [p.key for p in PAIRS])
+        # STOP means: pull EVERY resting order and flatten EVERY open position on both venues — fast.
+        # Read what's ACTUALLY open once and close only those, all concurrently (the old per-coin loop
+        # did a fresh markets round-trip for every coin and was the slow part).
         with contextlib.suppress(Exception):
             ent = await self._entropy_client(owner)
             lit = await self._lighter_client(owner)
             try:
-                if ent:
-                    with contextlib.suppress(Exception):
-                        await ent.cancel_all()          # cancel all resting Entropy orders
+                # 1) cancel all resting orders on both venues at once
+                await asyncio.gather(
+                    self._guard(ent.cancel_all()) if ent else self._noop(),
+                    self._guard(lit.cancel_all()) if lit else self._noop(),
+                )
+                # 2) fetch Lighter market metadata + open positions on both venues (concurrently)
+                lmarkets = {}
                 if lit:
                     with contextlib.suppress(Exception):
-                        await lit.cancel_all()          # cancel all resting Lighter orders
-                # Flatten any open position for every coin the session could have touched.
-                for key in coins:
-                    pair = get_pair(key)
-                    if ent and lit and pair:
-                        with contextlib.suppress(Exception):
-                            await self._close_hedge(ent, lit, pair, owner=owner)
+                        timeout = aiohttp.ClientTimeout(total=8, connect=5)
+                        async with aiohttp.ClientSession(timeout=timeout) as s:
+                            byid = await md.lighter_markets(s, self._cfg.lighter_api_url)
+                            lmarkets = {m.market_id: m for m in byid.values()}
+                ent_pos, lit_pos = await asyncio.gather(
+                    self._guard(ent.positions(), default=[]) if ent else self._noop([]),
+                    self._guard(lit.open_positions(), default=[]) if lit else self._noop([]),
+                )
+                # 3) flatten every open position, all at once
+                tasks = []
+                for p in (ent_pos or []):
+                    if float(p.get("szi", 0) or 0) != 0:
+                        tasks.append(self._guard(ent.close_market(p["coin"])))
+                for p in (lit_pos or []):
+                    lmk = lmarkets.get(p["market_id"])
+                    if lmk:
+                        tasks.append(self._close_lighter(lit, lmk, p.get("entry")))
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 if lit:
                     with contextlib.suppress(Exception):

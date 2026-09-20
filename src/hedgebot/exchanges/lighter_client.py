@@ -116,6 +116,33 @@ class LighterClient:
             return s[:200]
         return None
 
+    async def open_positions(self) -> list[dict]:
+        """All non-flat positions on the account: [{market_id, size(signed), abs, entry, ...}]. One
+        read — used to flatten everything fast on STOP without a per-coin round trip."""
+        import lighter
+        api = lighter.ApiClient(configuration=lighter.Configuration(host=self._url))
+        out: list[dict] = []
+        try:
+            resp = await lighter.AccountApi(api).account(by="index", value=str(self._account_index))
+            for p in (getattr(resp.accounts[0], "positions", None) or []):
+                raw = self._num(p, "position", "base_amount", "size") or 0.0
+                if abs(raw) <= 0:
+                    continue
+                sign = self._num(p, "sign")
+                signed = raw * (1 if (sign is None or sign >= 0) else -1)
+                out.append({
+                    "market_id": int(self._num(p, "market_id", "market_index") or -1),
+                    "size": signed, "abs": abs(signed),
+                    "entry": self._num(p, "avg_entry_price", "entry_price"),
+                    "unrealized_pnl": self._num(p, "unrealized_pnl") or 0.0,
+                })
+        except Exception:  # noqa: BLE001
+            return out
+        finally:
+            with contextlib.suppress(Exception):
+                await api.close()
+        return out
+
     @staticmethod
     def _num(obj, *names):
         for n in names:
