@@ -72,9 +72,16 @@ class SheetsLogger:
 
     @staticmethod
     def _title_sync(info: dict, spreadsheet_id: str) -> str:
+        """Open the sheet AND prove write access by creating and deleting a throwaway worksheet —
+        read access alone doesn't guarantee the service account can append rows (the common failure)."""
         import gspread
         gc = gspread.service_account_from_dict(info)
-        return gc.open_by_key(spreadsheet_id).title
+        ss = gc.open_by_key(spreadsheet_id)
+        title = ss.title
+        ws = ss.add_worksheet(title="_hedgebot_test", rows=1, cols=1)  # raises if no write access
+        with contextlib.suppress(Exception):
+            ss.del_worksheet(ws)
+        return title
 
     # ── public API (all best-effort) ────────────────────────────────────────────────────────────────
     async def ensure_sheet(self, owner_id: int, sid: int) -> None:
