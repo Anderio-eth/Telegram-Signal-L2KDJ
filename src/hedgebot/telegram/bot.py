@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import logging
 
 import aiohttp
@@ -191,7 +192,7 @@ class HedgeBot:
                              f"в позиціях {fmt(b.get('used'))}")
         except Exception as err:  # noqa: BLE001
             LOGGER.exception("entropy balance failed")
-            lines.append(f"🟩 <b>Entropy</b>: помилка — {str(err)[:150]}")
+            lines.append(f"🟩 <b>Entropy</b>: помилка — {html.escape(str(err)[:150])}")
 
         lit = None
         try:
@@ -203,7 +204,7 @@ class HedgeBot:
                 lines.append(f"🟦 <b>Lighter</b>: всього {fmt(b.get('total'))}, вільно {fmt(b.get('available'))}")
         except Exception as err:  # noqa: BLE001
             LOGGER.exception("lighter balance failed")
-            lines.append(f"🟦 <b>Lighter</b>: помилка — {str(err)[:150]}")
+            lines.append(f"🟦 <b>Lighter</b>: помилка — {html.escape(str(err)[:150])}")
         finally:
             if lit:
                 with contextlib.suppress(Exception):
@@ -353,7 +354,8 @@ class HedgeBot:
                 f"Entropy {e.market}: {'BUY' if e.is_buy else 'SELL'} {e.size:g} @ {e.limit_px:g}\n"
                 f"Lighter {pair.lighter}: {'SELL' if l.is_ask else 'BUY'} {l.size:g} @ {l.limit_px:g}\n")
         if plan.errors:
-            text += "\n" + "\n".join("✗ " + e for e in plan.errors)
+            # Errors carry a "<" ("size < min") which HTML parse_mode reads as a tag — escape them.
+            text += "\n" + "\n".join("✗ " + html.escape(e) for e in plan.errors)
         rows = [[InlineKeyboardButton("✅ Відкрити", callback_data="confirm")]] if plan.ok else []
         rows.append([InlineKeyboardButton("⬅️ Скасувати", callback_data="menu")])
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
@@ -393,10 +395,11 @@ class HedgeBot:
             plan, reason = await self._build_plan(owner, pair, notional, entropy_long)
         except Exception as err:  # noqa: BLE001
             LOGGER.exception("build_plan (execute) failed")
-            await update.callback_query.edit_message_text(f"✗ Помилка: {str(err)[:200]}", reply_markup=self._back())
+            await update.callback_query.edit_message_text(f"✗ Помилка: {html.escape(str(err)[:200])}", reply_markup=self._back())
             return
         if plan is None or not plan.ok:
-            await update.callback_query.edit_message_text(f"✗ {reason or (plan.errors[0] if plan else '')}", reply_markup=self._back())
+            await update.callback_query.edit_message_text(
+                f"✗ {html.escape(reason or (plan.errors[0] if plan else ''))}", reply_markup=self._back())
             return
 
         results = {}
@@ -427,8 +430,8 @@ class HedgeBot:
         warn = "" if status == "OPEN" else "\n⚠️ Одна нога не відкрилась — можлива гола дельта, перевір!"
         await update.callback_query.edit_message_text(
             f"{'✅' if status=='OPEN' else '🟠' if status=='PARTIAL' else '🔴'} <b>{pair.label}</b> — {status}\n"
-            f"Entropy: {'ok' if e_ok else results.get('entropy')}\n"
-            f"Lighter: {'ok' if l_ok else results.get('lighter')}{warn}",
+            f"Entropy: {'ok' if e_ok else html.escape(str(results.get('entropy')))}\n"
+            f"Lighter: {'ok' if l_ok else html.escape(str(results.get('lighter')))}{warn}",
             reply_markup=self._back(), parse_mode=ParseMode.HTML)
 
     # ── positions / close ──────────────────────────────────────────────────────────────────────────
