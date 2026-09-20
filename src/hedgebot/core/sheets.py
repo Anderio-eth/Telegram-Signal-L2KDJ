@@ -39,14 +39,41 @@ def _fmt_ts(v) -> str:
 
 
 class SheetsLogger:
-    def __init__(self, store) -> None:
+    def __init__(self, store, notify=None) -> None:
         self._store = store
+        self._notify = notify                       # async (owner_id, text) -> None, for surfaced errors
+        self._warned: set[int] = set()              # owners already told about a write failure
 
     async def enabled(self, owner_id: int) -> bool:
         return (await self._store.get_credentials(owner_id, "gsheets")) is not None
 
     def _title(self, sid: int) -> str:
         return f"Сесія {sid}"
+
+    async def test_connection(self, owner_id: int) -> tuple[bool, str]:
+        """Open the sheet once so setup mistakes (not shared with the service account, Sheets API not
+        enabled, wrong id) surface immediately when the user connects it, not silently at trade time."""
+        creds = await self._store.get_credentials(owner_id, "gsheets")
+        if not creds:
+            return False, "ключ не збережено"
+        spreadsheet_id = creds.meta.get("spreadsheet_id")
+        if not spreadsheet_id:
+            return False, "немає ID таблиці"
+        try:
+            info = json.loads(creds.secret)
+        except (ValueError, TypeError):
+            return False, "JSON ключа зіпсовано"
+        try:
+            title = await asyncio.to_thread(self._title_sync, info, spreadsheet_id)
+            return True, title
+        except Exception as err:  # noqa: BLE001
+            return False, str(err)[:200]
+
+    @staticmethod
+    def _title_sync(info: dict, spreadsheet_id: str) -> str:
+        import gspread
+        gc = gspread.service_account_from_dict(info)
+        return gc.open_by_key(spreadsheet_id).title
 
     # ── public API (all best-effort) ────────────────────────────────────────────────────────────────
     async def ensure_sheet(self, owner_id: int, sid: int) -> None:
@@ -71,17 +98,29 @@ class SheetsLogger:
         except (ValueError, TypeError):
             LOGGER.warning("gsheets creds for %s are not valid JSON", owner_id)
             return
-        with contextlib.suppress(Exception):
+        try:
             await asyncio.to_thread(self._threaded, info, spreadsheet_id, fn, *args)
+            self._warned.discard(owner_id)          # a write got through — allow future warnings again
+        except Exception as err:  # noqa: BLE001 — never let a sheet error escape into the session loop
+            LOGGER.exception("google sheets write failed")
+            await self._warn(owner_id, err)
+
+    async def _warn(self, owner_id: int, err: Exception) -> None:
+        if not self._notify or owner_id in self._warned:
+            return
+        self._warned.add(owner_id)                  # once per owner until a write succeeds again
+        with contextlib.suppress(Exception):
+            await self._notify(
+                owner_id,
+                "⚠️ Не вдалося писати в Google-таблицю: "
+                f"<code>{str(err)[:180]}</code>\n\nПеревір, що таблицею <b>поділено з сервіс-акаунтом</b> "
+                "(Editor) і що ввімкнено <b>Google Sheets API</b>. Статистика поки не пишеться.")
 
     def _threaded(self, info: dict, spreadsheet_id: str, fn, *args) -> None:
-        try:
-            import gspread
-            gc = gspread.service_account_from_dict(info)
-            ss = gc.open_by_key(spreadsheet_id)
-            fn(ss, *args)
-        except Exception:  # noqa: BLE001 — never let a sheet error escape into the session loop
-            LOGGER.exception("google sheets write failed")
+        import gspread
+        gc = gspread.service_account_from_dict(info)
+        ss = gc.open_by_key(spreadsheet_id)
+        fn(ss, *args)
 
     def _worksheet(self, ss, sid: int, create: bool):
         import gspread

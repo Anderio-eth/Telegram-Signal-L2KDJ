@@ -53,10 +53,11 @@ SESS_DEFAULT = {
 class HedgeBot:
     BAL_TTL = 60.0  # seconds a cached balance line stays fresh before the menu refetches
 
-    def __init__(self, cfg: Config, store: Store, engine=None) -> None:
+    def __init__(self, cfg: Config, store: Store, engine=None, sheets=None) -> None:
         self._cfg = cfg
         self._store = store
         self._engine = engine
+        self._sheets = sheets
         # owner_id -> {"ts": monotonic, "at": "HH:MM:SS UTC", "text": str}. Keeps the main menu from
         # hitting both exchanges on every navigation; the 🔄 button forces a refetch.
         self._bal_cache: dict[int, dict] = {}
@@ -525,12 +526,24 @@ class HedgeBot:
                     "Не розібрав ID таблиці. Надішли повне посилання (…/spreadsheets/d/<b>ID</b>/…) "
                     "або сам ID:", back)
                 return ASK
+            email = ctx.user_data["gs_email"]
             await self._store.set_credentials(
                 owner, "gsheets", ctx.user_data["gs_json"],
-                {"spreadsheet_id": spreadsheet_id, "client_email": ctx.user_data["gs_email"]})
+                {"spreadsheet_id": spreadsheet_id, "client_email": email})
             ctx.user_data.clear()
-            await self._refresh_menu(update, ctx, owner,
-                                     "✅ Google-таблицю підключено. Статистика сесій піде туди.")
+            # Verify access right away so a missing "share with the service account" is caught now.
+            ok, detail = (True, "")
+            if self._sheets:
+                await self._edit_anchor(update, ctx, "⏳ Перевіряю доступ до таблиці…", None)
+                ok, detail = await self._sheets.test_connection(owner)
+            if ok:
+                msg = (f"✅ Google-таблицю «{html.escape(detail)}» підключено. Статистика сесій піде туди."
+                       if detail else "✅ Google-таблицю підключено. Статистика сесій піде туди.")
+            else:
+                msg = (f"⚠️ Ключ збережено, але доступу до таблиці немає:\n<code>{html.escape(detail)}</code>\n\n"
+                       f"Поділись таблицею з <code>{html.escape(email)}</code> (Editor) і перевір, що "
+                       "ввімкнено Google Sheets API, потім спробуй ще раз.")
+            await self._refresh_menu(update, ctx, owner, msg)
             return ConversationHandler.END
 
         if flow == "cfg_margin":
@@ -615,6 +628,18 @@ class HedgeBot:
         await self._edit_anchor(update, ctx, "⚙️ <b>Плече</b> (Entropy io макс 6x):", InlineKeyboardMarkup(rows))
 
     # ── auto-session ───────────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _hhmm(v) -> str:
+        """HH:MM:SS (UTC) from a datetime (asyncpg) or an ISO string; '—' if missing/unparsable."""
+        if v is None:
+            return "—"
+        try:
+            if isinstance(v, str):
+                v = datetime.fromisoformat(v)
+            return v.astimezone(timezone.utc).strftime("%H:%M:%S")
+        except (ValueError, TypeError):
+            return "—"
+
     def _fmt_secs(self, s: float) -> str:
         s = int(s)
         return f"{s/86400:.0f}д" if s >= 86400 else (f"{s/3600:.0f}г" if s >= 3600 else f"{s/60:.0f}хв")
@@ -676,6 +701,22 @@ class HedgeBot:
             f"Хеджів: {len(hedges)} (відкрито {len(opened)}, закрито {len(closed)})\n"
             f"Монети: {', '.join(get_pair(k).label for k in cfg.get('coins', []))}\n"
         )
+        # Show each still-open hedge with when it opened and when the bot plans to close it.
+        if opened:
+            text += "\n<b>Відкриті зараз:</b>\n"
+            for h in opened:
+                pair = get_pair(h["pair_key"])
+                label = pair.label if pair else h["pair_key"]
+                det = h.get("detail")
+                if isinstance(det, str):
+                    with contextlib.suppress(Exception):
+                        det = json.loads(det or "{}")
+                det = det if isinstance(det, dict) else {}
+                opened_s = self._hhmm(h.get("opened_at"))
+                close_s = self._hhmm(det.get("close_at"))
+                side = h.get("entropy_side", "")
+                text += f"• {label} {side}: відкрито {opened_s} → закриється ≈ {close_s}\n"
+            text += "<i>Час у UTC.</i>\n"
         rows = [
             [InlineKeyboardButton("⏹ Стоп (закрити все)", callback_data="sess:stop")],
             [InlineKeyboardButton("🔄 Оновити", callback_data="sess")],

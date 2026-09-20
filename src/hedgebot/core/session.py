@@ -24,7 +24,7 @@ import contextlib
 import logging
 import random
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
@@ -121,8 +121,9 @@ class SessionEngine:
 
         if cfg.get("dry_run", True):
             opened_at = datetime.now(timezone.utc)
+            close_at = opened_at + timedelta(seconds=hold)
             hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPEN",
-                                              {"mode": "dry"})
+                                              {"mode": "dry", "hold": hold, "close_at": close_at.isoformat()})
             await self._hedge_alert(cfg, owner, f"🧪 [dry] Відкрив {pair.label} Entropy {side} ${notional:g}. "
                                                 f"Закрию через {self._fmt(hold)}.")
             await self._interruptible_sleep(sid, hold)
@@ -144,7 +145,9 @@ class SessionEngine:
         if plan is None or not plan.ok:
             await self._say(owner, f"⚠️ {pair.label}: не вдалось скласти план — пропускаю цикл.")
             return
-        hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPENING", {})
+        close_at = opened_at + timedelta(seconds=hold)
+        hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPENING",
+                                          {"hold": hold, "close_at": close_at.isoformat()})
         ent = await self._entropy_client(owner)
         lit = await self._lighter_client(owner)
         if not ent or not lit:

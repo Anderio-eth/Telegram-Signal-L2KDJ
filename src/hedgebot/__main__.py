@@ -52,11 +52,12 @@ def main() -> None:
     async def notify(owner_id: int, text: str) -> None:
         await app.bot.send_message(chat_id=owner_id, text=text, parse_mode=ParseMode.HTML)
 
-    engine = SessionEngine(store, cfg, notify=notify, sheets=SheetsLogger(store))
+    sheets = SheetsLogger(store, notify=notify)
+    engine = SessionEngine(store, cfg, notify=notify, sheets=sheets)
     app.bot_data["store"] = store
     app.bot_data["engine"] = engine
     app.add_error_handler(_on_error)
-    HedgeBot(cfg, store, engine).register(app)
+    HedgeBot(cfg, store, engine, sheets=sheets).register(app)
     app.run_polling(drop_pending_updates=True)
 
 
