@@ -28,6 +28,8 @@ class LighterClient:
     # with the 28-day expiry gets the order rejected — which silently broke reduce-only closing.
     IOC_EXPIRY = 0
     GTT_EXPIRY = -1
+    CROSS_MARGIN_MODE = 0
+    ISOLATED_MARGIN_MODE = 1
 
     def __init__(self, api_url: str, account_index: int, api_key_private_key: str,
                  api_key_index: int = 0) -> None:
@@ -175,17 +177,13 @@ class LighterClient:
             api_key_index=self._api_key_index,
         )
 
-    async def set_leverage(self, market_index: int, leverage: int) -> object | None:
-        """Best-effort leverage set. The SDK method/signature varies by version, so try the common
-        names and swallow anything unsupported (the caller also guards). VERIFY against the live SDK."""
-        fn = getattr(self._signer, "update_leverage", None) or getattr(self._signer, "change_leverage", None)
-        if fn is None:
-            return None
-        try:
-            return await fn(market_index=market_index, leverage=int(leverage))
-        except TypeError:
-            # some versions take (market_index, margin_mode, leverage)
-            return await fn(market_index, 0, int(leverage))
+    async def set_leverage(self, market_index: int, leverage: int, *, isolated: bool = True) -> object:
+        """Set leverage for a market. SDK signature is update_leverage(market_index, margin_mode,
+        leverage) with margin_mode 0=cross, 1=isolated — passing it wrong (my earlier guess) failed
+        silently and left the old leverage on the exchange. Returns the SDK's (tx, resp, err) tuple;
+        use order_error() to read the reason."""
+        mode = self.ISOLATED_MARGIN_MODE if isolated else self.CROSS_MARGIN_MODE
+        return await self._signer.update_leverage(market_index, mode, int(leverage))
 
     async def cancel_all(self) -> object:
         return await self._signer.cancel_all_orders()

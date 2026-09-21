@@ -216,8 +216,12 @@ class SessionEngine:
             lit_equity_before = await self._lit_equity(lit)   # for exact Lighter PnL (equity delta)
             with contextlib.suppress(Exception):
                 await ent.set_leverage(e.market, leverage)
-            with contextlib.suppress(Exception):
-                await lit.set_leverage(l.market_index, leverage)
+            # Lighter leverage MUST be set correctly (isolated) or the position opens at the old
+            # leverage — surface a failure so a wrong leverage doesn't go unnoticed.
+            lev_err = await self._place(lambda: lit.set_leverage(l.market_index, leverage), lit.order_error)
+            if lev_err:
+                await self._say(owner, f"⚠️ {pair.label}: не вдалось виставити плече {leverage}x на Lighter: "
+                                       f"{html.escape(str(lev_err))}")
             # Fire BOTH legs at once (gather) so they hit the market simultaneously — sequential posting
             # let the price drift between legs and widened the hedge's PnL. Each response is checked:
             # a rejected order (margin, min notional) doesn't raise, so this is where it surfaces.
