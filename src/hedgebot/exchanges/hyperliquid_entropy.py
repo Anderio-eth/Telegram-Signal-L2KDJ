@@ -59,14 +59,23 @@ class EntropyClient:
         )
 
     async def balance(self) -> dict:
-        """Account value and free (withdrawable) collateral in the io DEX. marginSummary is the
-        equity picture; withdrawable is what isn't tied up as margin."""
-        state = await asyncio.to_thread(self._info.user_state, self._address, self._dex)
+        """Tradeable balance as entropy.io shows it = io-perp equity + spot USDC. The io perp account
+        is empty when flat (collateral sits in spot and moves in when a position opens), so reading the
+        io account alone showed $0 even with money available. total/free include spot; `io`/`spot`
+        give the breakdown."""
+        state, spot = await asyncio.gather(
+            asyncio.to_thread(self._info.user_state, self._address, self._dex),
+            self.spot_usdc(),
+        )
         ms = state.get("marginSummary", {}) or {}
+        io_total = float(ms.get("accountValue", 0) or 0)
+        io_free = float(state.get("withdrawable", 0) or 0)
         return {
-            "total": float(ms.get("accountValue", 0) or 0),
+            "total": io_total + spot,
             "used": float(ms.get("totalMarginUsed", 0) or 0),
-            "free": float(state.get("withdrawable", 0) or 0),
+            "free": io_free + spot,
+            "io": io_total,
+            "spot": spot,
         }
 
     async def spot_usdc(self) -> float:

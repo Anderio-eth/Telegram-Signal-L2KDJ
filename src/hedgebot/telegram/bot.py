@@ -216,13 +216,12 @@ class HedgeBot:
                 if not ent:
                     return "🟩 Entropy: ключ не заведено"
                 b = await ent.balance()
-                line = f"🟩 Entropy (io): {fmt(b.get('total'))} · вільно {fmt(b.get('free'))}"
-                # io empty but money in spot → tell the user to move it into io to trade.
-                if float(b.get("total") or 0) < 0.5:
-                    with contextlib.suppress(Exception):
-                        spot = await ent.spot_usdc()
-                        if spot > 0.5:
-                            line += f"\n   💡 ${spot:,.2f} у spot — переведи в io (Entropy), щоб торгувати"
+                io, spot = float(b.get("io") or 0), float(b.get("spot") or 0)
+                line = f"🟩 Entropy: {fmt(b.get('total'))} (io {fmt(io)} + spot {fmt(spot)})"
+                # Orders draw on the io-perp margin; if it's empty and money is in spot, the bot's raw
+                # orders hit "not enough margin" — flag it so the user moves funds into io.
+                if io < 0.5 and spot > 0.5:
+                    line += "\n   ⚠️ кошти в spot — переведи в io-перп, інакше ордери не пройдуть"
                 return line
             except Exception as err:  # noqa: BLE001
                 LOGGER.exception("entropy balance failed")
