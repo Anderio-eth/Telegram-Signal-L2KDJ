@@ -69,6 +69,15 @@ class EntropyClient:
             "free": float(state.get("withdrawable", 0) or 0),
         }
 
+    async def spot_usdc(self) -> float:
+        """USDC sitting in the Hyperliquid SPOT wallet (not the io perp account). Used to hint the user
+        when io shows $0 but the money is just in spot and needs transferring into io to trade."""
+        state = await asyncio.to_thread(self._info.spot_user_state, self._address)
+        for b in state.get("balances", []) or []:
+            if b.get("coin") == "USDC":
+                return float(b.get("total", 0) or 0)
+        return 0.0
+
     async def positions(self) -> list[dict]:
         """Open io positions for this account: [{coin, szi, entryPx, leverage, ...}]."""
         state = await asyncio.to_thread(self._info.user_state, self._address, self._dex)

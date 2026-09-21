@@ -216,7 +216,14 @@ class HedgeBot:
                 if not ent:
                     return "🟩 Entropy: ключ не заведено"
                 b = await ent.balance()
-                return f"🟩 Entropy (io): {fmt(b.get('total'))} · вільно {fmt(b.get('free'))}"
+                line = f"🟩 Entropy (io): {fmt(b.get('total'))} · вільно {fmt(b.get('free'))}"
+                # io empty but money in spot → tell the user to move it into io to trade.
+                if float(b.get("total") or 0) < 0.5:
+                    with contextlib.suppress(Exception):
+                        spot = await ent.spot_usdc()
+                        if spot > 0.5:
+                            line += f"\n   💡 ${spot:,.2f} у spot — переведи в io (Entropy), щоб торгувати"
+                return line
             except Exception as err:  # noqa: BLE001
                 LOGGER.exception("entropy balance failed")
                 await self._drop_clients(owner)   # cached client may be dead — rebuild next time
