@@ -266,9 +266,12 @@ class SessionEngine:
                                                lit_equity_before=lit_equity_before)
                 await self._store.update_hedge(hid, status="CANCELLED",
                                                realized_pnl=res["pnl"], fees=res["fees"])
-                await self._hedge_alert(cfg, owner, f"✖️ {pair.label}: одна нога не заповнилась вчасно — скасовано.")
+                # The timeout only fires AFTER a leg filled, so a leg was opened and unwound — that
+                # round-trip is the small PnL/fee recorded here (not a phantom cost on a no-op).
+                await self._hedge_alert(cfg, owner, f"✖️ {pair.label}: друга нога не встигла — закрив першу "
+                                                    f"(відкат). PnL ≈ ${res['pnl']:g}, комісія ${res['fees']:g}.")
                 await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
-                                 coin=pair.label, side=side, open_status="CANCELLED", status="CANCELLED",
+                                 coin=pair.label, side=side, open_status="ВІДКАТ (1 нога)", status="CANCELLED",
                                  pnl=res["pnl"], fees=res["fees"], lighter_vol=0.0, entropy_vol=0.0)
                 return
             await self._store.update_hedge(hid, status="OPEN")
