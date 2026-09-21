@@ -227,6 +227,13 @@ class SessionEngine:
         try:
             e, l = plan.entropy, plan.lighter
             lit_equity_before = await self._lit_equity(lit)   # for exact Lighter PnL (equity delta)
+            # Move the required margin spot->io if the io-perp is short (what entropy.io does on order;
+            # raw API orders don't, which caused "not enough margin"). needed ≈ notional / leverage.
+            with contextlib.suppress(Exception):
+                mv_err = await ent.ensure_margin(notional / max(1, leverage) + 0.10)
+                if mv_err:
+                    await self._say(owner, f"⚠️ {pair.label}: не зміг перевести маржу spot→io: "
+                                           f"{html.escape(str(mv_err))}")
             with contextlib.suppress(Exception):
                 await ent.set_leverage(e.market, leverage)
             # Lighter leverage MUST be set correctly (isolated) or the position opens at the old

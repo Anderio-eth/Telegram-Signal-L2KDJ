@@ -78,6 +78,28 @@ class EntropyClient:
             "spot": spot,
         }
 
+    async def ensure_margin(self, needed_usd: float) -> str | None:
+        """Make sure the io-perp account has >= needed_usd of FREE margin, moving USDC from the spot
+        wallet if it's short — this is the spot->io transfer the entropy.io frontend does on order,
+        which raw API orders skip (hence "not enough margin"). Self-transfer only (destination is our
+        own address). Returns None if nothing needed / it succeeded, else an error string."""
+        state, spot = await asyncio.gather(
+            asyncio.to_thread(self._info.user_state, self._address, self._dex),
+            self.spot_usdc(),
+        )
+        io_free = float(state.get("withdrawable", 0) or 0)
+        if io_free >= needed_usd:
+            return None
+        move = min(spot, needed_usd - io_free + 0.10)   # +buffer for fees/rounding
+        if move < 0.01:
+            return None                                  # nothing in spot to move; let the order speak
+        try:
+            resp = await asyncio.to_thread(
+                self._exchange.send_asset, self._address, "spot", self._dex, "USDC", round(move, 2))
+            return self.order_error(resp)
+        except Exception as e:  # noqa: BLE001
+            return str(e)[:200]
+
     async def spot_usdc(self) -> float:
         """USDC sitting in the Hyperliquid SPOT wallet (not the io perp account). Used to hint the user
         when io shows $0 but the money is just in spot and needs transferring into io to trade."""
