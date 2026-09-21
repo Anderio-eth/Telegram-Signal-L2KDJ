@@ -169,12 +169,13 @@ class SessionEngine:
         if not pair:
             return
         leverage = int(cfg["leverage"])
-        notional = float(cfg["margin"]) * leverage
+        margin = float(cfg["margin"])
         entropy_long = bool(random.getrandbits(1))   # randomise side each cycle
         hold = random.uniform(cfg.get("hold_min", 1800), cfg.get("hold_max", 7200))
         side = "LONG" if entropy_long else "SHORT"
 
         if cfg.get("dry_run", True):
+            notional = margin * leverage
             opened_at = datetime.now(timezone.utc)
             close_at = opened_at + timedelta(seconds=hold)
             hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPEN",
@@ -191,17 +192,22 @@ class SessionEngine:
             return
 
         # ── live ──────────────────────────────────────────────────────────────────────────────────
-        await self._live_cycle(owner, sid, pair, leverage, notional, entropy_long, hold, cfg)
+        await self._live_cycle(owner, sid, pair, leverage, margin, entropy_long, hold, cfg)
 
-    async def _live_cycle(self, owner, sid, pair, leverage, notional, entropy_long, hold, cfg) -> None:
+    async def _live_cycle(self, owner, sid, pair, leverage, margin, entropy_long, hold, cfg) -> None:
         side = "LONG" if entropy_long else "SHORT"
         opened_at = datetime.now(timezone.utc)
         opened_ms = int(opened_at.timestamp() * 1000)
-        plan = await self._build_plan(pair, notional, entropy_long)
+        # Clamp leverage to what BOTH venues allow for this coin (Lighter caps OAI/ANTH at 5x); the
+        # notional follows the effective leverage so the margin used stays the user's chosen amount.
+        plan, leverage = await self._build_plan(pair, margin, leverage, entropy_long)
         if plan is None or not plan.ok:
             why = plan.errors[0] if (plan and plan.errors) else "не вдалось скласти план"
             await self._say(owner, f"⚠️ {pair.label}: {html.escape(str(why))} — пропускаю цикл.")
             return
+        notional = plan.notional_usd
+        if int(leverage) < int(cfg["leverage"]):
+            await self._say(owner, f"ℹ️ {pair.label}: плече знижено до {leverage}x (макс для цієї монети).")
         close_at = opened_at + timedelta(seconds=hold)
         hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPENING",
                                           {"hold": hold, "close_at": close_at.isoformat()})
@@ -421,26 +427,31 @@ class SessionEngine:
         return "позиція ще відкрита після закриття" if (pos and pos.get("abs", 0) > 0) else None
 
     # ── shared build/clients (mirrors the bot's) ───────────────────────────────────────────────────
-    async def _build_plan(self, pair, notional, entropy_long):
+    async def _build_plan(self, pair, margin, leverage, entropy_long):
+        """Returns (plan, effective_leverage). Leverage is clamped to the lower of the two venues'
+        per-coin maxima, and the notional = margin × that effective leverage."""
         try:
             timeout = aiohttp.ClientTimeout(total=8, connect=5)
             async with aiohttp.ClientSession(timeout=timeout) as s:
                 emk = (await md.entropy_markets(s, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
                 lmk = (await md.lighter_markets(s, self._cfg.lighter_api_url)).get(pair.lighter)
                 if not emk or not lmk:
-                    return None
+                    return None, leverage
                 # Prefer the realtime WS mid; fall back to a REST mark if the feed is cold/stale.
                 eprice = (self._feed.mid(pair.entropy) if self._feed else None)
                 if not eprice:
                     eprice = (await md.entropy_marks(s, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
                 lprice = await md.lighter_mark(s, self._cfg.lighter_api_url, lmk.market_id)
                 if not eprice or not lprice:
-                    return None
-            return plan_hedge(pair, notional, entropy_long=entropy_long, entropy_price=eprice,
+                    return None, leverage
+            eff = max(1, min(int(leverage), int(emk.max_leverage or leverage), int(lmk.max_leverage or leverage)))
+            notional = float(margin) * eff
+            plan = plan_hedge(pair, notional, entropy_long=entropy_long, entropy_price=eprice,
                               lighter_price=lprice, entropy_market=emk, lighter_market=lmk)
+            return plan, eff
         except Exception:  # noqa: BLE001
             LOGGER.exception("session build_plan failed")
-            return None
+            return None, leverage
 
     async def _entropy_client(self, owner):
         c = await self._store.get_credentials(owner, "entropy")

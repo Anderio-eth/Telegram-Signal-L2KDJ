@@ -32,6 +32,7 @@ class LighterMarket:
     price_decimals: int
     min_base: float
     min_quote: float
+    max_leverage: int = 1   # from min_initial_margin_fraction (10000 / min_imf); 6x/6x/10x etc.
 
 
 async def _post(session: aiohttp.ClientSession, url: str, payload: dict):
@@ -69,6 +70,18 @@ async def entropy_marks(session, api_url: str, dex: str = "io") -> dict[str, flo
 # ── Lighter ──────────────────────────────────────────────────────────────────────────────────────
 async def lighter_markets(session, api_url: str) -> dict[str, LighterMarket]:
     data = await _get(session, f"{api_url}/api/v1/orderBooks")
+    # Per-market max leverage lives in a separate endpoint as min_initial_margin_fraction (bps):
+    # max_leverage = 10000 / min_imf. Fetch it so we never request a leverage the market rejects
+    # (code 21113 "invalid initial margin fraction").
+    max_lev: dict[str, int] = {}
+    try:
+        det = await _get(session, f"{api_url}/api/v1/orderBookDetails")
+        for o in det.get("order_book_details", []) or []:
+            imf = int(o.get("min_initial_margin_fraction", 0) or 0)
+            if imf > 0:
+                max_lev[o["symbol"]] = max(1, 10000 // imf)
+    except Exception:  # noqa: BLE001 — fall back to 1x cap if the detail endpoint is unavailable
+        pass
     out: dict[str, LighterMarket] = {}
     for o in data.get("order_books", []):
         if o.get("market_type") != "perp" or o.get("status") != "active":
@@ -80,6 +93,7 @@ async def lighter_markets(session, api_url: str) -> dict[str, LighterMarket]:
             price_decimals=int(o.get("supported_price_decimals", 0)),
             min_base=float(o.get("min_base_amount", 0) or 0),
             min_quote=float(o.get("min_quote_amount", 0) or 0),
+            max_leverage=int(max_lev.get(o["symbol"], 1)),
         )
     return out
 
