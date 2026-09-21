@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import json
 import logging
 import random
 import time
@@ -141,6 +142,8 @@ class SessionEngine:
         verb = "🔄 Сесію відновлено після перезапуску" if resumed else "▶️ Сесію запущено"
         await self._say(owner, f"{verb} ({mode}). Триватиме ~{self._fmt(cfg.get('duration',86400))}.")
         try:
+            if resumed and not cfg.get("dry_run", True):
+                await self._adopt_open_hedges(owner, sid, cfg)   # finish hedges left open by the restart
             while time.time() < ends_at:
                 if await self._stopping(sid):
                     break
@@ -282,19 +285,65 @@ class SessionEngine:
         finally:
             pass  # clients are cached for the whole session; closed in _finish
 
+    async def _adopt_open_hedges(self, owner, sid, cfg) -> None:
+        """After a restart, finish hedges that were left OPEN — wait out the rest of their planned hold
+        (from detail.close_at) then close them, instead of abandoning the position and opening a new
+        one on top (which fought for margin)."""
+        hedges = await self._store.session_hedges(sid)
+        openh = [h for h in hedges if h["status"] in ("OPEN", "OPENING")]
+        if not openh:
+            return
+        ent = await self._entropy_client(owner)
+        lit = await self._lighter_client(owner)
+        for h in openh:
+            if await self._stopping(sid):
+                return
+            pair = get_pair(h["pair_key"])
+            if not (pair and ent and lit):
+                await self._store.update_hedge(h["id"], status="CLOSED")
+                continue
+            det = h.get("detail")
+            if isinstance(det, str):
+                with contextlib.suppress(Exception):
+                    det = json.loads(det or "{}")
+            det = det if isinstance(det, dict) else {}
+            remaining = 0.0
+            with contextlib.suppress(Exception):
+                if det.get("close_at"):
+                    remaining = (datetime.fromisoformat(det["close_at"]) - datetime.now(timezone.utc)).total_seconds()
+            await self._say(owner, f"↩️ {pair.label}: підхопив відкритий хедж після рестарту — "
+                                   f"{('закрию за ' + self._fmt(remaining)) if remaining > 0 else 'закриваю зараз'}.")
+            if remaining > 0:
+                await self._interruptible_sleep(sid, remaining)
+            since_ms = int(h["opened_at"].timestamp() * 1000) if h.get("opened_at") else None
+            res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms)
+            await self._store.update_hedge(h["id"], status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"])
+            vol = float(h.get("notional_usd", 0) or 0) * 2
+            await self._stat(owner, sid, opened_at=h.get("opened_at"), closed_at=datetime.now(timezone.utc),
+                             coin=pair.label, side=h.get("entropy_side", ""), open_status="OK", status="CLOSED",
+                             pnl=res["pnl"], fees=res["fees"], lighter_vol=vol, entropy_vol=vol)
+
     # ── live helpers ────────────────────────────────────────────────────────────────────────────────
     @staticmethod
     async def _place(do_order, error_parser) -> str | None:
-        """Run one leg's order and return a rejection reason (or None if accepted). Covers both a
-        raised exception and a response that merely reports an error without raising."""
-        try:
-            resp = await do_order()
-        except Exception as err:  # noqa: BLE001
-            return str(err)[:200]
-        try:
-            return error_parser(resp)
-        except Exception:  # noqa: BLE001
-            return None
+        """Run one leg's order and return a rejection reason (or None if accepted). Covers a raised
+        exception and a response that reports an error without raising. Retries once on a nonce error
+        (the optimistic nonce manager can drift after a restart/failed tx and resyncs on the retry)."""
+        err = None
+        for attempt in range(2):
+            try:
+                resp = await do_order()
+            except Exception as e:  # noqa: BLE001
+                return str(e)[:200]
+            try:
+                err = error_parser(resp)
+            except Exception:  # noqa: BLE001
+                err = None
+            if err and "nonce" in err.lower() and attempt == 0:
+                await asyncio.sleep(0.6)   # let the nonce manager resync, then retry once
+                continue
+            return err
+        return err
 
     async def _await_fills(self, sid: int, ent, lit, pair, e, l, timeout: float) -> bool:
         """True once both legs are fully filled. Timeout only counts from the first partial fill.
