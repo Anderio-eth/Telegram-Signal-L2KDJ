@@ -227,13 +227,8 @@ class SessionEngine:
         try:
             e, l = plan.entropy, plan.lighter
             lit_equity_before = await self._lit_equity(lit)   # for exact Lighter PnL (equity delta)
-            # Move the required margin spot->io if the io-perp is short (what entropy.io does on order;
-            # raw API orders don't, which caused "not enough margin"). needed ≈ notional / leverage.
-            with contextlib.suppress(Exception):
-                mv_err = await ent.ensure_margin(notional / max(1, leverage) + 0.10)
-                if mv_err:
-                    await self._say(owner, f"⚠️ {pair.label}: не зміг перевести маржу spot→io: "
-                                           f"{html.escape(str(mv_err))}")
+            # (No spot->io transfer: io draws margin from spot on its own, and the agent API wallet
+            # can't move funds anyway — positions open fine without it.)
             with contextlib.suppress(Exception):
                 await ent.set_leverage(e.market, leverage)
             # Lighter leverage MUST be set correctly (isolated) or the position opens at the old
@@ -282,13 +277,17 @@ class SessionEngine:
                                  pnl=res["pnl"], fees=res["fees"], lighter_vol=0.0, entropy_vol=0.0)
                 return
             await self._store.update_hedge(hid, status="OPEN")
-            await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (обидві ноги). Закрию через {self._fmt(hold)}.")
+            l_side = "SHORT" if entropy_long else "LONG"
+            await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (Entropy {side} ✓ / Lighter {l_side} ✓). "
+                                                f"Закрию через {self._fmt(hold)}.")
             await self._interruptible_sleep(sid, hold)
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
                                           lit_equity_before=lit_equity_before)
             await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
                                            entropy_vol=notional * 2, lighter_vol=notional * 2)
-            await self._hedge_alert(cfg, owner, f"✅ {pair.label} закрито. PnL ≈ ${res['pnl']:g}.")
+            lit_mark = "✓" if not res.get("errors") else "✗"
+            await self._hedge_alert(cfg, owner, f"✅ {pair.label} закрито (Entropy ✓ / Lighter {lit_mark}). "
+                                                f"PnL ≈ ${res['pnl']:g}, комісія ${res['fees']:g}.")
             await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
                              coin=pair.label, side=side, open_status="OK", status="CLOSED",
                              pnl=res["pnl"], fees=res["fees"], lighter_vol=notional * 2, entropy_vol=notional * 2)

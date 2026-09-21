@@ -232,12 +232,8 @@ class HedgeBot:
                     return "🟩 Entropy: ключ не заведено"
                 b = await ent.balance()
                 io, spot = float(b.get("io") or 0), float(b.get("spot") or 0)
-                line = f"🟩 Entropy: {fmt(b.get('total'))} (io {fmt(io)} + spot {fmt(spot)})"
-                # Orders draw on the io-perp margin; if it's empty and money is in spot, the bot's raw
-                # orders hit "not enough margin" — flag it so the user moves funds into io.
-                if io < 0.5 and spot > 0.5:
-                    line += "\n   ⚠️ кошти в spot — переведи в io-перп, інакше ордери не пройдуть"
-                return line
+                # io draws margin from spot automatically, so total (io+spot) is what's tradeable.
+                return f"🟩 Entropy: {fmt(b.get('total'))} (io {fmt(io)} + spot {fmt(spot)})"
             except Exception as err:  # noqa: BLE001
                 LOGGER.exception("entropy balance failed")
                 await self._drop_clients(owner)   # cached client may be dead — rebuild next time
