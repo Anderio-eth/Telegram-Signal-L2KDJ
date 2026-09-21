@@ -66,6 +66,9 @@ class HedgeBot:
         # owner_id -> {"entropy": client|None, "lighter": client|None, "ts": monotonic}. Building a
         # client is a network round-trip (Entropy loads meta); reusing it is what makes the menu snappy.
         self._client_cache: dict[int, dict] = {}
+        # chat_id -> current anchor message id. Single source of truth for "the menu message", shared
+        # by handlers and by the notification re-anchor (push_menu), so they never fight.
+        self._anchor: dict[int, int] = {}
 
     async def _drop_clients(self, owner: int) -> None:
         """Close and forget an owner's cached clients (on a key change or after an error)."""
@@ -109,12 +112,12 @@ class HedgeBot:
 
     async def _reanchor_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
         """Drop the old anchor and post a fresh main menu at the bottom of the chat."""
-        old = ctx.chat_data.get("menu_msg_id")
+        old = self._anchor.get(update.effective_chat.id)
         if old:
             with contextlib.suppress(Exception):
                 await ctx.bot.delete_message(update.effective_chat.id, old)
         m = await update.effective_chat.send_message(**await self._main_menu(owner))
-        ctx.chat_data["menu_msg_id"] = m.message_id
+        self._anchor[update.effective_chat.id] = m.message_id
 
     def _guard(self, update: Update) -> int | None:
         uid = update.effective_user.id if update.effective_user else None
@@ -133,14 +136,14 @@ class HedgeBot:
             carrier = await update.message.reply_text("⌨️", reply_markup=self._reply_kb())
             await carrier.delete()
         m = await update.message.reply_text(**await self._main_menu(update.effective_user.id))
-        ctx.chat_data["menu_msg_id"] = m.message_id      # the single message we keep and edit
+        self._anchor[update.effective_chat.id] = m.message_id   # the single message we keep and edit
         with contextlib.suppress(Exception):
             await update.message.delete()                # drop the /start command too
 
     async def _menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(**await self._main_menu(update.effective_user.id))
-        ctx.chat_data["menu_msg_id"] = update.callback_query.message.message_id
+        self._anchor[update.effective_chat.id] = update.callback_query.message.message_id
         return ConversationHandler.END
 
     @staticmethod
@@ -151,7 +154,7 @@ class HedgeBot:
         """Edit the one persistent menu message in place. Falls back to sending a new one (and
         remembering it) only if the old message is gone. This is what keeps the chat to a single
         message — every step of a flow edits this same message instead of sending new ones."""
-        mid = ctx.chat_data.get("menu_msg_id")
+        mid = self._anchor.get(update.effective_chat.id)
         if mid:
             try:
                 await ctx.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=mid,
@@ -160,7 +163,7 @@ class HedgeBot:
             except Exception:  # noqa: BLE001 — message gone/identical; fall through to a fresh one
                 pass
         m = await update.effective_chat.send_message(text, reply_markup=markup, parse_mode=ParseMode.HTML)
-        ctx.chat_data["menu_msg_id"] = m.message_id
+        self._anchor[update.effective_chat.id] = m.message_id
 
     async def _refresh_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int, prefix: str = "") -> None:
         menu = await self._main_menu(owner)
@@ -238,7 +241,7 @@ class HedgeBot:
         data = q.data
         await q.answer()
         owner = update.effective_user.id
-        ctx.chat_data["menu_msg_id"] = q.message.message_id   # this message is the anchor we keep
+        self._anchor[update.effective_chat.id] = q.message.message_id   # this message is the anchor we keep
         if data == "menu":
             await q.edit_message_text(**await self._main_menu(owner))
         elif data == "keys":
@@ -448,7 +451,7 @@ class HedgeBot:
         await update.callback_query.answer()
         data = update.callback_query.data
         # This button lives on the persistent menu message — make it the anchor we keep editing.
-        ctx.chat_data["menu_msg_id"] = update.callback_query.message.message_id
+        self._anchor[update.effective_chat.id] = update.callback_query.message.message_id
         if data == "key:lighter":
             ctx.user_data.clear()
             ctx.user_data.update(flow="key_lighter", step=0)
@@ -751,7 +754,9 @@ class HedgeBot:
         ]
         await self._edit_anchor(update, ctx, text, InlineKeyboardMarkup(rows))
 
-    async def _sess_active(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, sess_row: dict) -> None:
+    async def _sess_active_view(self, sess_row: dict) -> dict:
+        """Render the active-session status (text + buttons) — usable both from a handler and from the
+        auto re-anchor after a notification."""
         cfg = sess_row["config"]
         hedges = await self._store.session_hedges(sess_row["id"])
         opened = [h for h in hedges if h["status"] in ("OPEN", "OPENING")]
@@ -762,7 +767,6 @@ class HedgeBot:
             f"Хеджів: {len(hedges)} (відкрито {len(opened)}, закрито {len(closed)})\n"
             f"Монети: {', '.join(get_pair(k).label for k in cfg.get('coins', []))}\n"
         )
-        # Show each still-open hedge with when it opened and when the bot plans to close it.
         if opened:
             text += "\n<b>Відкриті зараз:</b>\n"
             for h in opened:
@@ -773,17 +777,35 @@ class HedgeBot:
                     with contextlib.suppress(Exception):
                         det = json.loads(det or "{}")
                 det = det if isinstance(det, dict) else {}
-                opened_s = self._hhmm(h.get("opened_at"))
-                close_s = self._hhmm(det.get("close_at"))
-                side = h.get("entropy_side", "")
-                text += f"• {label} {side}: відкрито {opened_s} → закриється ≈ {close_s}\n"
+                text += (f"• {label} {h.get('entropy_side','')}: відкрито {self._hhmm(h.get('opened_at'))} "
+                         f"→ закриється ≈ {self._hhmm(det.get('close_at'))}\n")
             text += "<i>Час у UTC.</i>\n"
         rows = [
             [InlineKeyboardButton("⏹ Стоп (закрити все)", callback_data="sess:stop")],
             [InlineKeyboardButton("🔄 Оновити", callback_data="sess")],
             [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
         ]
-        await self._edit_anchor(update, ctx, text, InlineKeyboardMarkup(rows))
+        return {"text": text, "reply_markup": InlineKeyboardMarkup(rows), "parse_mode": ParseMode.HTML}
+
+    async def _sess_active(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, sess_row: dict) -> None:
+        view = await self._sess_active_view(sess_row)
+        await self._edit_anchor(update, ctx, view["text"], view["reply_markup"])
+
+    async def push_menu(self, app, chat_id: int) -> None:
+        """Re-post the live anchor (active-session view, else main menu) at the BOTTOM of the chat and
+        delete the previous one — so notifications scroll up above a menu that stays pinned to the
+        bottom. Called after every bot-sent notification."""
+        try:
+            active = await self._store.active_session(chat_id)
+            view = await self._sess_active_view(active) if active else await self._main_menu(chat_id)
+            old = self._anchor.get(chat_id)
+            m = await app.bot.send_message(chat_id=chat_id, **view)
+            self._anchor[chat_id] = m.message_id
+            if old and old != m.message_id:
+                with contextlib.suppress(Exception):
+                    await app.bot.delete_message(chat_id, old)
+        except Exception:  # noqa: BLE001 — re-anchoring must never break the notification path
+            LOGGER.debug("push_menu failed", exc_info=True)
 
     async def _sess_coins(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         chosen = ctx.chat_data["sess"]["coins"]

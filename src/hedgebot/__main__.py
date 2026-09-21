@@ -56,6 +56,10 @@ def main() -> None:
 
     async def notify(owner_id: int, text: str) -> None:
         await app.bot.send_message(chat_id=owner_id, text=text, parse_mode=ParseMode.HTML)
+        # Keep the menu pinned to the bottom: re-post it under the notification, delete the old one.
+        bot = app.bot_data.get("hedgebot")
+        if bot:
+            await bot.push_menu(app, owner_id)
 
     sheets = SheetsLogger(store, notify=notify)
     feed = PriceFeed(cfg.hyperliquid_api_url, cfg.entropy_dex)
@@ -64,7 +68,9 @@ def main() -> None:
     app.bot_data["engine"] = engine
     app.bot_data["feed"] = feed
     app.add_error_handler(_on_error)
-    HedgeBot(cfg, store, engine, sheets=sheets, feed=feed).register(app)
+    hedgebot = HedgeBot(cfg, store, engine, sheets=sheets, feed=feed)
+    app.bot_data["hedgebot"] = hedgebot
+    hedgebot.register(app)
     app.run_polling(drop_pending_updates=True)
 
 
