@@ -14,6 +14,7 @@ VERIFY on first live run (cannot be checked without keys):
 from __future__ import annotations
 
 import contextlib
+import time
 
 from lighter import SignerClient
 
@@ -30,6 +31,7 @@ class LighterClient:
     GTT_EXPIRY = -1
     CROSS_MARGIN_MODE = 0
     ISOLATED_MARGIN_MODE = 1
+    CANCEL_ALL_TIF_IMMEDIATE = 0
 
     def __init__(self, api_url: str, account_index: int, api_key_private_key: str,
                  api_key_index: int = 0) -> None:
@@ -186,7 +188,10 @@ class LighterClient:
         return await self._signer.update_leverage(market_index, mode, int(leverage))
 
     async def cancel_all(self) -> object:
-        return await self._signer.cancel_all_orders()
+        # SDK requires (time_in_force, timestamp_ms); calling it bare raised and was swallowed, so STOP
+        # never actually cancelled Lighter orders. Immediate mode + a short future deadline.
+        return await self._signer.cancel_all_orders(
+            self.CANCEL_ALL_TIF_IMMEDIATE, int(time.time() * 1000) + 60_000)
 
     async def close(self) -> None:
         """Release the SDK's HTTP/WS resources."""
