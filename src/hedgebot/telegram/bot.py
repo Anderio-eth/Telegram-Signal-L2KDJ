@@ -83,7 +83,10 @@ class HedgeBot:
         app.add_handler(ConversationHandler(
             entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy|gsheets)|cfg:margin|sess:(hold|pause|timeout|margin))$")],
             states={ASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_input)]},
-            fallbacks=[CallbackQueryHandler(self._menu, pattern=r"^menu$")],
+            # ANY navigation button (Назад/Меню) ENDS the input flow and routes normally — otherwise a
+            # prompt whose Назад points to open/sess/stats left the conversation stuck in ASK, and the
+            # margin/hold/pause buttons then did nothing on the next tap (entry can't re-fire).
+            fallbacks=[CallbackQueryHandler(self._conv_exit, pattern=r"^[a-z]")],
             per_message=False,
         ))
         app.add_handler(CallbackQueryHandler(self._router))
@@ -143,6 +146,18 @@ class HedgeBot:
         self._anchor[update.effective_chat.id] = m.message_id   # the single message we keep and edit
         with contextlib.suppress(Exception):
             await update.message.delete()                # drop the /start command too
+
+    _ENTRY_RE = re.compile(r"^(key:(lighter|entropy|gsheets)|cfg:margin|sess:(hold|pause|timeout|margin))$")
+
+    async def _conv_exit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        """Fallback for any button pressed while awaiting text input. If it's another input button,
+        switch to it (stay in the flow); otherwise end the flow and route the navigation normally —
+        so a Назад never leaves the conversation stuck (which had killed the margin/hold/pause buttons)."""
+        data = (update.callback_query.data or "") if update.callback_query else ""
+        if self._ENTRY_RE.match(data):
+            return await self._begin_input(update, ctx)     # re-enter with the new prompt
+        await self._router(update, ctx)                      # do the navigation
+        return ConversationHandler.END
 
     async def _menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         await update.callback_query.answer()
