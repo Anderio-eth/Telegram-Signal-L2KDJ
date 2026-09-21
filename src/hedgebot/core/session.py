@@ -52,6 +52,9 @@ class SessionEngine:
         self._sheets = sheets                       # SheetsLogger | None — per-session stats to a sheet
         self._feed = feed                           # PriceFeed | None — realtime io mids over WS
         self._tasks: dict[int, asyncio.Task] = {}
+        # owner -> {"entropy": client, "lighter": client}. Built once per session and reused across
+        # cycles — rebuilding per cycle re-loaded Entropy market meta every time (seconds of latency).
+        self._clients: dict[int, dict] = {}
 
     async def start(self) -> None:
         """Resume RUNNING sessions after a restart — but only ONE per owner. Earlier double-taps can
@@ -148,6 +151,7 @@ class SessionEngine:
                 except Exception:  # noqa: BLE001 — one bad cycle must not end the whole session
                     LOGGER.exception("cycle failed in session %s", sid)
                     await self._say(owner, "⚠️ Цикл впав з помилкою — сесія триває, пробую далі.")
+                    await self._drop_clients(owner)   # rebuild clients next cycle (connector may be dead)
                     await self._interruptible_sleep(sid, 5)
                 if await self._stopping(sid):
                     break
@@ -276,8 +280,7 @@ class SessionEngine:
                              coin=pair.label, side=side, open_status="OK", status="CLOSED",
                              pnl=res["pnl"], fees=res["fees"], lighter_vol=notional * 2, entropy_vol=notional * 2)
         finally:
-            with contextlib.suppress(Exception):
-                await lit.close()
+            pass  # clients are cached for the whole session; closed in _finish
 
     # ── live helpers ────────────────────────────────────────────────────────────────────────────────
     @staticmethod
@@ -454,22 +457,36 @@ class SessionEngine:
             return None, leverage
 
     async def _entropy_client(self, owner):
+        cached = self._clients.get(owner, {}).get("entropy")
+        if cached is not None:
+            return cached
         c = await self._store.get_credentials(owner, "entropy")
         if not c:
             return None
-        return await asyncio.to_thread(
+        client = await asyncio.to_thread(
             EntropyClient, self._cfg.hyperliquid_api_url, c.meta["wallet_address"], c.secret, self._cfg.entropy_dex)
+        self._clients.setdefault(owner, {})["entropy"] = client
+        return client
 
     async def _lighter_client(self, owner):
+        cached = self._clients.get(owner, {}).get("lighter")
+        if cached is not None:
+            return cached
         c = await self._store.get_credentials(owner, "lighter")
         if not c:
             return None
-        # MUST build on the event loop: the Lighter SDK creates an aiohttp connector in its
-        # constructor, which calls asyncio.get_running_loop() — a worker thread has none, so
-        # to_thread here raised "no running event loop" and killed every Lighter action. The
-        # constructor does no network, so building inline is cheap.
-        return LighterClient(self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
-                             int(c.meta.get("api_key_index", 0)))
+        # MUST build on the event loop: the Lighter SDK creates an aiohttp connector in its constructor
+        # (asyncio.get_running_loop()); a worker thread has none. The constructor does no network.
+        client = LighterClient(self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
+                               int(c.meta.get("api_key_index", 0)))
+        self._clients.setdefault(owner, {})["lighter"] = client
+        return client
+
+    async def _drop_clients(self, owner) -> None:
+        entry = self._clients.pop(owner, None)
+        if entry and entry.get("lighter"):
+            with contextlib.suppress(Exception):
+                await entry["lighter"].close()
 
     # ── lifecycle bits ─────────────────────────────────────────────────────────────────────────────
     async def _stopping(self, sid: int) -> bool:
@@ -521,9 +538,7 @@ class SessionEngine:
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
             finally:
-                if lit:
-                    with contextlib.suppress(Exception):
-                        await lit.close()
+                await self._drop_clients(owner)   # session over — release cached clients
         # Mark any DB hedges still marked open as closed.
         with contextlib.suppress(Exception):
             for h in await self._store.session_hedges(sid):

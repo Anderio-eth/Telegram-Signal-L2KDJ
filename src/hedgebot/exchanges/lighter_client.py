@@ -6,9 +6,10 @@ API Keys page. The SignerClient signs orders and manages the per-key nonce itsel
 Sizes and prices go to the SDK as INTEGERS scaled by each market's decimals (see market_data.
 lighter_amounts); market_index is the order book's market_id.
 
-VERIFY on first live run (cannot be checked without keys):
-  - SignerClient constructor kwargs on the installed version (url, account_index, api_private_keys);
-  - the close/position read endpoints used below against the account's real state.
+Call signatures are verified against the elliottech/lighter-python SDK source: create_order (with
+order_expiry matching the TIF), update_leverage(market_index, margin_mode, leverage),
+cancel_all_orders(time_in_force, timestamp_ms), and AccountApi.account(by, value). Account reads reuse
+the signer's own HTTP connector.
 """
 
 from __future__ import annotations
@@ -44,52 +45,45 @@ class LighterClient:
             api_private_keys={int(api_key_index): api_key_private_key},
         )
 
-    async def balance(self) -> dict:
-        """Best-effort account balance: total asset value and what's free. Field names vary by SDK
-        version, so several are tried; anything unknown comes back as None and the caller shows '—'.
-        VERIFY the exact fields against a live account."""
+    async def _account(self):
+        """The account object, read over the SIGNER's existing HTTP connector (no new ApiClient per
+        call — that connector setup was the slow part of every balance/position read)."""
         import lighter
-        api = lighter.ApiClient(configuration=lighter.Configuration(host=self._url))
-        try:
-            resp = await lighter.AccountApi(api).account(by="index", value=str(self._account_index))
-            acc = resp.accounts[0]
-            pick = lambda *names: next((float(getattr(acc, n)) for n in names
-                                        if getattr(acc, n, None) not in (None, "")), None)
-            return {
-                "total": pick("total_asset_value", "collateral", "portfolio_value"),
-                "available": pick("available_balance", "cross_asset_value", "collateral"),
-            }
-        finally:
-            with contextlib.suppress(Exception):
-                await api.close()
+        resp = await lighter.AccountApi(self._signer.api_client).account(
+            by="index", value=str(self._account_index))
+        return resp.accounts[0]
+
+    def _pos_dict(self, p) -> dict:
+        raw = self._num(p, "position", "base_amount", "size") or 0.0
+        sign = self._num(p, "sign")
+        signed = raw * (1 if (sign is None or sign >= 0) else -1)
+        return {
+            "market_id": int(self._num(p, "market_id", "market_index") or -1),
+            "size": signed, "abs": abs(signed),
+            "entry": self._num(p, "avg_entry_price", "entry_price"),
+            "unrealized_pnl": self._num(p, "unrealized_pnl", "unrealizedPnl") or 0.0,
+            "realized_pnl": self._num(p, "realized_pnl", "realizedPnl") or 0.0,
+        }
+
+    async def balance(self) -> dict:
+        """Account balance: total asset value and what's free (fields per the AccountApi model)."""
+        acc = await self._account()
+        pick = lambda *names: next((float(getattr(acc, n)) for n in names
+                                    if getattr(acc, n, None) not in (None, "")), None)
+        return {
+            "total": pick("total_asset_value", "collateral", "portfolio_value"),
+            "available": pick("available_balance", "cross_asset_value", "collateral"),
+        }
 
     async def position(self, market_index: int) -> dict | None:
-        """The account's open position on one market, or None if flat. Field names vary by SDK
-        version, so several are tried. Returns {size (signed), abs, entry, unrealized_pnl,
-        realized_pnl}; `size > 0` is long, `< 0` is short."""
-        import lighter
-        api = lighter.ApiClient(configuration=lighter.Configuration(host=self._url))
-        try:
-            resp = await lighter.AccountApi(api).account(by="index", value=str(self._account_index))
-            acc = resp.accounts[0]
-            for p in (getattr(acc, "positions", None) or []):
-                mid = self._num(p, "market_id", "market_index")
-                if mid is None or int(mid) != int(market_index):
-                    continue
-                raw = self._num(p, "position", "base_amount", "size") or 0.0
-                sign = self._num(p, "sign")
-                signed = raw * (1 if (sign is None or sign >= 0) else -1)
-                return {
-                    "size": signed,
-                    "abs": abs(signed),
-                    "entry": self._num(p, "avg_entry_price", "entry_price"),
-                    "unrealized_pnl": self._num(p, "unrealized_pnl", "unrealizedPnl") or 0.0,
-                    "realized_pnl": self._num(p, "realized_pnl", "realizedPnl") or 0.0,
-                }
-            return None
-        finally:
-            with contextlib.suppress(Exception):
-                await api.close()
+        """The account's open position on one market, or None if flat. `size > 0` long, `< 0` short."""
+        acc = await self._account()
+        for p in (getattr(acc, "positions", None) or []):
+            mid = self._num(p, "market_id", "market_index")
+            if mid is None or int(mid) != int(market_index):
+                continue
+            return self._pos_dict(p)
+        return None
 
     @staticmethod
     def order_error(resp) -> str | None:
@@ -123,29 +117,12 @@ class LighterClient:
     async def open_positions(self) -> list[dict]:
         """All non-flat positions on the account: [{market_id, size(signed), abs, entry, ...}]. One
         read — used to flatten everything fast on STOP without a per-coin round trip."""
-        import lighter
-        api = lighter.ApiClient(configuration=lighter.Configuration(host=self._url))
-        out: list[dict] = []
         try:
-            resp = await lighter.AccountApi(api).account(by="index", value=str(self._account_index))
-            for p in (getattr(resp.accounts[0], "positions", None) or []):
-                raw = self._num(p, "position", "base_amount", "size") or 0.0
-                if abs(raw) <= 0:
-                    continue
-                sign = self._num(p, "sign")
-                signed = raw * (1 if (sign is None or sign >= 0) else -1)
-                out.append({
-                    "market_id": int(self._num(p, "market_id", "market_index") or -1),
-                    "size": signed, "abs": abs(signed),
-                    "entry": self._num(p, "avg_entry_price", "entry_price"),
-                    "unrealized_pnl": self._num(p, "unrealized_pnl") or 0.0,
-                })
+            acc = await self._account()
         except Exception:  # noqa: BLE001
-            return out
-        finally:
-            with contextlib.suppress(Exception):
-                await api.close()
-        return out
+            return []
+        return [self._pos_dict(p) for p in (getattr(acc, "positions", None) or [])
+                if (self._num(p, "position", "base_amount", "size") or 0.0) != 0]
 
     @staticmethod
     def _num(obj, *names):
