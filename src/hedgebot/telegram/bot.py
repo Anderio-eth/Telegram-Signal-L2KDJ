@@ -128,7 +128,11 @@ class HedgeBot:
     # ── menus ────────────────────────────────────────────────────────────────────────────────────
     async def _start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if self._guard(update) is None:
-            await update.message.reply_text("⛔ Доступ обмежено.")
+            uid = update.effective_user.id if update.effective_user else "?"
+            await update.message.reply_text(
+                f"⛔ Доступ обмежено.\nТвій Telegram ID: <code>{uid}</code>\n"
+                "Надішли його власнику бота, щоб він додав тебе в список дозволених.",
+                parse_mode=ParseMode.HTML)
             return
         # Establish the persistent bottom keyboard, then delete its carrier — the keyboard stays put
         # even without the message, so nothing lingers in the chat.
