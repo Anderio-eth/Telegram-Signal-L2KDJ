@@ -30,7 +30,7 @@ from telegram.ext import (
 )
 
 from ..config import Config
-from ..core.hedge import plan_hedge
+from ..core.hedge import gap_text, plan_hedge
 from ..db.store import Store
 from ..exchanges import market_data as md
 from ..exchanges.hyperliquid_entropy import EntropyClient
@@ -46,8 +46,15 @@ MENU_BTN = "☰ Меню"  # the one persistent reply-keyboard button, always at
 SESS_DEFAULT = {
     "coins": [PAIRS[0].key], "leverage": 3, "margin": 5.0,
     "hold_min": 1800, "hold_max": 7200, "pause_on": False, "pause_min": 300, "pause_max": 1800,
-    "duration": 86400, "fill_timeout": 20, "dry_run": True, "notify_each": False,
+    "duration": 86400, "fill_timeout": 90, "dry_run": True, "notify_each": False,
 }
+
+
+# Per-coin maxima (both venues): OpenAI / Anthropic 6x on io (5x on RH-Lighter), SanDisk 10x on both.
+# Anything above a coin's max is lowered to it automatically — in sessions and manual opens alike.
+LEV_HINT = ("⚙️ <b>Плече</b>\n"
+            "Макс: SanDisk 10x · OpenAI / Anthropic 5x (ліміт Lighter).\n"
+            "Вище за максимум монети — бот сам знизить до максимуму.")
 
 
 class HedgeBot:
@@ -232,8 +239,8 @@ class HedgeBot:
                     return "🟩 Entropy: ключ не заведено"
                 b = await ent.balance()
                 io, spot = float(b.get("io") or 0), float(b.get("spot") or 0)
-                # io draws margin from spot automatically, so total (io+spot) is what's tradeable.
-                return f"🟩 Entropy: {fmt(b.get('total'))} (io {fmt(io)} + spot {fmt(spot)})"
+                # `spot` is only the FREE spot USDC — the part backing io is already inside io.
+                return f"🟩 Entropy: {fmt(b.get('total'))} (io {fmt(io)} + вільно spot {fmt(spot)})"
             except Exception as err:  # noqa: BLE001
                 LOGGER.exception("entropy balance failed")
                 await self._drop_clients(owner)   # cached client may be dead — rebuild next time
@@ -278,8 +285,10 @@ class HedgeBot:
         elif data == "open":
             if "draft" not in ctx.chat_data:
                 saved = (await self._store.load_settings(owner)).get("draft") or {}
+                if not saved.get("side_manual"):
+                    saved.pop("entropy_long", None)   # drafts saved before auto-side: go auto
                 ctx.chat_data["draft"] = {
-                    "pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": True, **saved}
+                    "pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": None, **saved}
             await self._open_config(update, ctx)
         elif data == "cfg:pair":
             d = ctx.chat_data["draft"]
@@ -287,7 +296,10 @@ class HedgeBot:
             d["pair"] = keys[(keys.index(d["pair"]) + 1) % len(keys)]
             await self._open_config(update, ctx)
         elif data == "cfg:side":
-            ctx.chat_data["draft"]["entropy_long"] = not ctx.chat_data["draft"]["entropy_long"]
+            # Auto -> Entropy LONG -> Entropy SHORT -> Auto
+            d = ctx.chat_data["draft"]
+            nxt = {None: True, True: False, False: None}[d.get("entropy_long")]
+            d["entropy_long"], d["side_manual"] = nxt, nxt is not None
             await self._open_config(update, ctx)
         elif data == "cfg:lev":
             await self._lev_menu(update, ctx)
@@ -512,9 +524,9 @@ class HedgeBot:
             if data == "sess:margin":
                 msg = "💵 Надішли <b>маржу в USD на ногу</b> числом (розмір = маржа × плече):"
             elif data == "sess:timeout":
-                msg = ("⏳ Надішли <b>таймаут заповнення в секундах</b> (напр. 20).\n\n"
-                       "Це скільки чекати другу ногу після того, як перша <b>почала</b> заповнюватись; "
-                       "не встигла — скасовуємо хедж, щоб не лишитись з голою позицією.")
+                msg = ("⏳ Надішли <b>таймаут лімітки в секундах</b> (напр. 90).\n\n"
+                       "Скільки лімітка на Entropy може чекати заповнення (бот переставляє її за ціною). "
+                       "Не заповнилась — цикл пропускається без позиції; на закритті — дозакриваємо маркетом.")
             else:
                 what = "утримання" if data == "sess:hold" else "паузи"
                 msg = (f"Надішли <b>діапазон {what} у хвилинах</b> — два числа через пробіл, напр. "
@@ -641,7 +653,7 @@ class HedgeBot:
                                         InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="open")]]))
                 return ASK
             ctx.chat_data.setdefault(
-                "draft", {"pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": True})["margin"] = value
+                "draft", {"pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": None})["margin"] = value
             ctx.user_data.clear()
             await self._open_config(update, ctx)
             return ConversationHandler.END
@@ -684,21 +696,28 @@ class HedgeBot:
             await self._store.save_draft(update.effective_user.id, d)  # remember last settings
         pair = get_pair(d["pair"])
         notional = d["margin"] * d["leverage"]
-        e_side, l_side = ("LONG", "SHORT") if d["entropy_long"] else ("SHORT", "LONG")
+        side_mode = d.get("entropy_long")
+        if side_mode is None:
+            side_line = "Напрям: <b>Авто</b> — лонг там, де монета дешевша, шорт там, де дорожча"
+            side_btn = "🔄 Напрям: Авто (по ціні)"
+        else:
+            e_side, l_side = ("LONG", "SHORT") if side_mode else ("SHORT", "LONG")
+            side_line = f"Напрям: Entropy <b>{e_side}</b> / Lighter <b>{l_side}</b> (вручну)"
+            side_btn = f"🔄 Напрям: Entropy {e_side}"
         text = (
             "📈 <b>Новий хедж</b>\n\n"
             f"Монета: <b>{pair.label}</b>\n"
             f"Плече: <b>{d['leverage']}x</b>\n"
             f"Маржа: <b>${d['margin']:g}</b>/ногу\n"
             f"→ Розмір позиції: <b>${notional:g}</b>/ногу\n"
-            f"Напрям: Entropy <b>{e_side}</b> / Lighter <b>{l_side}</b>\n\n"
-            "<i>Лімітки-maker (чекають заповнення, менша комса). Плече макс на Entropy io = 6x.</i>"
+            f"{side_line}\n\n"
+            "<i>Entropy — лімітка-мейкер, Lighter — маркет після її заповнення.</i>"
         )
         rows = [
             [InlineKeyboardButton(f"🪙 Монета: {pair.label}", callback_data="cfg:pair")],
             [InlineKeyboardButton(f"⚙️ Плече: {d['leverage']}x", callback_data="cfg:lev"),
              InlineKeyboardButton(f"💵 Маржа: ${d['margin']:g}", callback_data="cfg:margin")],
-            [InlineKeyboardButton(f"🔄 Напрям: Entropy {e_side}", callback_data="cfg:side")],
+            [InlineKeyboardButton(side_btn, callback_data="cfg:side")],
             [InlineKeyboardButton("👁 Прев'ю / Відкрити", callback_data="cfg:preview")],
             [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
         ]
@@ -708,9 +727,9 @@ class HedgeBot:
     async def _lev_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cur = ctx.chat_data["draft"]["leverage"]
         def b(n): return InlineKeyboardButton(f"{'✅ ' if n == cur else ''}{n}x", callback_data=f"setlev:{n}")
-        rows = [[b(1), b(2), b(3)], [b(4), b(5), b(6)],
+        rows = [[b(1), b(2), b(3), b(4), b(5)], [b(6), b(7), b(8), b(9), b(10)],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="open")]]
-        await self._edit_anchor(update, ctx, "⚙️ <b>Плече</b> (Entropy io макс 6x):", InlineKeyboardMarkup(rows))
+        await self._edit_anchor(update, ctx, LEV_HINT, InlineKeyboardMarkup(rows))
 
     # ── auto-session ───────────────────────────────────────────────────────────────────────────────
     @staticmethod
@@ -754,7 +773,7 @@ class HedgeBot:
             f"⏱ Утримання: <b>{hold}</b>\n"
             f"⏸ Пауза: <b>{pause}</b>\n"
             f"🗓 Тривалість: <b>{self._fmt_secs(s['duration'])}</b>\n"
-            f"⏳ Таймаут філа: <b>{s['fill_timeout']}с</b>\n"
+            f"⏳ Таймаут лімітки: <b>{s['fill_timeout']}с</b>\n"
             f"🔔 Алерти по хеджах: <b>{'увімк' if s.get('notify_each') else 'вимк (у таблицю)'}</b>\n"
             f"🧪 Режим: <b>{'DRY-RUN (тест)' if s['dry_run'] else 'LIVE (реальні ордери)'}</b>\n\n"
             "<i>Хеджі відкриваються/закриваються самі, час — рандом у межах утримання.</i>"
@@ -839,8 +858,9 @@ class HedgeBot:
     async def _sess_lev(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cur = ctx.chat_data["sess"]["leverage"]
         def b(n): return InlineKeyboardButton(f"{'✅ ' if n == cur else ''}{n}x", callback_data=f"sslev:{n}")
-        rows = [[b(1), b(2), b(3)], [b(4), b(5), b(6)], [InlineKeyboardButton("⬅️ Назад", callback_data="sess")]]
-        await self._edit_anchor(update, ctx, "⚙️ <b>Плече</b> (io макс 6x):", InlineKeyboardMarkup(rows))
+        rows = [[b(1), b(2), b(3), b(4), b(5)], [b(6), b(7), b(8), b(9), b(10)],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="sess")]]
+        await self._edit_anchor(update, ctx, LEV_HINT, InlineKeyboardMarkup(rows))
 
     async def _sess_dur(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cur = ctx.chat_data["sess"]["duration"]
@@ -889,12 +909,11 @@ class HedgeBot:
             await update.callback_query.edit_message_text(
                 "Сесія скинулась. Почни заново.", reply_markup=self._back())
             return
-        entropy_long = d["entropy_long"]
-        notional = d["margin"] * d["leverage"]
+        entropy_long = d.get("entropy_long")   # None = auto (cheaper venue long)
         await update.callback_query.edit_message_text("⏳ Рахую план…")
         try:
-            plan, reason = await asyncio.wait_for(
-                self._build_plan(owner, pair, notional, entropy_long), timeout=25)
+            plan, reason, eff = await asyncio.wait_for(
+                self._build_plan(owner, pair, d["margin"], d["leverage"], entropy_long), timeout=25)
         except asyncio.TimeoutError:
             LOGGER.error("build_plan timed out")
             await update.callback_query.edit_message_text(
@@ -909,20 +928,21 @@ class HedgeBot:
             await update.callback_query.edit_message_text(f"✗ {html.escape(reason)}", reply_markup=self._back())
             return
         ctx.chat_data["plan_ready"] = True
+        notional = plan.notional_usd
         e, l = plan.entropy, plan.lighter
         e_dir = "ЛОНГ (BUY)" if e.is_buy else "ШОРТ (SELL)"
         l_dir = "ШОРТ (SELL)" if l.is_ask else "ЛОНГ (BUY)"
+        lowered = f" (знижено з {d['leverage']}x — макс для {pair.label})" if eff < int(d["leverage"]) else ""
         text = (
             f"👁 <b>ПЛАН — {pair.label}</b>\n"
-            f"Плече {d['leverage']}x · маржа ${d['margin']:g} → розмір <b>${notional:g}</b>/ногу\n\n"
-            f"🟩 <b>Entropy</b> {e.market} — {e_dir}\n"
-            f"   кількість: <b>{e.size:g}</b> {pair.label}\n"
-            f"   лімітна ціна: <b>{e.limit_px:g}</b>\n\n"
-            f"🟦 <b>Lighter</b> {pair.lighter} — {l_dir}\n"
-            f"   кількість: <b>{l.size:g}</b> {pair.label}\n"
-            f"   лімітна ціна: <b>{l.limit_px:g}</b>\n\n"
-            "<i>«кількість» — скільки токенів купуємо/продаємо; «лімітна ціна» — ціна, за якою "
-            "виставлена maker-лімітка (висить, поки ринок її не заповнить).</i>"
+            f"Плече {eff}x{lowered} · маржа ${d['margin']:g} → розмір <b>${notional:g}</b>/ногу\n"
+            f"Ціни: {gap_text(plan)}"
+            f"{' → лонг на дешевшій' if plan.auto_side else ' (напрям вручну)'}\n\n"
+            f"🟩 <b>Entropy</b> {e.market} — {e_dir} {e.size:g}\n"
+            f"   лімітка post-only на 2 тіки від ціни (мейкер, без тейкер-комісії)\n\n"
+            f"🟦 <b>Lighter</b> {pair.lighter} — {l_dir} {l.size:g}\n"
+            f"   маркет — одразу, як заповниться лімітка на Entropy\n\n"
+            "<i>Не заповнилась за 90с — позиція не відкривається.</i>"
         )
         if plan.errors:
             # Errors carry a "<" ("size < min") which HTML parse_mode reads as a tag — escape them.
@@ -931,7 +951,9 @@ class HedgeBot:
         rows.append([InlineKeyboardButton("⬅️ Скасувати", callback_data="menu")])
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
-    async def _build_plan(self, owner: int, pair, notional: float, entropy_long: bool):
+    async def _build_plan(self, owner: int, pair, margin: float, leverage: int, entropy_long: bool):
+        """Returns (plan, reason, effective_leverage). Leverage is clamped to the lower of the two
+        venues' per-coin maxima (same rule as sessions), and notional = margin × that leverage."""
         # Per-request timeout so one slow venue call can't wall the whole plan; each step is logged so
         # a stall shows up in the logs as the last line printed.
         timeout = aiohttp.ClientTimeout(total=8, connect=5)
@@ -941,7 +963,7 @@ class HedgeBot:
             LOGGER.info("build_plan: lighter_markets…")
             lmk = (await md.lighter_markets(s, self._cfg.lighter_api_url)).get(pair.lighter)
             if not emk or not lmk:
-                return None, "ринок не знайдено на одній із бірж"
+                return None, "ринок не знайдено на одній із бірж", int(leverage)
             # Realtime WS mid first; REST mark only if the feed is cold/stale.
             eprice = self._feed.mid(pair.entropy) if self._feed else None
             if not eprice:
@@ -951,11 +973,12 @@ class HedgeBot:
             lprice = await md.lighter_mark(s, self._cfg.lighter_api_url, lmk.market_id)
             LOGGER.info("build_plan: prices e=%s l=%s", eprice, lprice)
             if not eprice or not lprice:
-                return None, "немає ціни для однієї з бірж"
-        plan = plan_hedge(pair, notional, entropy_long=entropy_long,
+                return None, "немає ціни для однієї з бірж", int(leverage)
+        eff = max(1, min(int(leverage), int(emk.max_leverage or leverage), int(lmk.max_leverage or leverage)))
+        plan = plan_hedge(pair, float(margin) * eff, entropy_long=entropy_long,
                           entropy_price=eprice, lighter_price=lprice,
                           entropy_market=emk, lighter_market=lmk)
-        return plan, None
+        return plan, None, eff
 
     async def _execute(self, update: Update, ctx, owner: int) -> None:
         d = ctx.chat_data.get("draft")
@@ -963,12 +986,10 @@ class HedgeBot:
             await update.callback_query.answer("Спершу прев'ю", show_alert=True)
             return
         pair = get_pair(d["pair"])
-        leverage = int(d["leverage"])
-        notional = d["margin"] * leverage
-        entropy_long = d["entropy_long"]
-        await update.callback_query.edit_message_text("⏳ Відкриваю обидві ноги…")
+        entropy_long = d.get("entropy_long")
+        await update.callback_query.edit_message_text("⏳ Рахую план…")
         try:
-            plan, reason = await self._build_plan(owner, pair, notional, entropy_long)
+            plan, reason, leverage = await self._build_plan(owner, pair, d["margin"], d["leverage"], entropy_long)
         except Exception as err:  # noqa: BLE001
             LOGGER.exception("build_plan (execute) failed")
             await update.callback_query.edit_message_text(f"✗ Помилка: {html.escape(str(err)[:200])}", reply_markup=self._back())
@@ -977,46 +998,49 @@ class HedgeBot:
             await update.callback_query.edit_message_text(
                 f"✗ {html.escape(reason or (plan.errors[0] if plan else ''))}", reply_markup=self._back())
             return
+        notional = plan.notional_usd
+        entropy_long = plan.entropy.is_buy   # resolved (auto side picks it from the prices)
 
-        results = {}
         ent = await self._entropy_client(owner)
         lit = await self._lighter_client(owner)
         if not ent or not lit:
             await update.callback_query.edit_message_text("✗ Немає ключів для однієї з бірж.", reply_markup=self._back())
             return
         e, l = plan.entropy, plan.lighter
-        # Set the chosen leverage before ordering (best-effort; a failure is reported per leg).
         with contextlib.suppress(Exception):
             await ent.set_leverage(e.market, leverage)
         with contextlib.suppress(Exception):
             await lit.set_leverage(l.market_index, leverage)
-        # A rejected order does NOT raise (Hyperliquid returns an error IN the response), so check
-        # both the exception and the response body for each leg.
-        try:
-            resp = await ent.limit_order(e.market, e.is_buy, e.size, e.limit_px, post_only=plan.post_only)
-            err = ent.order_error(resp)
-            results["entropy"] = f"ERROR: {err}" if err else resp
-        except Exception as err:  # noqa: BLE001
-            results["entropy"] = f"ERROR: {err}"
-        try:
-            resp = await lit.limit_order(l.market_index, l.base_amount, l.price_int, l.is_ask, post_only=plan.post_only)
-            err = lit.order_error(resp)
-            results["lighter"] = f"ERROR: {err}" if err else resp
-        except Exception as err:  # noqa: BLE001
-            results["lighter"] = f"ERROR: {err}"
-        # ent/lit are cached and reused — not closed here.
-
-        e_ok = not str(results.get("entropy")).startswith("ERROR")
-        l_ok = not str(results.get("lighter")).startswith("ERROR")
-        status = "OPEN" if (e_ok and l_ok) else ("PARTIAL" if (e_ok or l_ok) else "FAILED")
-        self._bal_cache.pop(owner, None)  # balance changed — next menu refetches
-        await self._store.record_hedge(owner, pair.key, notional, "LONG" if entropy_long else "SHORT",
-                                       status, {"results": {k: str(v) for k, v in results.items()}})
-        warn = "" if status == "OPEN" else "\n⚠️ Одна нога не відкрилась — можлива гола дельта, перевір!"
+        side = "LONG" if entropy_long else "SHORT"
+        if not self._engine:
+            await update.callback_query.edit_message_text("✗ Движок не запущено.", reply_markup=self._back())
+            return
+        # Maker-first, same as sessions: Entropy post-only limit, Lighter at market once it fills.
         await update.callback_query.edit_message_text(
-            f"{'✅' if status=='OPEN' else '🟠' if status=='PARTIAL' else '🔴'} <b>{pair.label}</b> — {status}\n"
-            f"Entropy: {'ok' if e_ok else html.escape(str(results.get('entropy')))}\n"
-            f"Lighter: {'ok' if l_ok else html.escape(str(results.get('lighter')))}{warn}",
+            f"⏳ {pair.label}: лімітка на Entropy ({side}) виставлена, чекаю заповнення…")
+        fr = await self._engine.open_maker_first(ent, lit, plan, timeout=90)
+        self._bal_cache.pop(owner, None)  # balance changed — next menu refetches
+        if fr.error or fr.unhedged > 0:
+            await self._engine._cancel_hedge(ent, lit, pair, owner=owner)
+            why = fr.error or "частковий філ менший за мінімум Lighter"
+            await self._store.record_hedge(owner, pair.key, notional, side, "FAILED", {"error": str(why)})
+            await update.callback_query.edit_message_text(
+                f"🔴 <b>{pair.label}</b> — не відкрито: {html.escape(str(why))}\nОбидві ноги закрито.",
+                reply_markup=self._back(), parse_mode=ParseMode.HTML)
+            return
+        if fr.e_filled <= 0:
+            await update.callback_query.edit_message_text(
+                f"⏭ <b>{pair.label}</b> — лімітка на Entropy не заповнилась за 90с, позиції немає.",
+                reply_markup=self._back(), parse_mode=ParseMode.HTML)
+            return
+        if not fr.complete:
+            notional = round(notional * fr.e_filled / e.size, 2)
+        await self._store.record_hedge(owner, pair.key, notional, side, "OPEN",
+                                       {"entropy_filled": fr.e_filled, "lighter_filled": fr.l_done})
+        part = "" if fr.complete else " (частково)"
+        await update.callback_query.edit_message_text(
+            f"✅ <b>{pair.label}</b> — OPEN{part}, ${notional:g}\n"
+            f"Entropy {side} (лімітка) ✓ / Lighter {'SHORT' if entropy_long else 'LONG'} (маркет) ✓",
             reply_markup=self._back(), parse_mode=ParseMode.HTML)
 
     # ── positions / close ──────────────────────────────────────────────────────────────────────────
@@ -1046,8 +1070,9 @@ class HedgeBot:
         lit = await self._lighter_client(owner)
         res = {"pnl": None, "fees": None}
         if ent and lit and pair and self._engine:
-            # Reuse the engine's flatten: reduce-only close on BOTH venues + pull resting orders.
-            res = await self._engine._close_hedge(ent, lit, pair, owner=owner)
+            # Engine's close: maker-first (Entropy reduce-only limit, then Lighter), then a market pass
+            # that flattens anything left on BOTH venues.
+            res = await self._engine._close_hedge(ent, lit, pair, owner=owner, maker=True, timeout=60)
         elif ent and pair:
             with contextlib.suppress(Exception):
                 await ent.close_market(pair.entropy)

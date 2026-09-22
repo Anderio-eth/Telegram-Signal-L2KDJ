@@ -59,23 +59,27 @@ class EntropyClient:
         )
 
     async def balance(self) -> dict:
-        """Tradeable balance as entropy.io shows it = io-perp equity + spot USDC. The io perp account
-        is empty when flat (collateral sits in spot and moves in when a position opens), so reading the
-        io account alone showed $0 even with money available. total/free include spot; `io`/`spot`
-        give the breakdown."""
-        state, spot = await asyncio.gather(
+        """Tradeable balance = io-perp equity + the spot USDC NOT already backing it.
+
+        When io draws its collateral from spot (entropy.io's default), the SAME dollars show up twice:
+        as the io account value AND as spot USDC `hold` (verified on live accounts: spot total ==
+        hold == io accountValue for an all-in trader). Adding io + spot total double-counted exactly
+        that (the $1,315 shown for a ~$680 account). Spot minus its hold is the unencumbered part;
+        with a separately funded io account hold is 0 and this is plain io + spot."""
+        state, (spot_total, spot_hold) = await asyncio.gather(
             asyncio.to_thread(self._info.user_state, self._address, self._dex),
-            self.spot_usdc(),
+            self.spot_usdc_detail(),
         )
         ms = state.get("marginSummary", {}) or {}
         io_total = float(ms.get("accountValue", 0) or 0)
         io_free = float(state.get("withdrawable", 0) or 0)
+        spot_free = max(0.0, spot_total - spot_hold)
         return {
-            "total": io_total + spot,
+            "total": io_total + spot_free,
             "used": float(ms.get("totalMarginUsed", 0) or 0),
-            "free": io_free + spot,
+            "free": io_free + spot_free,
             "io": io_total,
-            "spot": spot,
+            "spot": spot_free,
         }
 
     async def ensure_margin(self, needed_usd: float) -> str | None:
@@ -101,13 +105,18 @@ class EntropyClient:
             return str(e)[:200]
 
     async def spot_usdc(self) -> float:
-        """USDC sitting in the Hyperliquid SPOT wallet (not the io perp account). Used to hint the user
-        when io shows $0 but the money is just in spot and needs transferring into io to trade."""
+        """Free USDC in the Hyperliquid SPOT wallet (total minus what's held as io collateral/orders)."""
+        total, hold = await self.spot_usdc_detail()
+        return max(0.0, total - hold)
+
+    async def spot_usdc_detail(self) -> tuple[float, float]:
+        """(total, hold) of spot USDC. `hold` is USDC locked as collateral for io positions (when io
+        draws from spot) or by open spot orders — it must not be added on top of the io balance."""
         state = await asyncio.to_thread(self._info.spot_user_state, self._address)
         for b in state.get("balances", []) or []:
             if b.get("coin") == "USDC":
-                return float(b.get("total", 0) or 0)
-        return 0.0
+                return float(b.get("total", 0) or 0), float(b.get("hold", 0) or 0)
+        return 0.0, 0.0
 
     async def positions(self) -> list[dict]:
         """Open io positions for this account: [{coin, szi, entryPx, leverage, ...}]."""

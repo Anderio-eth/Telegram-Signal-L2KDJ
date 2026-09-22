@@ -1,7 +1,10 @@
 """Turn a hedge request into two concrete limit orders — pure arithmetic, so it can be tested alone.
 
 Delta-neutral: the same asset, the same USD notional, opposite sides on the two venues. `entropy_long`
-picks the direction of the Entropy leg; the Lighter leg takes the opposite. Each leg's size is the
+picks the direction of the Entropy leg; the Lighter leg takes the opposite. Left as None it is chosen
+from the prices: LONG where the coin is cheaper, SHORT where it's dearer — entering on the favourable
+side of the cross-venue gap, so the two legs' entry prices are as close as they can be (and the gap
+closing works for the hedge rather than against it). Each leg's size is the
 notional divided by that venue's own price (they differ slightly, so sizes differ slightly). Limit
 prices cross the mid by a small offset so both legs actually fill; post-only mode places at the mid
 instead. Sizes are rounded to each venue's decimals and checked against its minimum.
@@ -43,6 +46,13 @@ class HedgePlan:
     lighter: LighterLeg
     errors: list[str]
     post_only: bool = False   # cross the book so both legs actually fill (RH-Lighter taker is 0%)
+    entropy_price: float = 0.0
+    lighter_price: float = 0.0
+    auto_side: bool = False   # side picked from the prices (cheaper venue long), not by the user
+    # Market metadata travels with the plan: maker-first execution needs Entropy's size decimals (for
+    # the price tick) and Lighter's decimals/minimums (for sizing the hedge as fills arrive).
+    entropy_market: EntropyMarket | None = None
+    lighter_market: LighterMarket | None = None
 
     @property
     def ok(self) -> bool:
@@ -71,11 +81,16 @@ def _round_px(price: float) -> float:
     return round(price, digits)
 
 
+def cheaper_is_entropy(entropy_price: float, lighter_price: float) -> bool:
+    """True when the coin is cheaper on Entropy -> go LONG there and SHORT on Lighter."""
+    return entropy_price <= lighter_price
+
+
 def plan_hedge(
     pair: Pair,
     notional_usd: float,
     *,
-    entropy_long: bool,
+    entropy_long: bool | None,
     entropy_price: float,
     lighter_price: float,
     entropy_market: EntropyMarket,
@@ -84,6 +99,9 @@ def plan_hedge(
     post_only: bool = False,
 ) -> HedgePlan:
     errors: list[str] = []
+    auto_side = entropy_long is None
+    if auto_side:
+        entropy_long = cheaper_is_entropy(entropy_price, lighter_price)
     if notional_usd < MIN_NOTIONAL_USD:
         errors.append(f"notional ${notional_usd:g} is below the ${MIN_NOTIONAL_USD:g} minimum")
     if entropy_price <= 0 or lighter_price <= 0:
@@ -123,4 +141,16 @@ def plan_hedge(
         lighter=LighterLeg(lighter_market.market_id, l_is_ask, l_size, l_px_raw, l_base, l_price_int),
         errors=errors,
         post_only=post_only,
+        entropy_market=entropy_market,
+        lighter_market=lighter_market,
+        entropy_price=entropy_price,
+        lighter_price=lighter_price,
+        auto_side=auto_side,
     )
+
+
+def gap_text(plan: HedgePlan) -> str:
+    """'Entropy 2155.2 / Lighter 2156.1 (+0.04%)' — the cross-venue gap the side was picked from."""
+    e, l = plan.entropy_price, plan.lighter_price
+    gap = (l - e) / e * 100 if e else 0.0
+    return f"Entropy {e:g} / Lighter {l:g} ({gap:+.3f}%)"
