@@ -1035,12 +1035,17 @@ class HedgeBot:
             return
         if not fr.complete:
             notional = round(notional * fr.e_filled / e.size, 2)
+        # Stops 1% before liquidation on both legs, then a watcher that closes the other leg if one
+        # of them is stopped out or liquidated.
+        stops = await self._engine.place_stops(ent, lit, pair, owner=owner)
+        self._engine.watch_manual(owner, ent, lit, pair)
         await self._store.record_hedge(owner, pair.key, notional, side, "OPEN",
-                                       {"entropy_filled": fr.e_filled, "lighter_filled": fr.l_done})
+                                       {"entropy_filled": fr.e_filled, "lighter_filled": fr.l_done, "stops": stops})
         part = "" if fr.complete else " (частково)"
+        stop_line = html.escape(self._engine.stops_text(stops)) or "⚠️ стопи не виставлені (див. повідомлення вище)"
         await update.callback_query.edit_message_text(
             f"✅ <b>{pair.label}</b> — OPEN{part}, ${notional:g}\n"
-            f"Entropy {side} (лімітка) ✓ / Lighter {'SHORT' if entropy_long else 'LONG'} (маркет) ✓",
+            f"Entropy {side} (лімітка) ✓ / Lighter {'SHORT' if entropy_long else 'LONG'} (маркет) ✓\n{stop_line}",
             reply_markup=self._back(), parse_mode=ParseMode.HTML)
 
     # ── positions / close ──────────────────────────────────────────────────────────────────────────

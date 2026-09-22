@@ -59,6 +59,12 @@ class SessionEngine:
         # cycles — rebuilding per cycle re-loaded Entropy market meta every time (seconds of latency).
         self._clients: dict[int, dict] = {}
         self._exec = MakerExecutor(cfg)
+        # (owner, pair.key) -> watcher task for hedges opened by hand in the bot (sessions guard their
+        # own hedges inline while holding).
+        self._watchers: dict[tuple, asyncio.Task] = {}
+        # (owner, pair.key) being closed on purpose right now — the leg guard must not "react" to a
+        # leg going flat because WE are closing it.
+        self._closing: set[tuple] = set()
 
     async def start(self) -> None:
         """Resume RUNNING sessions after a restart — but only ONE per owner. Earlier double-taps can
@@ -275,9 +281,20 @@ class SessionEngine:
                                        f"${notional:g} з ${planned:g}/ногу (обидві ноги захеджовані).")
             await self._store.update_hedge(hid, status="OPEN")
             l_side = "SHORT" if entropy_long else "LONG"
+            stops = await self.place_stops(ent, lit, pair, owner=owner)
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (Entropy {side} ✓ / Lighter {l_side} ✓). "
-                                                f"Закрию через {self._fmt(hold)}.")
-            await self._interruptible_sleep(sid, hold)
+                                                f"{self.stops_text(stops)}Закрию через {self._fmt(hold)}.")
+            hit = await self.guard_legs(owner, ent, lit, pair, seconds=hold, sid=sid)
+            if hit:
+                # A stop (or a liquidation) took one leg out; guard_legs already flattened the other.
+                res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
+                                              lit_equity_before=lit_equity_before)
+                await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
+                                               entropy_vol=notional * 2, lighter_vol=notional * 2)
+                await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+                                 coin=pair.label, side=side, open_status="OK", status=f"STOP ({hit})",
+                                 pnl=res["pnl"], fees=res["fees"], lighter_vol=notional * 2, entropy_vol=notional * 2)
+                return
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
                                           lit_equity_before=lit_equity_before, maker=True, sid=sid,
                                           timeout=cfg.get("fill_timeout", 90))
@@ -320,9 +337,14 @@ class SessionEngine:
                     remaining = (datetime.fromisoformat(det["close_at"]) - datetime.now(timezone.utc)).total_seconds()
             await self._say(owner, f"↩️ {pair.label}: підхопив відкритий хедж після рестарту — "
                                    f"{('закрию за ' + self._fmt(remaining)) if remaining > 0 else 'закриваю зараз'}.")
-            if remaining > 0:
-                await self._interruptible_sleep(sid, remaining)
             since_ms = int(h["opened_at"].timestamp() * 1000) if h.get("opened_at") else None
+            if remaining > 0:
+                await self.place_stops(ent, lit, pair, owner=owner)
+                hit = await self.guard_legs(owner, ent, lit, pair, seconds=remaining, sid=sid)
+                if hit:
+                    res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms)
+                    await self._store.update_hedge(h["id"], status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"])
+                    continue
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms, maker=True, sid=sid,
                                           timeout=cfg.get("fill_timeout", 90))
             await self._store.update_hedge(h["id"], status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"])
@@ -352,6 +374,150 @@ class SessionEngine:
                 continue
             return err
         return err
+
+    # ── stop-losses 1% before liquidation ───────────────────────────────────────────────────────────
+    STOP_BUFFER = 0.01          # stop sits 1% of price before the liquidation price (user's rule)
+    STOP_SLIPPAGE = 0.03        # worst execution price accepted once the stop fires
+
+    async def place_stops(self, ent, lit, pair, owner=None) -> dict:
+        """Put a reduce-only stop-market on each leg at liquidation ±1% of price:
+        long -> liq × 1.01, short -> liq × 0.99. Liquidation prices come from the venues themselves
+        (Hyperliquid position.liquidationPx; Lighter isolated position.liquidation_price). Idempotent:
+        existing orders on the market are cleared first, so re-placing never stacks stops.
+        Returns {"entropy": {...}, "lighter": {...}} with liq/stop or an "error"."""
+        out: dict = {"entropy": {}, "lighter": {}}
+        http = await self._exec.http()
+        emk = lmk = None
+        with contextlib.suppress(Exception):
+            emk = (await md.entropy_markets(http, self._cfg.hyperliquid_api_url, self._cfg.entropy_dex)).get(pair.entropy)
+        with contextlib.suppress(Exception):
+            lmk = (await md.lighter_markets(http, self._cfg.lighter_api_url)).get(pair.lighter)
+
+        # Entropy
+        try:
+            pos = await ent.position(pair.entropy)
+            szi = float(pos.get("szi", 0) or 0) if pos else 0.0
+            liq = float(pos.get("liquidationPx") or 0) if pos else 0.0
+            if not szi:
+                out["entropy"]["error"] = "позиції немає"
+            elif not liq or not emk:
+                out["entropy"]["error"] = "біржа не віддала ціну ліквідації"
+            else:
+                long = szi > 0
+                trig = ent.round_px(liq * (1 + self.STOP_BUFFER if long else 1 - self.STOP_BUFFER), emk.sz_decimals)
+                limit = ent.round_px(trig * (1 - self.STOP_SLIPPAGE if long else 1 + self.STOP_SLIPPAGE), emk.sz_decimals)
+                with contextlib.suppress(Exception):
+                    await ent.cancel_all(pair.entropy)          # no stacked stops
+                err = ent.order_error(await ent.stop_loss(pair.entropy, not long, abs(szi), trig, limit))
+                out["entropy"] = {"liq": liq, "stop": trig} if not err else {"liq": liq, "error": err}
+        except Exception as e:  # noqa: BLE001
+            out["entropy"]["error"] = str(e)[:200]
+
+        # Lighter
+        try:
+            lp = await lit.position(lmk.market_id) if lmk else None
+            if not lp or not lp.get("abs"):
+                out["lighter"]["error"] = "позиції немає" if lmk else "ринок не знайдено"
+            elif not lp.get("liq"):
+                out["lighter"]["error"] = "біржа не віддала ціну ліквідації (маржа не ізольована?)"
+            else:
+                long = lp["size"] > 0
+                liq = float(lp["liq"])
+                trig = liq * (1 + self.STOP_BUFFER if long else 1 - self.STOP_BUFFER)
+                worst = trig * (1 - self.STOP_SLIPPAGE if long else 1 + self.STOP_SLIPPAGE)
+                base_amount, price_int = md.lighter_amounts(lmk, lp["abs"], worst)
+                trig_int = round(trig * 10 ** lmk.price_decimals)
+                with contextlib.suppress(Exception):
+                    await lit.cancel_all()                    # one hedge at a time per owner
+                err = await self._place(lambda: lit.stop_loss(lmk.market_id, base_amount, trig_int, price_int, long),
+                                        lit.order_error)
+                out["lighter"] = {"liq": liq, "stop": trig_int / 10 ** lmk.price_decimals} if not err else {"liq": liq, "error": err}
+        except Exception as e:  # noqa: BLE001
+            out["lighter"]["error"] = str(e)[:200]
+
+        failed = [f"{v}: {out[v]['error']}" for v in ("entropy", "lighter") if out[v].get("error")]
+        if owner and failed:
+            await self._say(owner, f"⚠️ {pair.label}: стоп не виставлено — " + "; ".join(html.escape(f) for f in failed))
+        return out
+
+    @staticmethod
+    def stops_text(stops: dict) -> str:
+        parts = []
+        for name, key in (("Entropy", "entropy"), ("Lighter", "lighter")):
+            v = stops.get(key) or {}
+            if v.get("stop"):
+                parts.append(f"{name} стоп {v['stop']:g} (ліквідація {v['liq']:g})")
+        return ("🛡 " + ", ".join(parts) + ". ") if parts else ""
+
+    async def guard_legs(self, owner, ent, lit, pair, *, seconds: float, sid: int | None = None,
+                         poll: float = 5.0) -> str | None:
+        """Hold for `seconds` (or until STOP) while watching both legs. If one leg disappears — its stop
+        fired or it was liquidated — the other is closed at market at once, so the hedge never sits as
+        naked delta. Returns "entropy"/"lighter" (the leg that went first) or None if the hold ended
+        normally. Reads that fail are skipped, never mistaken for a flat position."""
+        key = (owner, pair.key)
+        lmk = None
+        with contextlib.suppress(Exception):
+            lmk = (await md.lighter_markets(await self._exec.http(), self._cfg.lighter_api_url)).get(pair.lighter)
+        if not lmk:
+            await self._interruptible_sleep(sid, seconds) if sid is not None else await asyncio.sleep(seconds)
+            return None
+        start_e = start_l = None
+        end = time.time() + seconds
+        while time.time() < end:
+            if sid is not None and await self._stopping(sid):
+                return None
+            if key not in self._closing:
+                e_szi = await self._exec.entropy_szi(ent, pair.entropy)
+                l_abs = None
+                with contextlib.suppress(Exception):
+                    lp = await lit.position(lmk.market_id)
+                    l_abs = float(lp.get("abs", 0) or 0) if lp else 0.0
+                if e_szi is not None and l_abs is not None:
+                    e_abs = abs(e_szi)
+                    if start_e is None and e_abs > 0 and l_abs > 0:
+                        start_e, start_l = e_abs, l_abs
+                    if start_e:
+                        e_gone, l_gone = e_abs <= start_e * 0.05, l_abs <= start_l * 0.05
+                        if e_gone and l_gone:
+                            return None                       # both closed elsewhere — nothing to hedge
+                        if e_gone or l_gone:
+                            first = "entropy" if e_gone else "lighter"
+                            other = "Lighter" if e_gone else "Entropy"
+                            self._closing.add(key)
+                            try:
+                                if e_gone:
+                                    mark = await self._exec.lighter_mid(lmk.market_id)
+                                    err = await self._close_lighter(lit, lmk, mark)
+                                else:
+                                    resp = await ent.close_market(pair.entropy)
+                                    err = ent.order_error(resp) if isinstance(resp, dict) else None
+                                with contextlib.suppress(Exception):
+                                    await ent.cancel_all(pair.entropy)
+                                with contextlib.suppress(Exception):
+                                    await lit.cancel_all()
+                            finally:
+                                self._closing.discard(key)
+                            tail = f" Помилка закриття: {html.escape(str(err))}" if err else ""
+                            await self._say(owner, f"🛑 {pair.label}: нога на {'Entropy' if e_gone else 'Lighter'} закрилась "
+                                                   f"(стоп або ліквідація) — закрив {other} маркетом.{tail}")
+                            return first
+            await asyncio.sleep(min(poll, max(0.2, end - time.time())))
+        return None
+
+    def watch_manual(self, owner, ent, lit, pair) -> None:
+        """Guard a hedge opened by hand in the bot until it is closed (no hold timer)."""
+        key = (owner, pair.key)
+        old = self._watchers.pop(key, None)
+        if old:
+            old.cancel()
+
+        async def run():
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.guard_legs(owner, ent, lit, pair, seconds=30 * 86400)
+            self._watchers.pop(key, None)
+
+        self._watchers[key] = asyncio.create_task(run(), name=f"guard-{owner}-{pair.key}")
 
     async def open_maker_first(self, ent, lit, plan, *, timeout: float, sid: int | None = None):
         """Open a planned hedge maker-first and verify the Lighter leg actually landed.
@@ -421,10 +587,23 @@ class SessionEngine:
         PnL read just before flattening (RH-Lighter fee is 0). A failed close is reported, not swallowed
         — a leg left open ties up margin and blocks the next hedge."""
         errors: list[str] = []
+        key = (owner, pair.key)
+        self._closing.add(key)
+        try:
+            return await self._close_hedge_inner(ent, lit, pair, owner, since_ms, lit_equity_before, maker, sid, timeout,
+                                                 errors)
+        finally:
+            self._closing.discard(key)
+            w = self._watchers.pop(key, None)
+            if w:
+                w.cancel()
+
+    async def _close_hedge_inner(self, ent, lit, pair, owner, since_ms, lit_equity_before, maker, sid, timeout,
+                                 errors) -> dict:
         lmk = mark = None
         with contextlib.suppress(Exception):
-            timeout = aiohttp.ClientTimeout(total=8, connect=5)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
+            http_timeout = aiohttp.ClientTimeout(total=8, connect=5)   # not `timeout`: that's the maker-close budget
+            async with aiohttp.ClientSession(timeout=http_timeout) as s:
                 lmk = (await md.lighter_markets(s, self._cfg.lighter_api_url)).get(pair.lighter)
                 if lmk:
                     mark = await md.lighter_mark(s, self._cfg.lighter_api_url, lmk.market_id)

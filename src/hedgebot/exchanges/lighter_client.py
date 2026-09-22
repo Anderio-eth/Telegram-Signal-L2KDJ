@@ -63,6 +63,11 @@ class LighterClient:
             "entry": self._num(p, "avg_entry_price", "entry_price"),
             "unrealized_pnl": self._num(p, "unrealized_pnl", "unrealizedPnl") or 0.0,
             "realized_pnl": self._num(p, "realized_pnl", "realizedPnl") or 0.0,
+            # Isolated positions carry their own liquidation price (verified live, e.g. isolated
+            # ANTHROPIC long entry 2168.8 -> liq 1973.04); cross-margin positions report 0 because
+            # liquidation is account-wide — callers treat 0/None as "unknown".
+            "liq": self._num(p, "liquidation_price") or None,
+            "margin_mode": self._num(p, "margin_mode"),
         }
 
     async def balance(self) -> dict:
@@ -153,6 +158,17 @@ class LighterClient:
             time_in_force=tif,
             reduce_only=reduce_only,
             order_expiry=order_expiry,
+            api_key_index=self._api_key_index,
+        )
+
+    async def stop_loss(self, market_index: int, base_amount: int, trigger_price: int, price: int,
+                        is_ask: bool, client_order_index: int = 0) -> object:
+        """Reduce-only stop-loss (market on trigger). Integer-scaled amounts like limit_order; `price` is
+        the worst execution price accepted. SDK: create_sl_order(market_index, client_order_index,
+        base_amount, trigger_price, price, is_ask, reduce_only) — it sets ORDER_TYPE_STOP_LOSS with
+        IOC + the 28-day expiry itself. Returns the SDK's (order, resp, err) tuple."""
+        return await self._signer.create_sl_order(
+            market_index, client_order_index, base_amount, trigger_price, price, is_ask, True,
             api_key_index=self._api_key_index,
         )
 

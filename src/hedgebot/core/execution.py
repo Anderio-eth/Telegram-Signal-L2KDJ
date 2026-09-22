@@ -229,7 +229,7 @@ class MakerExecutor:
 
         async def cancel_resting() -> None:
             with contextlib.suppress(Exception):
-                await ent.cancel_all(market)
+                await ent.cancel_all(market, include_triggers=False)   # keep the stop-loss
 
         try:
             while True:

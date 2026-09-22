@@ -130,16 +130,22 @@ class EntropyClient:
                 return p
         return None
 
-    async def cancel_all(self, market: str | None = None) -> None:
+    async def cancel_all(self, market: str | None = None, *, include_triggers: bool = True) -> None:
         """Cancel this account's resting orders (optionally just one io market). Best-effort — used to
-        pull the unfilled maker leg after the position itself has been flattened."""
+        pull the unfilled maker leg after the position itself has been flattened.
+
+        include_triggers=False leaves stop-loss trigger orders alone: re-quoting the maker limit must
+        not strip the protective stop off the position. frontend_open_orders is used because it
+        carries the `isTrigger` flag (plain open_orders doesn't)."""
         try:
-            orders = await asyncio.to_thread(self._info.open_orders, self._address, self._dex)
+            orders = await asyncio.to_thread(self._info.frontend_open_orders, self._address, self._dex)
         except TypeError:
-            orders = await asyncio.to_thread(self._info.open_orders, self._address)
+            orders = await asyncio.to_thread(self._info.frontend_open_orders, self._address)
         for o in orders or []:
             coin, oid = o.get("coin"), o.get("oid")
             if oid is None or (market and coin != market):
+                continue
+            if not include_triggers and o.get("isTrigger"):
                 continue
             try:
                 await asyncio.to_thread(self._exchange.cancel, coin, oid)
@@ -155,6 +161,22 @@ class EntropyClient:
                     return {"status": "flat"}
                 return await asyncio.to_thread(self._exchange.market_close, market)
         return {"status": "flat"}
+
+    @staticmethod
+    def round_px(px: float, sz_decimals: int) -> float:
+        """Hyperliquid price rule (same as the SDK's own _slippage_price): 5 significant figures and
+        at most 6 - szDecimals decimals for perps."""
+        return round(float(f"{px:.5g}"), 6 - sz_decimals)
+
+    async def stop_loss(self, market: str, is_buy: bool, size: float, trigger_px: float,
+                        limit_px: float) -> dict:
+        """Reduce-only stop-market: fires at trigger_px and executes as a market order capped at
+        limit_px (the worst price accepted). is_buy=False protects a long, True a short. Returns the
+        raw response — use order_error() to read a rejection."""
+        order_type = {"trigger": {"triggerPx": trigger_px, "isMarket": True, "tpsl": "sl"}}
+        return await asyncio.to_thread(
+            self._exchange.order, market, is_buy, size, limit_px, order_type, True,
+        )
 
     async def set_leverage(self, market: str, leverage: int) -> dict:
         """Set isolated leverage for one io market (io markets are strictIsolated)."""
