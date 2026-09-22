@@ -171,7 +171,7 @@ class SessionEngine:
         except Exception:  # noqa: BLE001 — a session must not crash the whole engine
             LOGGER.exception("session %s crashed", sid)
         finally:
-            await self._finish(sid, owner)
+            await self._finish(sid, owner, cfg)
             self._tasks.pop(sid, None)
 
     async def _one_cycle(self, owner: int, sid: int, cfg: dict) -> None:
@@ -266,9 +266,13 @@ class SessionEngine:
                                  pnl=0.0, fees=0.0, lighter_vol=0.0, entropy_vol=0.0)
                 return
             if not fr.complete:
-                # Partly filled and hedged: hold the smaller hedge rather than throw it away.
+                # Partly filled and hedged: hold the smaller hedge rather than throw it away — and
+                # say so, or a smaller position on the exchange looks like a sizing bug.
+                planned = notional
                 notional = round(notional * fr.e_filled / e.size, 2)
                 await self._store.update_hedge(hid, notional_usd=notional)
+                await self._say(owner, f"ℹ️ {pair.label}: лімітка заповнилась частково — відкрито "
+                                       f"${notional:g} з ${planned:g}/ногу (обидві ноги захеджовані).")
             await self._store.update_hedge(hid, status="OPEN")
             l_side = "SHORT" if entropy_long else "LONG"
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (Entropy {side} ✓ / Lighter {l_side} ✓). "
@@ -394,10 +398,11 @@ class SessionEngine:
             lpos = await lit.position(lmk.market_id)
         l_abs = float(lpos.get("abs", 0) or 0) if lpos else 0.0
         l_is_ask = (lpos["size"] > 0) if lpos else (szi < 0)   # sell to close a Lighter long
-        stopping = (lambda: self._stopping(sid)) if sid is not None else None
+        # No `stopping` here: STOP is usually what asked for this close, so it must not abort it.
+        # The maker order gets its timeout, then the caller's market pass finishes the job.
         fr = await self._exec.fill(ent, lit, emk, lmk, e_is_buy=szi < 0, e_target=abs(szi),
                                    l_is_ask=l_is_ask, l_target=l_abs, closing=True,
-                                   timeout=timeout, stopping=stopping)
+                                   timeout=timeout, stopping=None)
         if fr.error:
             LOGGER.warning("maker close %s: %s — falling back to market", pair.label, fr.error)
 
@@ -578,14 +583,27 @@ class SessionEngine:
                 return
             await asyncio.sleep(min(1.5, max(0.05, end - time.time())))
 
-    async def _finish(self, sid: int, owner: int) -> None:
-        # STOP means: pull EVERY resting order and flatten EVERY open position on both venues — fast.
-        # Read what's ACTUALLY open once and close only those, all concurrently (the old per-coin loop
-        # did a fresh markets round-trip for every coin and was the slow part).
+    async def _finish(self, sid: int, owner: int, cfg: dict | None = None) -> None:
+        # Session over (STOP or duration): close whatever is still open the same way hedges normally
+        # close — Entropy maker limit first, Lighter at market as it fills — then sweep EVERY venue at
+        # market so nothing is ever left behind (maker timeout, positions from other coins, leftovers).
         with contextlib.suppress(Exception):
             ent = await self._entropy_client(owner)
             lit = await self._lighter_client(owner)
             try:
+                if ent and lit:
+                    open_pairs = []
+                    for p in await self._guard(ent.positions(), default=[]) or []:
+                        pair = next((x for x in PAIRS if x.entropy == p.get("coin")), None)
+                        if pair and float(p.get("szi", 0) or 0) != 0:
+                            open_pairs.append(pair)
+                    if open_pairs:
+                        t = float((cfg or {}).get("fill_timeout", 90))
+                        await self._say(owner, "⏹ Закриваю відкриті хеджі ліміткою на Entropy "
+                                               f"(до {self._fmt(t)}, далі — маркетом)…")
+                        await asyncio.gather(*(self._guard(self._close_hedge(ent, lit, pair, owner=owner, maker=True,
+                                                                             timeout=t))
+                                               for pair in open_pairs))
                 # 1) cancel all resting orders on both venues at once
                 await asyncio.gather(
                     self._guard(ent.cancel_all()) if ent else self._noop(),

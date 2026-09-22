@@ -42,6 +42,10 @@ LOGGER = logging.getLogger(__name__)
 
 MAKER_TICKS = 2            # how far off the mid the Entropy limit rests (user: "2-3 мінімальні кроки")
 REPRICE_S = 8.0            # re-quote a resting order that hasn't completed after this long
+# Once the order has STARTED filling, keep working it to the full size for up to this long (the
+# plain timeout only covers "nothing filled yet"). A big order on a thin io book fills in pieces —
+# giving up at the first timeout left a $5k hedge at $2k.
+PARTIAL_GRACE_S = 600.0
 POLL_S = 0.4               # position poll cadence while the maker order works
 LIGHTER_SLIPPAGE = 0.01    # IOC limit 1% through the mid: fills at the book, the cap is only a guard
 ENTROPY_MIN_NOTIONAL = 10.0
@@ -195,6 +199,7 @@ class MakerExecutor:
             return res
         ratio = l_target / e_target if e_target > 0 else 0.0
         deadline = time.monotonic() + max(5.0, float(timeout))
+        extended = False
         order_px: float | None = None
         placed_at = 0.0
         tick = 0.0
@@ -230,8 +235,13 @@ class MakerExecutor:
             while True:
                 szi = await self.entropy_szi(ent, market)
                 if szi is not None:
-                    progress = min(e_target, abs(szi - start_szi))
+                    # Not capped at the target: a bumped-up last order (see the $10 floor below) can fill
+                    # a little past it, and Lighter must mirror what actually filled.
+                    progress = abs(szi - start_szi)
                     res.e_filled = progress
+                    if progress > 0 and not extended:
+                        deadline = max(deadline, time.monotonic() + PARTIAL_GRACE_S)
+                        extended = True
                     if not await hedge_owed(final=False):
                         return res
                     if progress >= e_target * 0.999:
@@ -245,7 +255,7 @@ class MakerExecutor:
                     await asyncio.sleep(0.3)
                     szi = await self.entropy_szi(ent, market)
                     if szi is not None:
-                        progress = min(e_target, abs(szi - start_szi))
+                        progress = abs(szi - start_szi)
                         res.e_filled = progress
                     res.notes.append("лімітка не заповнилась вчасно" if progress <= 0 else "лімітка заповнилась частково")
                     await hedge_owed(final=True)
@@ -270,12 +280,21 @@ class MakerExecutor:
                 if order_px is None:
                     remaining = _floor(e_target - progress, emk.sz_decimals)
                     mid = (bid + ask) / 2
-                    if remaining <= 0 or remaining * mid < ENTROPY_MIN_NOTIONAL:
-                        # The leftover can't be quoted (Entropy's $10 floor). Treat as done-partial;
-                        # the caller decides (open: keep what's hedged, close: market the rest).
-                        res.notes.append("залишок менший за мінімум Entropy")
+                    if remaining <= 0:
+                        res.complete = True
                         await hedge_owed(final=True)
                         return res
+                    if remaining * mid < ENTROPY_MIN_NOTIONAL:
+                        if closing:
+                            # A reduce-only order can't exceed the position; the caller's market pass
+                            # closes this small remainder.
+                            res.notes.append("залишок менший за мінімум Entropy")
+                            return res
+                        # Opening: Entropy won't take an order under $10, so a $4-of-$12 partial could
+                        # never be completed. Quote the $10 minimum instead — the hedge ends a few
+                        # dollars larger than planned, and Lighter mirrors the actual fill, so delta
+                        # stays flat.
+                        remaining = math.ceil(ENTROPY_MIN_NOTIONAL * 1.01 / mid * 10 ** emk.sz_decimals) / 10 ** emk.sz_decimals
                     px = maker_price(bid, ask, e_is_buy, tick)
                     try:
                         resp = await ent.limit_order(market, e_is_buy, remaining, px, post_only=True, reduce_only=closing)
