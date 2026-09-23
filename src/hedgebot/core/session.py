@@ -236,6 +236,12 @@ class SessionEngine:
             await self._store.update_hedge(hid, status="FAILED")
             await self._say(owner, "⚠️ Немає ключів — зупиняю цикл.")
             return
+        # Never stack a new hedge on top of leftovers from a previous one (a leg that didn't close,
+        # a resting order): flatten whatever is still open first.
+        if not await self._ensure_flat(owner, ent, lit, pair):
+            await self._store.update_hedge(hid, status="FAILED")
+            await self._say(owner, f"⚠️ {pair.label}: попередня позиція ще відкрита — пропускаю цикл.")
+            return
         try:
             e, l = plan.entropy, plan.lighter
             lit_equity_before = await self._lit_equity(lit)   # for exact Lighter PnL (equity delta)
@@ -250,7 +256,10 @@ class SessionEngine:
                 await self._say(owner, f"⚠️ {pair.label}: не вдалось виставити плече {leverage}x на Lighter: "
                                        f"{html.escape(str(lev_err))}")
             # Maker-first: Entropy post-only limit, Lighter at market as it fills (see core/execution).
-            fr = await self.open_maker_first(ent, lit, plan, timeout=cfg.get("fill_timeout", 90), sid=sid)
+            # until_complete: a hedge is either opened at the size the user asked for, or not opened.
+            # Sessions never move on to the next cycle with a half-filled leg.
+            fr = await self.open_maker_first(ent, lit, plan, timeout=cfg.get("fill_timeout", 90), sid=sid,
+                                             until_complete=True, owner=owner, pair=pair)
             if fr.error or fr.unhedged > 0:
                 # A leg failed, or a partial fill is too small to hedge on Lighter — flatten both.
                 res = await self._cancel_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
@@ -272,12 +281,12 @@ class SessionEngine:
                                  pnl=0.0, fees=0.0, lighter_vol=0.0, entropy_vol=0.0)
                 return
             if not fr.complete:
-                # Partly filled and hedged: hold the smaller hedge rather than throw it away — and
-                # say so, or a smaller position on the exchange looks like a sizing bug.
+                # With until_complete this only happens on STOP: keep what filled (it is hedged),
+                # say so, and let the session wind down instead of starting a hold.
                 planned = notional
                 notional = round(notional * fr.e_filled / e.size, 2)
                 await self._store.update_hedge(hid, notional_usd=notional)
-                await self._say(owner, f"ℹ️ {pair.label}: лімітка заповнилась частково — відкрито "
+                await self._say(owner, f"ℹ️ {pair.label}: зупинка під час набору — відкрито "
                                        f"${notional:g} з ${planned:g}/ногу (обидві ноги захеджовані).")
             await self._store.update_hedge(hid, status="OPEN")
             l_side = "SHORT" if entropy_long else "LONG"
@@ -308,6 +317,34 @@ class SessionEngine:
                              pnl=res["pnl"], fees=res["fees"], lighter_vol=notional * 2, entropy_vol=notional * 2)
         finally:
             pass  # clients are cached for the whole session; closed in _finish
+
+    async def _ensure_flat(self, owner, ent, lit, pair) -> bool:
+        """True when both venues are flat for this pair. Anything left over (a leg that survived a
+        failed close, a resting order) is flattened first — a new hedge must never be opened on top
+        of an old one."""
+        leftovers = []
+        with contextlib.suppress(Exception):
+            if await self._exec.entropy_szi(ent, pair.entropy):
+                leftovers.append("Entropy")
+        lmk = None
+        with contextlib.suppress(Exception):
+            lmk = (await md.lighter_markets(await self._exec.http(), self._cfg.lighter_api_url)).get(pair.lighter)
+            if lmk:
+                lp = await lit.position(lmk.market_id)
+                if lp and lp.get("abs"):
+                    leftovers.append("Lighter")
+        if not leftovers:
+            return True
+        await self._say(owner, f"🧹 {pair.label}: лишилась стара позиція ({', '.join(leftovers)}) — закриваю перед новим хеджем.")
+        await self._close_hedge(ent, lit, pair, owner=owner)
+        with contextlib.suppress(Exception):
+            if await self._exec.entropy_szi(ent, pair.entropy):
+                return False
+            if lmk:
+                lp = await lit.position(lmk.market_id)
+                if lp and lp.get("abs"):
+                    return False
+        return True
 
     async def _adopt_open_hedges(self, owner, sid, cfg) -> None:
         """After a restart, finish hedges that were left OPEN — wait out the rest of their planned hold
@@ -519,16 +556,23 @@ class SessionEngine:
 
         self._watchers[key] = asyncio.create_task(run(), name=f"guard-{owner}-{pair.key}")
 
-    async def open_maker_first(self, ent, lit, plan, *, timeout: float, sid: int | None = None):
+    async def open_maker_first(self, ent, lit, plan, *, timeout: float, sid: int | None = None,
+                               until_complete: bool = False, owner=None, pair=None):
         """Open a planned hedge maker-first and verify the Lighter leg actually landed.
 
         Returns core.execution.FillResult. Shared with the bot's manual open. Assumes Lighter is flat
         on this market beforehand (one session per owner, hedges closed between cycles)."""
         e, l = plan.entropy, plan.lighter
         stopping = (lambda: self._stopping(sid)) if sid is not None else None
+        async def ping(filled: float, target: float) -> None:
+            if owner:
+                await self._say(owner, f"⏳ {pair.label if pair else ''}: лімітка на Entropy заповнена на "
+                                       f"{filled / target * 100:.0f}% ({filled:g} з {target:g}) — дотягую до повного розміру.")
+
         fr = await self._exec.fill(ent, lit, plan.entropy_market, plan.lighter_market,
                                    e_is_buy=e.is_buy, e_target=e.size, l_is_ask=l.is_ask, l_target=l.size,
-                                   closing=False, timeout=timeout, stopping=stopping)
+                                   closing=False, timeout=timeout, stopping=stopping,
+                                   until_complete=until_complete, on_progress=ping)
         if fr.error or fr.l_done <= 0:
             return fr
         # IOC can fill short on a thin book — top the Lighter leg up once if it's missing a real chunk.

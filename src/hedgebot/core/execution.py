@@ -45,7 +45,11 @@ REPRICE_S = 8.0            # re-quote a resting order that hasn't completed afte
 # Once the order has STARTED filling, keep working it to the full size for up to this long (the
 # plain timeout only covers "nothing filled yet"). A big order on a thin io book fills in pieces —
 # giving up at the first timeout left a $5k hedge at $2k.
+# With until_complete=True (how sessions open), there is no cap at all: the order is re-quoted until
+# the whole size is filled or the user stops the session, because a half-open hedge is not the hedge
+# the user asked for.
 PARTIAL_GRACE_S = 600.0
+PROGRESS_PING_S = 300.0    # how often to report "still filling" while a long fill works
 POLL_S = 0.4               # position poll cadence while the maker order works
 LIGHTER_SLIPPAGE = 0.01    # IOC limit 1% through the mid: fills at the book, the cap is only a guard
 ENTROPY_MIN_NOTIONAL = 10.0
@@ -185,12 +189,19 @@ class MakerExecutor:
         closing: bool,
         timeout: float,
         stopping=None,
+        until_complete: bool = False,
+        on_progress=None,
     ) -> FillResult:
         """Work a post-only Entropy order for `e_target` and mirror each fill on Lighter.
 
         `l_target` is the Lighter size matching the FULL Entropy target (sizes differ slightly because
         each venue's price and rounding differ); fills are mirrored pro rata. `stopping` is an async
-        callable -> bool (STOP pressed). Never returns with a resting Entropy order."""
+        callable -> bool (STOP pressed). Never returns with a resting Entropy order.
+
+        `timeout` only bounds the wait while NOTHING has filled. After the first fill:
+          · until_complete=False — keep working for PARTIAL_GRACE_S, then return what filled;
+          · until_complete=True  — keep working until the full size is filled or STOP.
+        `on_progress(filled, target)` is called about every PROGRESS_PING_S during a long fill."""
         market = emk.name
         res = FillResult()
         start_szi = await self.entropy_szi(ent, market)
@@ -200,6 +211,7 @@ class MakerExecutor:
         ratio = l_target / e_target if e_target > 0 else 0.0
         deadline = time.monotonic() + max(5.0, float(timeout))
         extended = False
+        last_ping = time.monotonic()
         order_px: float | None = None
         placed_at = 0.0
         tick = 0.0
@@ -240,8 +252,15 @@ class MakerExecutor:
                     progress = abs(szi - start_szi)
                     res.e_filled = progress
                     if progress > 0 and not extended:
+                        # First fill: stop counting the "nothing happened" timeout.
                         deadline = max(deadline, time.monotonic() + PARTIAL_GRACE_S)
                         extended = True
+                    if progress > 0 and until_complete:
+                        deadline = time.monotonic() + 3600     # rolling: only STOP ends this
+                        if on_progress and time.monotonic() - last_ping >= PROGRESS_PING_S:
+                            last_ping = time.monotonic()
+                            with contextlib.suppress(Exception):
+                                await on_progress(progress, e_target)
                     if not await hedge_owed(final=False):
                         return res
                     if progress >= e_target * 0.999:
