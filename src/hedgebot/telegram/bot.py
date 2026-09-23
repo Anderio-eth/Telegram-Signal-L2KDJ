@@ -46,7 +46,7 @@ MENU_BTN = "☰ Меню"  # the one persistent reply-keyboard button, always at
 SESS_DEFAULT = {
     "coins": [PAIRS[0].key], "leverage": 3, "margin": 5.0,
     "hold_min": 1800, "hold_max": 7200, "pause_on": False, "pause_min": 300, "pause_max": 1800,
-    "duration": 86400, "fill_timeout": 90, "dry_run": True, "notify_each": False,
+    "duration": 86400, "fill_timeout": 90, "reprice_s": 8, "dry_run": True, "notify_each": False,
 }
 
 
@@ -517,12 +517,17 @@ class HedgeBot:
                 "💵 Надішли <b>маржу в USD на ногу</b> числом (розмір позиції = маржа × плече):",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="open")]]),
                 parse_mode=ParseMode.HTML)
-        elif data in ("sess:hold", "sess:pause", "sess:timeout", "sess:margin"):
+        elif data in ("sess:hold", "sess:pause", "sess:timeout", "sess:margin", "sess:reprice"):
             ctx.user_data.clear()
             ctx.user_data["flow"] = "sess_" + data.split(":", 1)[1]
             back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
             if data == "sess:margin":
                 msg = "💵 Надішли <b>маржу в USD на ногу</b> числом (розмір = маржа × плече):"
+            elif data == "sess:reprice":
+                msg = ("🎯 Надішли <b>час життя лімітки в секундах</b> (напр. 8).\n\n"
+                       "Лімітка ставиться за 2 тіки від ціни і стоїть рівно стільки — не менше і не "
+                       "більше. Потім бот її знімає, хеджує на Lighter те, що встигло залитись, і "
+                       "ставить нову лімітку на залишок. І так, поки не набереться весь розмір.")
             elif data == "sess:timeout":
                 msg = ("⏳ Надішли <b>таймаут лімітки в секундах</b> (напр. 90).\n\n"
                        "Скільки лімітка на Entropy може чекати заповнення (бот переставляє її за ціною). "
@@ -658,7 +663,7 @@ class HedgeBot:
             await self._open_config(update, ctx)
             return ConversationHandler.END
 
-        if flow in ("sess_hold", "sess_pause", "sess_timeout", "sess_margin"):
+        if flow in ("sess_hold", "sess_pause", "sess_timeout", "sess_margin", "sess_reprice"):
             s = ctx.chat_data.setdefault("sess", dict(SESS_DEFAULT))
             back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
             try:
@@ -669,6 +674,8 @@ class HedgeBot:
                     s["margin"] = value
                 elif flow == "sess_timeout":
                     s["fill_timeout"] = max(5, int(float(text)))
+                elif flow == "sess_reprice":
+                    s["reprice_s"] = max(1, int(float(text)))
                 else:
                     a, b = (float(x) for x in text.replace(",", ".").split()[:2])
                     lo, hi = sorted((a, b))
@@ -758,6 +765,13 @@ class HedgeBot:
             ctx.chat_data["sess"] = {**SESS_DEFAULT, **saved, "coins": list(saved.get("coins") or SESS_DEFAULT["coins"])}
         await self._sess_config(update, ctx)
 
+    async def _reprice_s(self, owner: int):
+        """The limit lifetime the user configured for sessions. Manual opens/closes read the same
+        setting, so both paths quote and re-quote on the identical clock."""
+        with contextlib.suppress(Exception):
+            return ((await self._store.load_settings(owner)).get("session_cfg") or {}).get("reprice_s")
+        return None
+
     async def _sess_config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         s = ctx.chat_data["sess"]
         with contextlib.suppress(Exception):
@@ -773,7 +787,7 @@ class HedgeBot:
             f"⏱ Утримання: <b>{hold}</b>\n"
             f"⏸ Пауза: <b>{pause}</b>\n"
             f"🗓 Тривалість: <b>{self._fmt_secs(s['duration'])}</b>\n"
-            f"⏳ Таймаут лімітки: <b>{s['fill_timeout']}с</b>\n"
+            f"⏳ Таймаут лімітки: <b>{s['fill_timeout']}с</b>   🎯 Крок лімітки: <b>{s.get('reprice_s', 8)}с</b>\n"
             f"🔔 Алерти по хеджах: <b>{'увімк' if s.get('notify_each') else 'вимк (у таблицю)'}</b>\n"
             f"🧪 Режим: <b>{'DRY-RUN (тест)' if s['dry_run'] else 'LIVE (реальні ордери)'}</b>\n\n"
             "<i>Хеджі відкриваються/закриваються самі, час — рандом у межах утримання.</i>"
@@ -787,6 +801,7 @@ class HedgeBot:
             [InlineKeyboardButton(f"⏸ Пауза: {'увімк' if s['pause_on'] else 'вимк'}", callback_data="sess:pausetoggle")],
             [InlineKeyboardButton("🗓 Тривалість", callback_data="sess:dur"),
              InlineKeyboardButton("⏳ Таймаут", callback_data="sess:timeout")],
+            [InlineKeyboardButton(f"🎯 Крок лімітки {s.get('reprice_s', 8)}с", callback_data="sess:reprice")],
             [InlineKeyboardButton(f"🔔 Алерти: {'увімк' if s.get('notify_each') else 'вимк'}", callback_data="sess:notify"),
              InlineKeyboardButton(f"🧪 {'DRY-RUN' if s['dry_run'] else 'LIVE'}", callback_data="sess:dry")],
             [InlineKeyboardButton("▶️ Старт", callback_data="sess:start")],
@@ -1018,7 +1033,8 @@ class HedgeBot:
         # Maker-first, same as sessions: Entropy post-only limit, Lighter at market once it fills.
         await update.callback_query.edit_message_text(
             f"⏳ {pair.label}: лімітка на Entropy ({side}) виставлена, чекаю заповнення…")
-        fr = await self._engine.open_maker_first(ent, lit, plan, timeout=90)
+        fr = await self._engine.open_maker_first(ent, lit, plan, timeout=90,
+                                                 reprice_s=await self._reprice_s(owner))
         self._bal_cache.pop(owner, None)  # balance changed — next menu refetches
         if fr.error or fr.unhedged > 0:
             await self._engine._cancel_hedge(ent, lit, pair, owner=owner)
@@ -1077,7 +1093,8 @@ class HedgeBot:
         if ent and lit and pair and self._engine:
             # Engine's close: maker-first (Entropy reduce-only limit, then Lighter), then a market pass
             # that flattens anything left on BOTH venues.
-            res = await self._engine._close_hedge(ent, lit, pair, owner=owner, maker=True, timeout=60)
+            res = await self._engine._close_hedge(ent, lit, pair, owner=owner, maker=True, timeout=60,
+                                                  reprice_s=await self._reprice_s(owner))
         elif ent and pair:
             with contextlib.suppress(Exception):
                 await ent.close_market(pair.entropy)

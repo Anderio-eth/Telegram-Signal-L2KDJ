@@ -16,9 +16,10 @@ only hedged once the chunk clears those minimums AND leaves either nothing or an
 behind. Once Entropy is complete the residual is hedged whatever its size (it is then the whole
 remainder, which the plan already sized above the minimums).
 
-Repricing: the resting order is re-quoted when it has sat for REPRICE_S without completing, or as
-soon as the market runs away from it by more than the tick offset. Every re-quote first cancels and
-re-reads the position, so a fill that lands during the cancel can't make the new order oversized.
+Repricing is purely on the clock (user's rule): the resting order sits for `reprice_s` — whatever the
+user configured — and is only then cancelled and re-quoted, even if the market has walked away from
+it in the meantime. Every re-quote first cancels and re-reads the position, so a fill that lands
+during the cancel can't make the new order oversized, and the new order is sized to what is left.
 
 Fill detection reads the Entropy POSITION (not order status): it's the ground truth for delta, and it
 is the same read on open and close.
@@ -41,7 +42,7 @@ from ..exchanges.market_data import EntropyMarket, LighterMarket
 LOGGER = logging.getLogger(__name__)
 
 MAKER_TICKS = 2            # how far off the mid the Entropy limit rests (user: "2-3 мінімальні кроки")
-REPRICE_S = 8.0            # re-quote a resting order that hasn't completed after this long
+REPRICE_S = 8.0            # default seconds a resting order is left to work; per-session overridable
 # Once the order has STARTED filling, keep working it to the full size for up to this long (the
 # plain timeout only covers "nothing filled yet"). A big order on a thin io book fills in pieces —
 # giving up at the first timeout left a $5k hedge at $2k.
@@ -191,6 +192,7 @@ class MakerExecutor:
         stopping=None,
         until_complete: bool = False,
         on_progress=None,
+        reprice_s: float | None = None,
     ) -> FillResult:
         """Work a post-only Entropy order for `e_target` and mirror each fill on Lighter.
 
@@ -201,8 +203,11 @@ class MakerExecutor:
         `timeout` only bounds the wait while NOTHING has filled. After the first fill:
           · until_complete=False — keep working for PARTIAL_GRACE_S, then return what filled;
           · until_complete=True  — keep working until the full size is filled or STOP.
-        `on_progress(filled, target)` is called about every PROGRESS_PING_S during a long fill."""
+        `on_progress(filled, target)` is called about every PROGRESS_PING_S during a long fill.
+        `reprice_s` is how long one quote is left to work before it is cancelled and re-quoted
+        (defaults to REPRICE_S)."""
         market = emk.name
+        hold_s = max(1.0, float(reprice_s if reprice_s is not None else REPRICE_S))
         res = FillResult()
         start_szi = await self.entropy_szi(ent, market)
         if start_szi is None:
@@ -286,12 +291,10 @@ class MakerExecutor:
                     continue
                 bid, ask = book
                 tick = tick or entropy_tick((bid + ask) / 2, emk.sz_decimals)
-                ran_away = order_px is not None and (
-                    (e_is_buy and bid > order_px + MAKER_TICKS * tick) or
-                    (not e_is_buy and ask < order_px - MAKER_TICKS * tick))
-                stale = order_px is not None and time.monotonic() - placed_at > REPRICE_S
-
-                if order_px is not None and (ran_away or stale):
+                # Strictly on the clock: a quote gets its full `hold_s` even if the price has walked
+                # away from it. The user set this rule deliberately — re-quoting on every wiggle made
+                # the order jump around far more often than the interval they asked for.
+                if order_px is not None and time.monotonic() - placed_at >= hold_s:
                     await cancel_resting()
                     order_px = None
                     continue                     # re-read the position before sizing the new quote

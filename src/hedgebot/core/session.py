@@ -259,7 +259,8 @@ class SessionEngine:
             # until_complete: a hedge is either opened at the size the user asked for, or not opened.
             # Sessions never move on to the next cycle with a half-filled leg.
             fr = await self.open_maker_first(ent, lit, plan, timeout=cfg.get("fill_timeout", 90), sid=sid,
-                                             until_complete=True, owner=owner, pair=pair)
+                                             until_complete=True, owner=owner, pair=pair,
+                                             reprice_s=cfg.get("reprice_s"))
             if fr.error or fr.unhedged > 0:
                 # A leg failed, or a partial fill is too small to hedge on Lighter — flatten both.
                 res = await self._cancel_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
@@ -306,7 +307,7 @@ class SessionEngine:
                 return
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
                                           lit_equity_before=lit_equity_before, maker=True, sid=sid,
-                                          timeout=cfg.get("fill_timeout", 90))
+                                          timeout=cfg.get("fill_timeout", 90), reprice_s=cfg.get("reprice_s"))
             await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
                                            entropy_vol=notional * 2, lighter_vol=notional * 2)
             lit_mark = "✓" if not res.get("errors") else "✗"
@@ -383,7 +384,7 @@ class SessionEngine:
                     await self._store.update_hedge(h["id"], status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"])
                     continue
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms, maker=True, sid=sid,
-                                          timeout=cfg.get("fill_timeout", 90))
+                                          timeout=cfg.get("fill_timeout", 90), reprice_s=cfg.get("reprice_s"))
             await self._store.update_hedge(h["id"], status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"])
             vol = float(h.get("notional_usd", 0) or 0) * 2
             await self._stat(owner, sid, opened_at=h.get("opened_at"), closed_at=datetime.now(timezone.utc),
@@ -557,7 +558,8 @@ class SessionEngine:
         self._watchers[key] = asyncio.create_task(run(), name=f"guard-{owner}-{pair.key}")
 
     async def open_maker_first(self, ent, lit, plan, *, timeout: float, sid: int | None = None,
-                               until_complete: bool = False, owner=None, pair=None):
+                               until_complete: bool = False, owner=None, pair=None,
+                               reprice_s: float | None = None):
         """Open a planned hedge maker-first and verify the Lighter leg actually landed.
 
         Returns core.execution.FillResult. Shared with the bot's manual open. Assumes Lighter is flat
@@ -572,7 +574,7 @@ class SessionEngine:
         fr = await self._exec.fill(ent, lit, plan.entropy_market, plan.lighter_market,
                                    e_is_buy=e.is_buy, e_target=e.size, l_is_ask=l.is_ask, l_target=l.size,
                                    closing=False, timeout=timeout, stopping=stopping,
-                                   until_complete=until_complete, on_progress=ping)
+                                   until_complete=until_complete, on_progress=ping, reprice_s=reprice_s)
         if fr.error or fr.l_done <= 0:
             return fr
         # IOC can fill short on a thin book — top the Lighter leg up once if it's missing a real chunk.
@@ -593,7 +595,8 @@ class SessionEngine:
                 fr.unhedged = short   # a real gap that can't be topped up — caller flattens both
         return fr
 
-    async def _maker_close(self, ent, lit, pair, lmk, *, timeout: float, sid: int | None) -> None:
+    async def _maker_close(self, ent, lit, pair, lmk, *, timeout: float, sid: int | None,
+                           reprice_s: float | None = None) -> None:
         """Reduce the hedge maker-first: Entropy reduce-only limit, Lighter reduce-only at market as it
         fills. Whatever is left afterwards is flattened by the caller's market pass."""
         emk = None
@@ -612,7 +615,7 @@ class SessionEngine:
         # The maker order gets its timeout, then the caller's market pass finishes the job.
         fr = await self._exec.fill(ent, lit, emk, lmk, e_is_buy=szi < 0, e_target=abs(szi),
                                    l_is_ask=l_is_ask, l_target=l_abs, closing=True,
-                                   timeout=timeout, stopping=None)
+                                   timeout=timeout, stopping=None, reprice_s=reprice_s)
         if fr.error:
             LOGGER.warning("maker close %s: %s — falling back to market", pair.label, fr.error)
 
@@ -623,7 +626,7 @@ class SessionEngine:
                                        lit_equity_before=lit_equity_before)
 
     async def _close_hedge(self, ent, lit, pair, owner=None, since_ms=None, lit_equity_before=None,
-                           maker=False, sid=None, timeout: float = 60) -> dict:
+                           maker=False, sid=None, timeout: float = 60, reprice_s: float | None = None) -> dict:
         """Flatten BOTH legs simultaneously and return {pnl, fees, errors}.
 
         PnL/fees: the Entropy leg's realized PnL and fee are read from the exchange's own fills since
@@ -635,7 +638,7 @@ class SessionEngine:
         self._closing.add(key)
         try:
             return await self._close_hedge_inner(ent, lit, pair, owner, since_ms, lit_equity_before, maker, sid, timeout,
-                                                 errors)
+                                                 errors, reprice_s)
         finally:
             self._closing.discard(key)
             w = self._watchers.pop(key, None)
@@ -643,7 +646,7 @@ class SessionEngine:
                 w.cancel()
 
     async def _close_hedge_inner(self, ent, lit, pair, owner, since_ms, lit_equity_before, maker, sid, timeout,
-                                 errors) -> dict:
+                                 errors, reprice_s=None) -> dict:
         lmk = mark = None
         with contextlib.suppress(Exception):
             http_timeout = aiohttp.ClientTimeout(total=8, connect=5)   # not `timeout`: that's the maker-close budget
@@ -664,7 +667,7 @@ class SessionEngine:
         # Maker-first close (normal closes): saves Entropy's taker fee. Anything it didn't close — timeout,
         # STOP, a leftover under the $10 floor — falls through to the market flatten below.
         if maker and lmk:
-            await self._maker_close(ent, lit, pair, lmk, timeout=timeout, sid=sid)
+            await self._maker_close(ent, lit, pair, lmk, timeout=timeout, sid=sid, reprice_s=reprice_s)
             with contextlib.suppress(Exception):
                 mark = await md.lighter_mark(await self._exec.http(), self._cfg.lighter_api_url, lmk.market_id) or mark
 
@@ -825,7 +828,8 @@ class SessionEngine:
                         await self._say(owner, "⏹ Закриваю відкриті хеджі ліміткою на Entropy "
                                                f"(до {self._fmt(t)}, далі — маркетом)…")
                         await asyncio.gather(*(self._guard(self._close_hedge(ent, lit, pair, owner=owner, maker=True,
-                                                                             timeout=t))
+                                                                             timeout=t,
+                                                                             reprice_s=(cfg or {}).get("reprice_s")))
                                                for pair in open_pairs))
                 # 1) cancel all resting orders on both venues at once
                 await asyncio.gather(
