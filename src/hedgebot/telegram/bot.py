@@ -166,7 +166,7 @@ class HedgeBot:
         with contextlib.suppress(Exception):
             await update.message.delete()                # drop the /start command too
 
-    _ENTRY_RE = re.compile(r"^(key:(lighter|entropy|gsheets)|cfg:margin|sess:(hold|pause|timeout|margin))$")
+    _ENTRY_RE = re.compile(INPUT_PATTERN)   # same list as the entry points: see INPUT_CALLBACKS
 
     async def _conv_exit(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         """Fallback for any button pressed while awaiting text input. If it's another input button,
