@@ -31,6 +31,7 @@ from telegram.ext import (
 
 from ..config import Config
 from ..core.hedge import gap_text, plan_hedge
+from ..core.sheets import ACCOUNT_SCOPE
 from ..db.store import Store
 from ..exchanges import market_data as md
 from ..exchanges.hyperliquid_entropy import EntropyClient
@@ -50,8 +51,14 @@ MENU_BTN = "☰ Меню"  # the one persistent reply-keyboard button, always at
 INPUT_CALLBACKS = (
     "key:lighter", "key:entropy", "key:gsheets", "cfg:margin",
     "sess:hold", "sess:pause", "sess:timeout", "sess:margin", "sess:reprice",
+    "prof:add", "prof:proxy",
 )
-INPUT_PATTERN = "^(" + "|".join(re.escape(c) for c in INPUT_CALLBACKS) + ")$"
+# Dynamic callbacks: a row index is appended (prof:ren:0). Same list, same rules as above.
+INPUT_PREFIXES = ("prof:ren:",)
+INPUT_PATTERN = "^(?:" + "|".join(
+    [re.escape(c) for c in INPUT_CALLBACKS] + [re.escape(x) + r"\d+" for x in INPUT_PREFIXES]
+) + ")$"
+MAX_RANGE_MIN = 1440           # 24h -- the longest hold/pause the session config accepts
 SESS_INPUTS = tuple(c for c in INPUT_CALLBACKS if c.startswith("sess:"))
 SESS_INPUT_FLOWS = tuple(c.replace(":", "_") for c in SESS_INPUTS)
 
@@ -81,20 +88,31 @@ class HedgeBot:
         self._feed = feed
         # owner_id -> {"ts": monotonic, "at": "HH:MM:SS UTC", "text": str}. Keeps the main menu from
         # hitting both exchanges on every navigation; the 🔄 button forces a refetch.
-        self._bal_cache: dict[int, dict] = {}
+        self._bal_cache: dict[tuple, dict] = {}
         # owner_id -> {"entropy": client|None, "lighter": client|None, "ts": monotonic}. Building a
         # client is a network round-trip (Entropy loads meta); reusing it is what makes the menu snappy.
-        self._client_cache: dict[int, dict] = {}
+        self._client_cache: dict[tuple, dict] = {}
         # chat_id -> current anchor message id. Single source of truth for "the menu message", shared
         # by handlers and by the notification re-anchor (push_menu), so they never fight.
         self._anchor: dict[int, int] = {}
 
-    async def _drop_clients(self, owner: int) -> None:
-        """Close and forget an owner's cached clients (on a key change or after an error)."""
-        entry = self._client_cache.pop(owner, None)
-        if entry and entry.get("lighter"):
-            with contextlib.suppress(Exception):
-                await entry["lighter"].close()
+    async def _prof(self, owner: int) -> str:
+        """The profile every screen is acting on. Resolved inside the helpers instead of being
+        threaded through each handler, so a screen that forgets to ask still acts on the account the
+        user is looking at rather than a stale one."""
+        return await self._store.selected_profile(owner)
+
+    async def _drop_clients(self, owner: int, profile: str | None = None) -> None:
+        """Close and forget cached clients for one profile, or for all of the owner's profiles when
+        none is named (a key change, a profile switch, or after an error)."""
+        keys = [(owner, profile)] if profile is not None else [
+            k for k in list(self._client_cache) if k[0] == owner]
+        for k in keys:
+            entry = self._client_cache.pop(k, None)
+            self._bal_cache.pop(k, None)
+            if entry and entry.get("lighter"):
+                with contextlib.suppress(Exception):
+                    await entry["lighter"].close()
 
     # ── wiring ───────────────────────────────────────────────────────────────────────────────────
     def register(self, app: Application) -> None:
@@ -209,15 +227,27 @@ class HedgeBot:
         await self._edit_anchor(update, ctx, text, menu["reply_markup"])
 
     async def _main_menu(self, owner: int, force_bal: bool = False) -> dict:
-        venues = await self._store.venues_set(owner)
+        profile = await self._prof(owner)
+        venues = await self._store.venues_set(owner, profile)
         l = "✅" if "lighter" in venues else "❌"
         e = "✅" if "entropy" in venues else "❌"
         bal = await self._balances_cached(owner, force=force_bal)
+        # How many OTHER profiles are trading right now: with parallel sessions the menu must not
+        # look idle just because the profile you happen to be looking at is.
+        running = [x for x in await self._store.active_sessions(owner)]
+        others = sum(1 for x in running if (x.get("profile") or "") != profile)
+        run_line = ""
+        if running:
+            mine = any((x.get("profile") or "") == profile for x in running)
+            run_line = (f"🟢 Сесія: {'йде' if mine else '—'}"
+                        + (f"  ·  ще {others} на інших профілях" if others else "") + f"{NL}{NL}")
         text = (f"🤖 <b>Delta-Points</b>{NL}{NL}"
+                f"👤 Профіль: <b>{html.escape(profile)}</b>{NL}"
                 f"Ключі: Lighter {l}  ·  Entropy {e}{NL}{NL}"
-                f"{bal}{NL}{NL}"
+                f"{run_line}{bal}{NL}{NL}"
                 f"Хедж відкривається лімітками по спільних монетах (лонг на одній біржі, шорт на іншій).")
         rows = [
+            [InlineKeyboardButton(f"👤 Профіль: {profile}", callback_data="profs")],
             [InlineKeyboardButton("🔄 Оновити баланси", callback_data="refresh")],
             [InlineKeyboardButton("🔑 Ключі", callback_data="keys")],
             [InlineKeyboardButton("📈 Відкрити хедж (ручний)", callback_data="open")],
@@ -230,13 +260,14 @@ class HedgeBot:
     async def _balances_cached(self, owner: int, force: bool = False) -> str:
         """Formatted balance block for the main menu, cached for BAL_TTL so ordinary navigation is
         instant; `force` (the 🔄 button) refetches now."""
-        hit = self._bal_cache.get(owner)
+        key = (owner, await self._prof(owner))
+        hit = self._bal_cache.get(key)
         if hit and not force and (time.monotonic() - hit["ts"]) < self.BAL_TTL:
             return hit["text"]
         text = await self._fetch_balances_text(owner)
         at = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-        self._bal_cache[owner] = {"ts": time.monotonic(), "at": at, "text": f"{text}{NL}<i>оновлено {at}</i>"}
-        return self._bal_cache[owner]["text"]
+        self._bal_cache[key] = {"ts": time.monotonic(), "at": at, "text": f"{text}{NL}<i>оновлено {at}</i>"}
+        return self._bal_cache[key]["text"]
 
     async def _fetch_balances_text(self, owner: int) -> str:
         """Read both venues' balances into one compact block. The two venues are read CONCURRENTLY
@@ -286,17 +317,27 @@ class HedgeBot:
             await q.edit_message_text(**await self._main_menu(owner))
         elif data == "keys":
             await self._keys_menu(update, owner)
+        elif data == "profs":
+            await self._profs_menu(update, owner)
+        elif data == "proxy":
+            await self._proxy_menu(update, owner)
+        elif data == "prof:proxyoff":
+            await self._store.set_proxy(owner, await self._prof(owner), None)
+            await self._forget(owner, await self._prof(owner))
+            await self._proxy_menu(update, owner, "🗑 Проксі прибрано — трафік піде напряму.")
+        elif data.startswith("prof:"):
+            await self._prof_action(update, ctx, owner, data)
         elif data.startswith("unkey:") and data != "unkey:gsheets":
             venue = data.split(":", 1)[1]
-            await self._store.delete_credentials(owner, venue)
-            self._bal_cache.pop(owner, None)
+            await self._store.delete_credentials(owner, venue, await self._prof(owner))
+            await self._forget(owner, await self._prof(owner))
             await self._drop_clients(owner)
             await self._keys_menu(update, owner)   # already answered above; refreshed menu shows ❌
         elif data == "refresh":
             await q.edit_message_text(**await self._main_menu(owner, force_bal=True))
         elif data == "open":
             if "draft" not in ctx.chat_data:
-                saved = (await self._store.load_settings(owner)).get("draft") or {}
+                saved = (await self._store.load_settings(owner, await self._prof(owner))).get("draft") or {}
                 if not saved.get("side_manual"):
                     saved.pop("entropy_long", None)   # drafts saved before auto-side: go auto
                 ctx.chat_data["draft"] = {
@@ -365,7 +406,7 @@ class HedgeBot:
         elif data == "stats:test":
             await self._stats_test(update, owner)
         elif data == "unkey:gsheets":
-            await self._store.delete_credentials(owner, "gsheets")
+            await self._store.delete_credentials(owner, "gsheets", ACCOUNT_SCOPE)
             await self._stats_menu(update, owner)
         elif data == "positions":
             await self._positions(update, owner)
@@ -373,28 +414,153 @@ class HedgeBot:
             await self._close(update, owner, int(data.split(":", 1)[1]))
 
     async def _keys_menu(self, update: Update, owner: int) -> None:
-        venues = await self._store.venues_set(owner)
+        profile = await self._prof(owner)
+        venues = await self._store.venues_set(owner, profile)
         has_l, has_e = "lighter" in venues, "entropy" in venues
+        proxy = await self._store.get_proxy(owner, profile)
         text = (
-            "🔑 <b>Ключі</b>\n\n"
+            f"🔑 <b>Ключі — профіль «{html.escape(profile)}»</b>\n\n"
             f"🟦 Lighter: {'✅ заведено' if has_l else '❌ нема'}\n"
-            f"🟩 Entropy: {'✅ заведено' if has_e else '❌ нема'}\n\n"
-            "<i>Щоб змінити ключ — спершу відв'яжи, потім заведи знову.</i>"
+            f"🟩 Entropy: {'✅ заведено' if has_e else '❌ нема'}\n"
+            f"🌐 Проксі: {('<code>' + html.escape(self._mask_proxy(proxy)) + '</code>') if proxy else '— нема'}\n\n"
+            "<i>Ключі й проксі належать цьому профілю. Інші профілі — інші акаунти.</i>"
         )
-        # One button per venue: unlink if set, add if not. Both set → three buttons total.
         rows = [
             [InlineKeyboardButton("🗑 Відв'язати Lighter" if has_l else "➕ Завести Lighter",
                                   callback_data="unkey:lighter" if has_l else "key:lighter")],
             [InlineKeyboardButton("🗑 Відв'язати Entropy" if has_e else "➕ Завести Entropy",
                                   callback_data="unkey:entropy" if has_e else "key:entropy")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="menu")],
+            [InlineKeyboardButton("🌐 Проксі", callback_data="proxy")],
+            [InlineKeyboardButton("👤 Профілі", callback_data="profs")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
         ]
         await update.callback_query.edit_message_text(
             text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
 
+    # ── profiles (one Entropy + one Lighter + their shared proxy) ────────────────────────────────
+    async def _keys_locked(self, owner: int, profile: str) -> str:
+        """Why this profile's keys must not change right now -- "" when they may.
+
+        Swapping accounts under a live hedge is unrecoverable: the position stays on the account that
+        opened it, and the new keys cannot see, guard or close it."""
+        if await self._store.active_session(owner, profile):
+            return "На цьому профілі йде авто-сесія — зупини її спершу."
+        if await self._store.open_hedges(owner, profile):
+            return "На цьому профілі є відкриті хеджі — позицію іншим акаунтом не закрити."
+        return ""
+
+    async def _forget(self, owner: int, profile: str | None = None) -> None:
+        """Drop cached clients and balances after keys, proxy or the current profile changed. The
+        engine keeps its own cache, and a stale one would keep trading the previous account."""
+        await self._drop_clients(owner, profile)
+        if self._engine and profile is not None:
+            with contextlib.suppress(Exception):
+                await self._engine._drop_clients(owner, profile)
+
+    async def _profs_menu(self, update: Update, owner: int, note: str = "") -> None:
+        profs = await self._store.profiles(owner)
+        running = {(x.get("profile") or "") for x in await self._store.active_sessions(owner)}
+        lines = ["👤 <b>Профілі</b>", "",
+                 "Профіль — це один Entropy + один Lighter + спільний проксі, зі своїми "
+                 "налаштуваннями. Профілі торгують паралельно, кожен сам по собі.", ""]
+        for x in profs:
+            marks = (f"🟦{'✅' if x['has_lighter'] else '❌'} 🟩{'✅' if x['has_entropy'] else '❌'} "
+                     f"🌐{'✅' if x['has_proxy'] else '—'}")
+            run = "  ·  🟢 сесія" if x["name"] in running else ""
+            lines.append(f"{'✅' if x['selected'] else '○'} <b>{html.escape(x['name'])}</b> — {marks}{run}")
+        if note:
+            lines += ["", note]
+        rows = [[InlineKeyboardButton(f"{'✅' if x['selected'] else '○'} {x['name']}",
+                                      callback_data=f"prof:use:{i}"),
+                 InlineKeyboardButton("✏️", callback_data=f"prof:ren:{i}"),
+                 InlineKeyboardButton("🗑", callback_data=f"prof:del:{i}")]
+                for i, x in enumerate(profs)]
+        rows.append([InlineKeyboardButton("➕ Додати профіль", callback_data="prof:add")])
+        rows.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
+        await update.callback_query.edit_message_text(
+            "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+    async def _prof_action(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                           owner: int, data: str) -> None:
+        # Buttons carry the row index, not the name: names are free text and would not survive
+        # Telegram's 64-byte callback budget.
+        _, action, raw = data.split(":", 2)
+        profs = await self._store.profiles(owner)
+        i = int(raw) if raw.isdigit() else -1
+        if not 0 <= i < len(profs):
+            await self._profs_menu(update, owner, "⚠️ Список змінився — оновив.")
+            return
+        prof = profs[i]
+        if action == "use":
+            if not prof["selected"]:
+                await self._store.select_profile(owner, prof["name"])
+                await self._forget(owner)          # every screen now speaks to the other account
+            await self._refresh_menu(update, ctx, owner, f"👤 Профіль: <b>{html.escape(prof['name'])}</b>")
+        elif action == "del":
+            lock = await self._keys_locked(owner, prof["name"])
+            if lock:
+                await self._profs_menu(update, owner, f"⛔ {lock}")
+            elif len(profs) == 1:
+                await self._profs_menu(update, owner, "⛔ Це єдиний профіль — його не можна видалити.")
+            else:
+                await update.callback_query.edit_message_text(
+                    f"🗑 Видалити профіль «{html.escape(prof['name'])}»?\n\n"
+                    "Разом з ним зникнуть його ключі Entropy і Lighter та проксі — вводити доведеться "
+                    "заново. Історія хеджів залишиться.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🗑 Так, видалити", callback_data=f"prof:delok:{i}")],
+                        [InlineKeyboardButton("⬅️ Ні", callback_data="profs")]]),
+                    parse_mode=ParseMode.HTML)
+        elif action == "delok":
+            lock = await self._keys_locked(owner, prof["name"])
+            if lock or len(profs) == 1:
+                await self._profs_menu(update, owner, f"⛔ {lock or 'Це єдиний профіль.'}")
+                return
+            await self._store.delete_profile(owner, prof["name"])
+            await self._forget(owner)
+            await self._store.selected_profile(owner)      # promotes a survivor if this was selected
+            await self._profs_menu(update, owner, f"🗑 «{html.escape(prof['name'])}» видалено.")
+
+    async def _proxy_menu(self, update: Update, owner: int, note: str = "") -> None:
+        profile = await self._prof(owner)
+        proxy = await self._store.get_proxy(owner, profile)
+        lines = [f"🌐 <b>Проксі — профіль «{html.escape(profile)}»</b>", ""]
+        lines.append(f"Зараз: <code>{html.escape(self._mask_proxy(proxy))}</code>" if proxy
+                     else "Зараз: <b>без проксі</b> — обидві біржі бачать IP сервера.")
+        lines += ["", "Проксі спільний для Entropy і Lighter цього профілю. Підтримуються "
+                      "<b>HTTP</b>-проксі (<code>http://user:pass@host:port</code>): трафік до бірж "
+                      "усе одно йде через TLS наскрізь, тож проксі бачить лише адресу, а не запити."]
+        if note:
+            lines += ["", note]
+        rows = [[InlineKeyboardButton("✏️ Задати / змінити", callback_data="prof:proxy")]]
+        if proxy:
+            rows.append([InlineKeyboardButton("🗑 Прибрати проксі", callback_data="prof:proxyoff")])
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="keys")])
+        await update.callback_query.edit_message_text(
+            "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+    @staticmethod
+    def _mask_proxy(url: str | None) -> str:
+        """Show the proxy without its password -- the screen is a chat message that stays in history."""
+        return re.sub(r"://([^:/@]+):[^@]*@", r"://\1:***@", url or "")
+
+    @staticmethod
+    async def _proxy_check(proxy: str) -> tuple[bool, str]:
+        """Prove the proxy actually carries traffic and say which IP the world sees through it. A dead
+        proxy otherwise shows up as every order failing, minutes later and with a confusing error."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=12, connect=8)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get("https://api.ipify.org?format=json", proxy=proxy) as r:
+                    if r.status != 200:
+                        return False, f"HTTP {r.status}"
+                    return True, str((await r.json()).get("ip") or "?")
+        except Exception as e:  # noqa: BLE001 -- any failure here means "do not save this"
+            return False, f"{type(e).__name__}: {e}"[:160]
+
     # ── stats / Google Sheets ──────────────────────────────────────────────────────────────────────
     async def _stats_menu(self, update: Update, owner: int) -> None:
-        creds = await self._store.get_credentials(owner, "gsheets")
+        creds = await self._store.get_credentials(owner, "gsheets", ACCOUNT_SCOPE)
         if creds:
             email = creds.meta.get("client_email", "—")
             text = (
@@ -501,11 +667,41 @@ class HedgeBot:
             ctx.user_data.clear()
             ctx.user_data.update(flow="key_lighter", step=0)
             await update.callback_query.edit_message_text(
-                "🟦 <b>Lighter (Robinhood Chain) — крок 1/3</b>\n\n"
+                "🟦 <b>Lighter — крок 1/3</b>\n\n"
                 "На <b>robinhoodchain.lighter.xyz</b> відкрий розділ <b>API</b>, створи/візьми "
                 "API-ключ і надішли <b>приватний ключ API-ключа</b> (0x…).\n\n"
                 "⚠️ Це НЕ ключ гаманця — це згенерований API-ключ. І саме RH-деплой.",
                 reply_markup=self._cancel_kb(), parse_mode=ParseMode.HTML)
+        elif data == "prof:add":
+            ctx.user_data.clear()
+            ctx.user_data.update(flow="prof_add")
+            await update.callback_query.edit_message_text(
+                "➕ <b>Новий профіль</b>\n\nНадішли <b>назву</b> — щоб упізнавати його у списку "
+                "(напр. <code>Акк 2</code>).\n\nКлючі Entropy/Lighter і проксі заведеш йому "
+                "окремо, після створення.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="profs")]]),
+                parse_mode=ParseMode.HTML)
+        elif data == "prof:proxy":
+            ctx.user_data.clear()
+            ctx.user_data.update(flow="prof_proxy")
+            await update.callback_query.edit_message_text(
+                "🌐 <b>Проксі профілю</b>\n\nНадішли адресу у вигляді\n"
+                "<code>http://user:pass@host:port</code>  (або без логіна: <code>http://host:port</code>).\n\n"
+                "Тільки <b>HTTP</b>-проксі. Перевірю його одразу й покажу, який IP видно через нього.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="proxy")]]),
+                parse_mode=ParseMode.HTML)
+        elif data.startswith("prof:ren:"):
+            i = int(data.rsplit(":", 1)[1])
+            profs = await self._store.profiles(update.effective_user.id)
+            back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="profs")]])
+            if not 0 <= i < len(profs):
+                await update.callback_query.edit_message_text("⚠️ Список змінився.", reply_markup=back)
+                return ConversationHandler.END
+            ctx.user_data.clear()
+            ctx.user_data.update(flow="prof_rename", old_name=profs[i]["name"])
+            await update.callback_query.edit_message_text(
+                f"✏️ Нова назва для «{html.escape(profs[i]['name'])}»:",
+                reply_markup=back, parse_mode=ParseMode.HTML)
         elif data == "key:entropy":
             ctx.user_data.clear()
             ctx.user_data.update(flow="key_entropy", step=0)
@@ -544,10 +740,13 @@ class HedgeBot:
                 msg = ("⏳ Надішли <b>таймаут лімітки в секундах</b> (напр. 90).\n\n"
                        "Скільки лімітка на Entropy може чекати заповнення (бот переставляє її за ціною). "
                        "Не заповнилась — цикл пропускається без позиції; на закритті — дозакриваємо маркетом.")
+            elif data == "sess:hold":
+                msg = ("⏱ Надішли <b>діапазон утримання у хвилинах</b> — два числа через пробіл.\n\n"
+                       "Напр. <code>30 120</code> (30хв–2г) або <code>60 1440</code> (1г–24г).\n"
+                       "Максимум — <b>1440 хв (24 години)</b>.")
             else:
-                what = "утримання" if data == "sess:hold" else "паузи"
-                msg = (f"Надішли <b>діапазон {what} у хвилинах</b> — два числа через пробіл, напр. "
-                       f"<code>30 120</code> (від 30хв до 2г):")
+                msg = ("⏸ Надішли <b>діапазон паузи у хвилинах</b> — два числа через пробіл, напр. "
+                       "<code>5 30</code>. Максимум — 1440 хв (24 години).")
             await update.callback_query.edit_message_text(msg, reply_markup=back, parse_mode=ParseMode.HTML)
         return ASK
 
@@ -566,6 +765,53 @@ class HedgeBot:
             return ConversationHandler.END
         flow = ctx.user_data.get("flow")
 
+        if flow in ("prof_add", "prof_rename"):
+            back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ До профілів", callback_data="profs")]])
+            name = text.strip()[:32]
+            if not name or name == ACCOUNT_SCOPE:
+                await self._edit_anchor(update, ctx, "Так назвати не можна. Надішли іншу назву:", back)
+                return ASK
+            if flow == "prof_add":
+                ok = await self._store.create_profile(owner, name)
+                msg = (f"➕ Профіль «{html.escape(name)}» створено. Тепер заведи йому ключі й проксі."
+                       if ok else f"⚠️ Профіль «{html.escape(name)}» уже є.")
+            else:
+                ok = await self._store.rename_profile(owner, ctx.user_data["old_name"], name)
+                # The name is the join key for keys, sessions and hedges, so cached clients are stale.
+                await self._forget(owner)
+                msg = (f"✏️ Перейменовано на «{html.escape(name)}»." if ok
+                       else f"⚠️ Назва «{html.escape(name)}» вже зайнята — нічого не змінив.")
+            ctx.user_data.clear()
+            await self._edit_anchor(update, ctx, msg, back)
+            return ConversationHandler.END
+
+        if flow == "prof_proxy":
+            back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ До проксі", callback_data="proxy")]])
+            url = text.strip()
+            if not re.match(r"^https?://[^\s]+:\d+/?$", url) and not re.match(r"^http://[^\s@]+@[^\s]+:\d+/?$", url):
+                if not re.match(r"^https?://", url):
+                    await self._edit_anchor(update, ctx,
+                        "Не схоже на адресу проксі. Потрібно <code>http://host:port</code> або "
+                        "<code>http://user:pass@host:port</code>:", back)
+                    return ASK
+            profile = await self._prof(owner)
+            await self._edit_anchor(update, ctx, "⏳ Перевіряю проксі…", None)
+            ok, detail = await self._proxy_check(url)
+            if not ok:
+                # Never save a proxy that does not work: it would fail at order time instead, minutes
+                # later and with an error that says nothing about the proxy.
+                await self._edit_anchor(update, ctx,
+                    f"✗ Проксі не працює: <code>{html.escape(detail)}</code>\n\nНічого не зберіг. "
+                    f"Перевір адресу/логін і надішли ще раз:", back)
+                return ASK
+            await self._store.set_proxy(owner, profile, url)
+            await self._forget(owner, profile)
+            ctx.user_data.clear()
+            await self._edit_anchor(update, ctx,
+                f"✅ Проксі збережено для «{html.escape(profile)}».\nЗовнішній IP через нього: "
+                f"<code>{html.escape(detail)}</code>", back)
+            return ConversationHandler.END
+
         if flow == "key_lighter":
             step = ctx.user_data["step"]
             if step == 0:
@@ -581,13 +827,15 @@ class HedgeBot:
                     "зі сторінки API (число).", self._cancel_kb())
                 return ASK
             api_key_index = int(text) if text.isdigit() else 0
+            profile = await self._prof(owner)
             await self._store.set_credentials(
                 owner, "lighter", ctx.user_data["priv"],
-                {"account_index": ctx.user_data["account_index"], "api_key_index": api_key_index})
+                {"account_index": ctx.user_data["account_index"], "api_key_index": api_key_index},
+                profile)
             ctx.user_data.clear()
-            self._bal_cache.pop(owner, None)
-            await self._drop_clients(owner)
-            await self._refresh_menu(update, ctx, owner, "✅ Lighter збережено.")
+            await self._forget(owner, profile)
+            await self._refresh_menu(update, ctx, owner,
+                                     f"✅ Lighter збережено для «{html.escape(profile)}».")
             return ConversationHandler.END
 
         if flow == "key_entropy":
@@ -599,12 +847,13 @@ class HedgeBot:
                     "з app.hyperliquid.xyz/API (Generate → Authorize).\n\n"
                     "⚠️ Це ключ agent-а, а НЕ приватний ключ основного гаманця.", self._cancel_kb())
                 return ASK
+            profile = await self._prof(owner)
             await self._store.set_credentials(
-                owner, "entropy", text, {"wallet_address": ctx.user_data["wallet"]})
+                owner, "entropy", text, {"wallet_address": ctx.user_data["wallet"]}, profile)
             ctx.user_data.clear()
-            self._bal_cache.pop(owner, None)
-            await self._drop_clients(owner)
-            await self._refresh_menu(update, ctx, owner, "✅ Entropy збережено.")
+            await self._forget(owner, profile)
+            await self._refresh_menu(update, ctx, owner,
+                                     f"✅ Entropy збережено для «{html.escape(profile)}».")
             return ConversationHandler.END
 
         if flow == "key_gsheets":
@@ -635,9 +884,10 @@ class HedgeBot:
                     "або сам ID:", back)
                 return ASK
             email = ctx.user_data["gs_email"]
+            # The sheet is account-level: it must survive renaming or deleting any profile.
             await self._store.set_credentials(
                 owner, "gsheets", ctx.user_data["gs_json"],
-                {"spreadsheet_id": spreadsheet_id, "client_email": email})
+                {"spreadsheet_id": spreadsheet_id, "client_email": email}, ACCOUNT_SCOPE)
             ctx.user_data.clear()
             # Verify access right away so a missing "share with the service account" is caught now.
             ok, detail = (True, "")
@@ -693,6 +943,7 @@ class HedgeBot:
                     lo, hi = sorted((a, b))
                     if lo <= 0:
                         raise ValueError
+                    lo, hi = min(lo, MAX_RANGE_MIN), min(hi, MAX_RANGE_MIN)
                     if flow == "sess_hold":
                         s["hold_min"], s["hold_max"] = lo * 60, hi * 60
                     else:
@@ -700,7 +951,8 @@ class HedgeBot:
                         s["pause_on"] = True
             except (ValueError, IndexError):
                 await self._edit_anchor(update, ctx, "Не зрозумів. Для діапазону — два числа через пробіл "
-                                        "(напр. <code>30 120</code>); для таймауту — одне число:", back)
+                                        "(напр. <code>60 1440</code>, максимум 1440); для таймауту — "
+                                        "одне число:", back)
                 return ASK
             ctx.user_data.clear()
             await self._sess_config(update, ctx)
@@ -712,7 +964,8 @@ class HedgeBot:
     async def _open_config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         d = ctx.chat_data["draft"]
         with contextlib.suppress(Exception):
-            await self._store.save_draft(update.effective_user.id, d)  # remember last settings
+            oid = update.effective_user.id
+            await self._store.save_draft(oid, await self._prof(oid), d)  # remember last settings
         pair = get_pair(d["pair"])
         notional = d["margin"] * d["leverage"]
         side_mode = d.get("entropy_long")
@@ -768,12 +1021,12 @@ class HedgeBot:
         return f"{s/86400:.0f}д" if s >= 86400 else (f"{s/3600:.0f}г" if s >= 3600 else f"{s/60:.0f}хв")
 
     async def _sess_open(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
-        active = await self._store.active_session(owner)
+        active = await self._store.active_session(owner, await self._prof(owner))
         if active:
             await self._sess_active(update, ctx, active)
             return
         if "sess" not in ctx.chat_data:
-            saved = (await self._store.load_settings(owner)).get("session_cfg") or {}
+            saved = (await self._store.load_settings(owner, await self._prof(owner))).get("session_cfg") or {}
             ctx.chat_data["sess"] = {**SESS_DEFAULT, **saved, "coins": list(saved.get("coins") or SESS_DEFAULT["coins"])}
         await self._sess_config(update, ctx)
 
@@ -781,13 +1034,15 @@ class HedgeBot:
         """The limit lifetime the user configured for sessions. Manual opens/closes read the same
         setting, so both paths quote and re-quote on the identical clock."""
         with contextlib.suppress(Exception):
-            return ((await self._store.load_settings(owner)).get("session_cfg") or {}).get("reprice_s")
+            return ((await self._store.load_settings(owner, await self._prof(owner)))
+                    .get("session_cfg") or {}).get("reprice_s")
         return None
 
     async def _sess_config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         s = ctx.chat_data["sess"]
         with contextlib.suppress(Exception):
-            await self._store.save_session_cfg(update.effective_user.id, s)
+            oid = update.effective_user.id
+            await self._store.save_session_cfg(oid, await self._prof(oid), s)
         coins = ", ".join(get_pair(k).label for k in s["coins"]) or "—"
         hold = f"{self._fmt_secs(s['hold_min'])}–{self._fmt_secs(s['hold_max'])}"
         pause = (f"увімк {self._fmt_secs(s['pause_min'])}–{self._fmt_secs(s['pause_max'])}"
@@ -863,7 +1118,7 @@ class HedgeBot:
         delete the previous one — so notifications scroll up above a menu that stays pinned to the
         bottom. Called after every bot-sent notification."""
         try:
-            active = await self._store.active_session(chat_id)
+            active = await self._store.active_session(chat_id, await self._prof(chat_id))
             view = await self._sess_active_view(active) if active else await self._main_menu(chat_id)
             old = self._anchor.get(chat_id)
             m = await app.bot.send_message(chat_id=chat_id, **view)
@@ -900,7 +1155,7 @@ class HedgeBot:
         s = ctx.chat_data.get("sess", dict(SESS_DEFAULT))
         # Never stack sessions — two sessions fight over the same margin (the "not enough margin"
         # flood). If one is already running, just show it.
-        active = await self._store.active_session(owner)
+        active = await self._store.active_session(owner, await self._prof(owner))
         if active:
             await update.callback_query.answer("Сесія вже активна — спершу зупини її.", show_alert=True)
             await self._sess_active(update, ctx, active)
@@ -911,7 +1166,7 @@ class HedgeBot:
         if not self._engine:
             await update.callback_query.answer("Рушій недоступний", show_alert=True)
             return
-        sid = await self._engine.start_session(owner, dict(s))
+        sid = await self._engine.start_session(owner, await self._prof(owner), dict(s))
         await update.callback_query.answer(f"▶️ Сесію #{sid} запущено", show_alert=True)
         await self._sess_open(update, ctx, owner)
 
@@ -1051,7 +1306,8 @@ class HedgeBot:
         if fr.error or fr.unhedged > 0:
             await self._engine._cancel_hedge(ent, lit, pair, owner=owner)
             why = fr.error or "частковий філ менший за мінімум Lighter"
-            await self._store.record_hedge(owner, pair.key, notional, side, "FAILED", {"error": str(why)})
+            await self._store.record_hedge(owner, await self._prof(owner), pair.key, notional, side,
+                                           "FAILED", {"error": str(why)})
             await update.callback_query.edit_message_text(
                 f"🔴 <b>{pair.label}</b> — не відкрито: {html.escape(str(why))}\nОбидві ноги закрито.",
                 reply_markup=self._back(), parse_mode=ParseMode.HTML)
@@ -1066,8 +1322,8 @@ class HedgeBot:
         # Stops 1% before liquidation on both legs, then a watcher that closes the other leg if one
         # of them is stopped out or liquidated.
         stops = await self._engine.place_stops(ent, lit, pair, owner=owner)
-        self._engine.watch_manual(owner, ent, lit, pair)
-        await self._store.record_hedge(owner, pair.key, notional, side, "OPEN",
+        self._engine.watch_manual(owner, ent, lit, pair, await self._prof(owner))
+        await self._store.record_hedge(owner, await self._prof(owner), pair.key, notional, side, "OPEN",
                                        {"entropy_filled": fr.e_filled, "lighter_filled": fr.l_done, "stops": stops})
         part = "" if fr.complete else " (частково)"
         stop_line = html.escape(self._engine.stops_text(stops)) or "⚠️ стопи не виставлені (див. повідомлення вище)"
@@ -1078,7 +1334,7 @@ class HedgeBot:
 
     # ── positions / close ──────────────────────────────────────────────────────────────────────────
     async def _positions(self, update: Update, owner: int) -> None:
-        hedges = await self._store.open_hedges(owner)
+        hedges = await self._store.open_hedges(owner, await self._prof(owner))
         if not hedges:
             await update.callback_query.edit_message_text("Немає відкритих хеджів.", reply_markup=self._back())
             return
@@ -1093,7 +1349,7 @@ class HedgeBot:
 
     async def _close(self, update: Update, owner: int, hedge_id: int) -> None:
         await update.callback_query.edit_message_text("⏳ Закриваю…")
-        hedges = {h["id"]: h for h in await self._store.open_hedges(owner)}
+        hedges = {h["id"]: h for h in await self._store.open_hedges(owner, await self._prof(owner))}
         h = hedges.get(hedge_id)
         if not h:
             await update.callback_query.edit_message_text("Не знайшов хедж.", reply_markup=self._back())
@@ -1122,40 +1378,45 @@ class HedgeBot:
     def _back(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="menu")]])
 
-    def _cache_get(self, owner: int, venue: str):
-        entry = self._client_cache.get(owner)
+    def _cache_get(self, owner: int, profile: str, venue: str):
+        entry = self._client_cache.get((owner, profile))
         if entry and (time.monotonic() - entry["ts"]) < self.CLIENT_TTL:
             return entry.get(venue)
         return None
 
-    def _cache_put(self, owner: int, venue: str, client) -> None:
-        entry = self._client_cache.setdefault(owner, {"ts": time.monotonic()})
+    def _cache_put(self, owner: int, profile: str, venue: str, client) -> None:
+        entry = self._client_cache.setdefault((owner, profile), {"ts": time.monotonic()})
         entry[venue] = client
         entry["ts"] = time.monotonic()
 
-    async def _entropy_client(self, owner: int) -> EntropyClient | None:
-        cached = self._cache_get(owner, "entropy")
+    async def _entropy_client(self, owner: int, profile: str | None = None) -> EntropyClient | None:
+        profile = profile if profile is not None else await self._prof(owner)
+        cached = self._cache_get(owner, profile, "entropy")
         if cached is not None:
             return cached
-        c = await self._store.get_credentials(owner, "entropy")
+        c = await self._store.get_credentials(owner, "entropy", profile)
         if not c:
             return None
+        proxy = await self._store.get_proxy(owner, profile)
         client = await asyncio.to_thread(
-            EntropyClient, self._cfg.hyperliquid_api_url, c.meta["wallet_address"], c.secret, self._cfg.entropy_dex)
-        self._cache_put(owner, "entropy", client)
+            EntropyClient, self._cfg.hyperliquid_api_url, c.meta["wallet_address"], c.secret,
+            self._cfg.entropy_dex, proxy)
+        self._cache_put(owner, profile, "entropy", client)
         return client
 
-    async def _lighter_client(self, owner: int) -> LighterClient | None:
-        cached = self._cache_get(owner, "lighter")
+    async def _lighter_client(self, owner: int, profile: str | None = None) -> LighterClient | None:
+        profile = profile if profile is not None else await self._prof(owner)
+        cached = self._cache_get(owner, profile, "lighter")
         if cached is not None:
             return cached
-        c = await self._store.get_credentials(owner, "lighter")
+        c = await self._store.get_credentials(owner, "lighter", profile)
         if not c:
             return None
+        proxy = await self._store.get_proxy(owner, profile)
         # MUST build on the event loop: the Lighter SDK creates an aiohttp connector in its
         # constructor (asyncio.get_running_loop()), so a worker thread raised "no running event loop".
         # The constructor does no network, and clients are cached, so building inline is fine.
         client = LighterClient(self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
-                               int(c.meta.get("api_key_index", 0)))
-        self._cache_put(owner, "lighter", client)
+                               int(c.meta.get("api_key_index", 0)), proxy)
+        self._cache_put(owner, profile, "lighter", client)
         return client

@@ -35,7 +35,7 @@ class LighterClient:
     CANCEL_ALL_TIF_IMMEDIATE = 0
 
     def __init__(self, api_url: str, account_index: int, api_key_private_key: str,
-                 api_key_index: int = 0) -> None:
+                 api_key_index: int = 0, proxy: str | None = None) -> None:
         self._url = api_url
         self._account_index = int(account_index)
         self._api_key_index = int(api_key_index)
@@ -44,6 +44,16 @@ class LighterClient:
             account_index=int(account_index),
             api_private_keys={int(api_key_index): api_key_private_key},
         )
+        if proxy:
+            # SignerClient builds its own ApiClient (no proxy parameter anywhere), and lighter's
+            # rest.py copies configuration.proxy into the REST object at CONSTRUCTION time --
+            # so setting only the configuration after the fact would be read too late. Both have
+            # to be set. Only plain http:// proxies: aiohttp reaches https endpoints through them
+            # with CONNECT, so the session with the exchange stays end-to-end encrypted and the
+            # proxy sees nothing but the hostname. https:// proxies (TLS in TLS) are disabled in
+            # asyncio, and SOCKS would need a connector the SDK does not let us pass.
+            self._signer.api_client.configuration.proxy = proxy
+            self._signer.api_client.rest_client.proxy = proxy
 
     async def _account(self):
         """The account object, read over the SIGNER's existing HTTP connector (no new ApiClient per

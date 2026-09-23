@@ -23,6 +23,9 @@ from datetime import datetime, timezone
 
 LOGGER = logging.getLogger(__name__)
 
+# The sheet belongs to the account, not to any one profile (see db/schema.sql).
+ACCOUNT_SCOPE = "*"
+
 HEADERS = [
     "Відкрито (UTC)", "Закрито (UTC)", "Монета", "Напрям (Entropy)",
     "Статус відкриття", "Статус позиції", "PnL $ (після комісій)", "Комісії $",
@@ -45,15 +48,17 @@ class SheetsLogger:
         self._warned: set[int] = set()              # owners already told about a write failure
 
     async def enabled(self, owner_id: int) -> bool:
-        return (await self._store.get_credentials(owner_id, "gsheets")) is not None
+        return (await self._store.get_credentials(owner_id, "gsheets", ACCOUNT_SCOPE)) is not None
 
-    def _title(self, sid: int) -> str:
-        return f"Сесія {sid}"
+    def _title(self, sid: int, profile: str = "") -> str:
+        # The profile leads the tab name so several accounts' sessions stay readable side by side in
+        # one spreadsheet (and sort together per account).
+        return f"{profile} — Сесія {sid}" if profile else f"Сесія {sid}"
 
     async def test_connection(self, owner_id: int) -> tuple[bool, str]:
         """Open the sheet once so setup mistakes (not shared with the service account, Sheets API not
         enabled, wrong id) surface immediately when the user connects it, not silently at trade time."""
-        creds = await self._store.get_credentials(owner_id, "gsheets")
+        creds = await self._store.get_credentials(owner_id, "gsheets", ACCOUNT_SCOPE)
         if not creds:
             return False, "ключ не збережено"
         spreadsheet_id = creds.meta.get("spreadsheet_id")
@@ -84,18 +89,18 @@ class SheetsLogger:
         return title
 
     # ── public API (all best-effort) ────────────────────────────────────────────────────────────────
-    async def ensure_sheet(self, owner_id: int, sid: int) -> None:
-        await self._run(owner_id, self._ensure_sync, sid)
+    async def ensure_sheet(self, owner_id: int, sid: int, profile: str = "") -> None:
+        await self._run(owner_id, self._ensure_sync, sid, profile)
 
-    async def append_hedge(self, owner_id: int, sid: int, row: dict) -> None:
-        await self._run(owner_id, self._append_sync, sid, row)
+    async def append_hedge(self, owner_id: int, sid: int, profile: str, row: dict) -> None:
+        await self._run(owner_id, self._append_sync, sid, profile, row)
 
-    async def append_totals(self, owner_id: int, sid: int, rows: list[dict]) -> None:
-        await self._run(owner_id, self._totals_sync, sid, rows)
+    async def append_totals(self, owner_id: int, sid: int, profile: str, rows: list[dict]) -> None:
+        await self._run(owner_id, self._totals_sync, sid, profile, rows)
 
     # ── plumbing ────────────────────────────────────────────────────────────────────────────────────
     async def _run(self, owner_id: int, fn, *args) -> None:
-        creds = await self._store.get_credentials(owner_id, "gsheets")
+        creds = await self._store.get_credentials(owner_id, "gsheets", ACCOUNT_SCOPE)
         if not creds:
             return
         spreadsheet_id = creds.meta.get("spreadsheet_id")
@@ -130,9 +135,9 @@ class SheetsLogger:
         ss = gc.open_by_key(spreadsheet_id)
         fn(ss, *args)
 
-    def _worksheet(self, ss, sid: int, create: bool):
+    def _worksheet(self, ss, sid: int, profile: str, create: bool):
         import gspread
-        title = self._title(sid)
+        title = self._title(sid, profile)
         try:
             return ss.worksheet(title)
         except gspread.WorksheetNotFound:
@@ -142,8 +147,8 @@ class SheetsLogger:
             ws.append_row(HEADERS, value_input_option="USER_ENTERED")
             return ws
 
-    def _ensure_sync(self, ss, sid: int) -> None:
-        self._worksheet(ss, sid, create=True)
+    def _ensure_sync(self, ss, sid: int, profile: str = "") -> None:
+        self._worksheet(ss, sid, profile, create=True)
 
     @staticmethod
     def _row_values(row: dict) -> list:
@@ -155,12 +160,12 @@ class SheetsLogger:
             round(float(row.get("lighter_vol") or 0), 2), round(float(row.get("entropy_vol") or 0), 2),
         ]
 
-    def _append_sync(self, ss, sid: int, row: dict) -> None:
-        ws = self._worksheet(ss, sid, create=True)
+    def _append_sync(self, ss, sid: int, profile: str, row: dict) -> None:
+        ws = self._worksheet(ss, sid, profile, create=True)
         ws.append_row(self._row_values(row), value_input_option="USER_ENTERED")
 
-    def _totals_sync(self, ss, sid: int, rows: list[dict]) -> None:
-        ws = self._worksheet(ss, sid, create=True)
+    def _totals_sync(self, ss, sid: int, profile: str, rows: list[dict]) -> None:
+        ws = self._worksheet(ss, sid, profile, create=True)
         pnl = sum(float(r.get("pnl") or 0) for r in rows)
         fees = sum(float(r.get("fees") or 0) for r in rows)
         lvol = sum(float(r.get("lighter_vol") or 0) for r in rows)

@@ -55,24 +55,26 @@ class SessionEngine:
         self._sheets = sheets                       # SheetsLogger | None — per-session stats to a sheet
         self._feed = feed                           # PriceFeed | None — realtime io mids over WS
         self._tasks: dict[int, asyncio.Task] = {}
-        # owner -> {"entropy": client, "lighter": client}. Built once per session and reused across
-        # cycles — rebuilding per cycle re-loaded Entropy market meta every time (seconds of latency).
-        self._clients: dict[int, dict] = {}
+        # (owner, profile) -> {"entropy": client, "lighter": client}. Built once per session and reused
+        # across cycles — rebuilding per cycle re-loaded Entropy market meta every time (seconds of
+        # latency). Keyed by PROFILE too: profiles are different accounts behind different proxies, so
+        # one owner's clients must never be handed to another of their profiles.
+        self._clients: dict[tuple, dict] = {}
         self._exec = MakerExecutor(cfg)
-        # (owner, pair.key) -> watcher task for hedges opened by hand in the bot (sessions guard their
-        # own hedges inline while holding).
+        # (owner, profile, pair.key) -> watcher task for hedges opened by hand in the bot (sessions
+        # guard their own hedges inline while holding).
         self._watchers: dict[tuple, asyncio.Task] = {}
-        # (owner, pair.key) being closed on purpose right now — the leg guard must not "react" to a
-        # leg going flat because WE are closing it.
+        # (owner, profile, pair.key) being closed on purpose right now — the leg guard must not
+        # "react" to a leg going flat because WE are closing it.
         self._closing: set[tuple] = set()
 
     async def start(self) -> None:
         """Resume RUNNING sessions after a restart — but only ONE per owner. Earlier double-taps can
         leave several RUNNING rows for the same user; resuming them all would recreate the margin
         fight, so keep the newest and retire the rest."""
-        seen: set[int] = set()
+        seen: set[tuple] = set()
         for s in await self._store.running_sessions():
-            owner = s.get("owner_id")
+            owner = (s.get("owner_id"), s.get("profile") or "")
             if owner in seen:
                 with contextlib.suppress(Exception):
                     await self._store.set_session_status(s["id"], "STOPPED")  # retire the duplicate
@@ -81,14 +83,15 @@ class SessionEngine:
             self._spawn(s, resumed=True)
         LOGGER.info("session engine started; resumed %d session(s)", len(self._tasks))
 
-    async def start_session(self, owner_id: int, config: dict) -> int:
-        # Guard against stacking (double-tap / race): one running session per owner. Concurrent
-        # sessions fight over the same margin and flood "not enough margin".
-        existing = await self._store.active_session(owner_id)
+    async def start_session(self, owner_id: int, profile: str, config: dict) -> int:
+        # Guard against stacking (double-tap / race): one running session per PROFILE. Two sessions on
+        # the same profile fight over the same margin and flood "not enough margin"; two sessions on
+        # different profiles are different accounts entirely and are exactly what this supports.
+        existing = await self._store.active_session(owner_id, profile)
         if existing and existing.get("status") == "RUNNING":
             return existing["id"]
-        sid = await self._store.create_session(owner_id, config)
-        self._spawn({"id": sid, "owner_id": owner_id, "config": config})
+        sid = await self._store.create_session(owner_id, profile, config)
+        self._spawn({"id": sid, "owner_id": owner_id, "profile": profile, "config": config})
         return sid
 
     async def stop_session(self, session_id: int) -> None:
@@ -100,8 +103,10 @@ class SessionEngine:
             return
         self._tasks[s["id"]] = asyncio.create_task(self._run(s, resumed), name=f"session-{s['id']}")
 
-    async def _say(self, owner_id: int, text: str) -> None:
+    async def _say(self, owner_id: int, text: str, profile: str | None = None) -> None:
         if self._notify:
+            if profile:
+                text = f"<b>[{html.escape(profile)}]</b> {text}"
             with contextlib.suppress(Exception):
                 await self._notify(owner_id, text)
 
@@ -129,58 +134,59 @@ class SessionEngine:
         except Exception:  # noqa: BLE001
             return default
 
-    async def _hedge_alert(self, cfg: dict, owner_id: int, text: str) -> None:
+    async def _hedge_alert(self, cfg: dict, owner_id: int, text: str, profile: str | None = None) -> None:
         """Per-hedge open/close chatter. Off by default (stats go to the sheet instead of the chat);
         the user can flip `notify_each` on in the session config if they want the pings back."""
         if cfg.get("notify_each"):
-            await self._say(owner_id, text)
+            await self._say(owner_id, text, profile)
 
-    async def _stat(self, owner_id: int, sid: int, **row) -> None:
+    async def _stat(self, owner_id: int, sid: int, profile: str, **row) -> None:
         if self._sheets:
             with contextlib.suppress(Exception):
-                await self._sheets.append_hedge(owner_id, sid, row)
+                await self._sheets.append_hedge(owner_id, sid, profile, row)
 
     # ── the loop ─────────────────────────────────────────────────────────────────────────────────
     async def _run(self, s: dict, resumed: bool = False) -> None:
         sid, owner, cfg = s["id"], s["owner_id"], s["config"]
+        profile = s.get("profile") or ""
         ends_at = time.time() + float(cfg.get("duration", 86400))
         mode = "DRY-RUN" if cfg.get("dry_run", True) else "LIVE"
         if self._sheets:
             with contextlib.suppress(Exception):
-                await self._sheets.ensure_sheet(owner, sid)
+                await self._sheets.ensure_sheet(owner, sid, profile)
         verb = "🔄 Сесію відновлено після перезапуску" if resumed else "▶️ Сесію запущено"
-        await self._say(owner, f"{verb} ({mode}). Триватиме ~{self._fmt(cfg.get('duration',86400))}.")
+        await self._say(owner, f"{verb} ({mode}). Триватиме ~{self._fmt(cfg.get('duration',86400))}.", profile)
         try:
             if resumed and not cfg.get("dry_run", True):
-                await self._adopt_open_hedges(owner, sid, cfg)   # finish hedges left open by the restart
+                await self._adopt_open_hedges(owner, profile, sid, cfg)   # finish hedges left by the restart
             while time.time() < ends_at:
                 if await self._stopping(sid):
                     break
                 try:
-                    await self._one_cycle(owner, sid, cfg)
+                    await self._one_cycle(owner, profile, sid, cfg)
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 — one bad cycle must not end the whole session
                     LOGGER.exception("cycle failed in session %s", sid)
-                    await self._say(owner, "⚠️ Цикл впав з помилкою — сесія триває, пробую далі.")
-                    await self._drop_clients(owner)   # rebuild clients next cycle (connector may be dead)
+                    await self._say(owner, "⚠️ Цикл впав з помилкою — сесія триває, пробую далі.", profile)
+                    await self._drop_clients(owner, profile)   # connector may be dead — rebuild next cycle
                     await self._interruptible_sleep(sid, 5)
                 if await self._stopping(sid):
                     break
                 await self._interruptible_sleep(sid, 5)   # small gap so a failing cycle can't tight-loop/spam
                 if cfg.get("pause_on"):
                     pause = random.uniform(cfg.get("pause_min", 300), cfg.get("pause_max", 1800))
-                    await self._hedge_alert(cfg, owner, f"⏸ Пауза {self._fmt(pause)} до наступного хеджа.")
+                    await self._hedge_alert(cfg, owner, f"⏸ Пауза {self._fmt(pause)} до наступного хеджа.", profile)
                     await self._interruptible_sleep(sid, pause)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — a session must not crash the whole engine
             LOGGER.exception("session %s crashed", sid)
         finally:
-            await self._finish(sid, owner, cfg)
+            await self._finish(sid, owner, profile, cfg)
             self._tasks.pop(sid, None)
 
-    async def _one_cycle(self, owner: int, sid: int, cfg: dict) -> None:
+    async def _one_cycle(self, owner: int, profile: str, sid: int, cfg: dict) -> None:
         pair = get_pair(random.choice(cfg["coins"]))
         if not pair:
             return
@@ -194,24 +200,24 @@ class SessionEngine:
             notional = margin * leverage
             opened_at = datetime.now(timezone.utc)
             close_at = opened_at + timedelta(seconds=hold)
-            hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPEN",
+            hid = await self._store.new_hedge(owner, profile, sid, pair.key, notional, side, "OPEN",
                                               {"mode": "dry", "hold": hold, "close_at": close_at.isoformat()})
             await self._hedge_alert(cfg, owner, f"🧪 [dry] Відкрив {pair.label} Entropy {side} ${notional:g}. "
-                                                f"Закрию через {self._fmt(hold)}.")
+                                                f"Закрию через {self._fmt(hold)}.", profile)
             await self._interruptible_sleep(sid, hold)
             await self._store.update_hedge(hid, status="CLOSED", realized_pnl=0.0, fees=0.0,
                                            entropy_vol=notional * 2, lighter_vol=notional * 2)
-            await self._hedge_alert(cfg, owner, f"🧪 [dry] Закрив {pair.label}. (симуляція)")
-            await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+            await self._hedge_alert(cfg, owner, f"🧪 [dry] Закрив {pair.label}. (симуляція)", profile)
+            await self._stat(owner, sid, profile, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
                              coin=pair.label, side=side, open_status="OK", status="CLOSED (dry)",
                              pnl=0.0, fees=0.0, lighter_vol=notional * 2, entropy_vol=notional * 2)
             return
 
         # ── live ──────────────────────────────────────────────────────────────────────────────────
         # Live: the side comes from the prices (long where it's cheaper) — see plan_hedge.
-        await self._live_cycle(owner, sid, pair, leverage, margin, None, hold, cfg)
+        await self._live_cycle(owner, profile, sid, pair, leverage, margin, None, hold, cfg)
 
-    async def _live_cycle(self, owner, sid, pair, leverage, margin, entropy_long, hold, cfg) -> None:
+    async def _live_cycle(self, owner, profile, sid, pair, leverage, margin, entropy_long, hold, cfg) -> None:
         opened_at = datetime.now(timezone.utc)
         opened_ms = int(opened_at.timestamp() * 1000)
         # Clamp leverage to what BOTH venues allow for this coin (Lighter caps OAI/ANTH at 5x); the
@@ -219,28 +225,28 @@ class SessionEngine:
         plan, leverage = await self._build_plan(pair, margin, leverage, entropy_long)
         if plan is None or not plan.ok:
             why = plan.errors[0] if (plan and plan.errors) else "не вдалось скласти план"
-            await self._say(owner, f"⚠️ {pair.label}: {html.escape(str(why))} — пропускаю цикл.")
+            await self._say(owner, f"⚠️ {pair.label}: {html.escape(str(why))} — пропускаю цикл.", profile)
             return
         notional = plan.notional_usd
         entropy_long = plan.entropy.is_buy
         side = "LONG" if entropy_long else "SHORT"
         if int(leverage) < int(cfg["leverage"]):
-            await self._say(owner, f"ℹ️ {pair.label}: плече знижено до {leverage}x (макс для цієї монети).")
+            await self._say(owner, f"ℹ️ {pair.label}: плече знижено до {leverage}x (макс для цієї монети).", profile)
         close_at = opened_at + timedelta(seconds=hold)
-        hid = await self._store.new_hedge(owner, sid, pair.key, notional, side, "OPENING",
+        hid = await self._store.new_hedge(owner, profile, sid, pair.key, notional, side, "OPENING",
                                           {"hold": hold, "close_at": close_at.isoformat(),
                                            "entropy_px": plan.entropy_price, "lighter_px": plan.lighter_price})
-        ent = await self._entropy_client(owner)
-        lit = await self._lighter_client(owner)
+        ent = await self._entropy_client(owner, profile)
+        lit = await self._lighter_client(owner, profile)
         if not ent or not lit:
             await self._store.update_hedge(hid, status="FAILED")
-            await self._say(owner, "⚠️ Немає ключів — зупиняю цикл.")
+            await self._say(owner, "⚠️ Немає ключів — зупиняю цикл.", profile)
             return
         # Never stack a new hedge on top of leftovers from a previous one (a leg that didn't close,
         # a resting order): flatten whatever is still open first.
-        if not await self._ensure_flat(owner, ent, lit, pair):
+        if not await self._ensure_flat(owner, profile, ent, lit, pair):
             await self._store.update_hedge(hid, status="FAILED")
-            await self._say(owner, f"⚠️ {pair.label}: попередня позиція ще відкрита — пропускаю цикл.")
+            await self._say(owner, f"⚠️ {pair.label}: попередня позиція ще відкрита — пропускаю цикл.", profile)
             return
         try:
             e, l = plan.entropy, plan.lighter
@@ -254,21 +260,21 @@ class SessionEngine:
             lev_err = await self._place(lambda: lit.set_leverage(l.market_index, leverage), lit.order_error)
             if lev_err:
                 await self._say(owner, f"⚠️ {pair.label}: не вдалось виставити плече {leverage}x на Lighter: "
-                                       f"{html.escape(str(lev_err))}")
+                                       f"{html.escape(str(lev_err))}", profile)
             # Maker-first: Entropy post-only limit, Lighter at market as it fills (see core/execution).
             # until_complete: a hedge is either opened at the size the user asked for, or not opened.
             # Sessions never move on to the next cycle with a half-filled leg.
             fr = await self.open_maker_first(ent, lit, plan, timeout=cfg.get("fill_timeout", 90), sid=sid,
                                              until_complete=True, owner=owner, pair=pair,
-                                             reprice_s=cfg.get("reprice_s"))
+                                             reprice_s=cfg.get("reprice_s"), profile=profile)
             if fr.error or fr.unhedged > 0:
                 # A leg failed, or a partial fill is too small to hedge on Lighter — flatten both.
                 res = await self._cancel_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
-                                               lit_equity_before=lit_equity_before)
+                                               lit_equity_before=lit_equity_before, profile=profile)
                 await self._store.update_hedge(hid, status="FAILED", realized_pnl=res["pnl"], fees=res["fees"])
                 why = fr.error or "частковий філ менший за мінімум Lighter"
-                await self._say(owner, f"⛔ {pair.label}: {html.escape(str(why))} — закрив обидві ноги.")
-                await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+                await self._say(owner, f"⛔ {pair.label}: {html.escape(str(why))} — закрив обидві ноги.", profile)
+                await self._stat(owner, sid, profile, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
                                  coin=pair.label, side=side, open_status="FAILED", status="FAILED",
                                  pnl=res["pnl"], fees=res["fees"], lighter_vol=0.0, entropy_vol=0.0)
                 return
@@ -276,8 +282,9 @@ class SessionEngine:
                 # The limit never filled: no position anywhere, nothing to unwind. Skip this cycle.
                 await self._store.update_hedge(hid, status="CANCELLED")
                 await self._hedge_alert(cfg, owner, f"⏭ {pair.label}: лімітка на Entropy не заповнилась за "
-                                                    f"{self._fmt(cfg.get('fill_timeout', 90))} — пропускаю цикл.")
-                await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+                                                    f"{self._fmt(cfg.get('fill_timeout', 90))} — пропускаю цикл.",
+                                        profile)
+                await self._stat(owner, sid, profile, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
                                  coin=pair.label, side=side, open_status="НЕ ЗАПОВНИЛОСЬ", status="CANCELLED",
                                  pnl=0.0, fees=0.0, lighter_vol=0.0, entropy_vol=0.0)
                 return
@@ -288,38 +295,39 @@ class SessionEngine:
                 notional = round(notional * fr.e_filled / e.size, 2)
                 await self._store.update_hedge(hid, notional_usd=notional)
                 await self._say(owner, f"ℹ️ {pair.label}: зупинка під час набору — відкрито "
-                                       f"${notional:g} з ${planned:g}/ногу (обидві ноги захеджовані).")
+                                       f"${notional:g} з ${planned:g}/ногу (обидві ноги захеджовані).", profile)
             await self._store.update_hedge(hid, status="OPEN")
             l_side = "SHORT" if entropy_long else "LONG"
-            stops = await self.place_stops(ent, lit, pair, owner=owner)
+            stops = await self.place_stops(ent, lit, pair, owner=owner, profile=profile)
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (Entropy {side} ✓ / Lighter {l_side} ✓). "
-                                                f"{self.stops_text(stops)}Закрию через {self._fmt(hold)}.")
-            hit = await self.guard_legs(owner, ent, lit, pair, seconds=hold, sid=sid)
+                                                f"{self.stops_text(stops)}Закрию через {self._fmt(hold)}.", profile)
+            hit = await self.guard_legs(owner, ent, lit, pair, profile=profile, seconds=hold, sid=sid)
             if hit:
                 # A stop (or a liquidation) took one leg out; guard_legs already flattened the other.
                 res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
-                                              lit_equity_before=lit_equity_before)
+                                              lit_equity_before=lit_equity_before, profile=profile)
                 await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
                                                entropy_vol=notional * 2, lighter_vol=notional * 2)
-                await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+                await self._stat(owner, sid, profile, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
                                  coin=pair.label, side=side, open_status="OK", status=f"STOP ({hit})",
                                  pnl=res["pnl"], fees=res["fees"], lighter_vol=notional * 2, entropy_vol=notional * 2)
                 return
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
                                           lit_equity_before=lit_equity_before, maker=True, sid=sid,
-                                          timeout=cfg.get("fill_timeout", 90), reprice_s=cfg.get("reprice_s"))
+                                          timeout=cfg.get("fill_timeout", 90), reprice_s=cfg.get("reprice_s"),
+                                          profile=profile)
             await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
                                            entropy_vol=notional * 2, lighter_vol=notional * 2)
             lit_mark = "✓" if not res.get("errors") else "✗"
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} закрито (Entropy ✓ / Lighter {lit_mark}). "
-                                                f"PnL ≈ ${res['pnl']:g}, комісія ${res['fees']:g}.")
-            await self._stat(owner, sid, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
+                                                f"PnL ≈ ${res['pnl']:g}, комісія ${res['fees']:g}.", profile)
+            await self._stat(owner, sid, profile, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
                              coin=pair.label, side=side, open_status="OK", status="CLOSED",
                              pnl=res["pnl"], fees=res["fees"], lighter_vol=notional * 2, entropy_vol=notional * 2)
         finally:
             pass  # clients are cached for the whole session; closed in _finish
 
-    async def _ensure_flat(self, owner, ent, lit, pair) -> bool:
+    async def _ensure_flat(self, owner, profile, ent, lit, pair) -> bool:
         """True when both venues are flat for this pair. Anything left over (a leg that survived a
         failed close, a resting order) is flattened first — a new hedge must never be opened on top
         of an old one."""
@@ -336,8 +344,9 @@ class SessionEngine:
                     leftovers.append("Lighter")
         if not leftovers:
             return True
-        await self._say(owner, f"🧹 {pair.label}: лишилась стара позиція ({', '.join(leftovers)}) — закриваю перед новим хеджем.")
-        await self._close_hedge(ent, lit, pair, owner=owner)
+        await self._say(owner, f"🧹 {pair.label}: лишилась стара позиція ({', '.join(leftovers)}) — "
+                               f"закриваю перед новим хеджем.", profile)
+        await self._close_hedge(ent, lit, pair, owner=owner, profile=profile)
         with contextlib.suppress(Exception):
             if await self._exec.entropy_szi(ent, pair.entropy):
                 return False
@@ -347,7 +356,7 @@ class SessionEngine:
                     return False
         return True
 
-    async def _adopt_open_hedges(self, owner, sid, cfg) -> None:
+    async def _adopt_open_hedges(self, owner, profile, sid, cfg) -> None:
         """After a restart, finish hedges that were left OPEN — wait out the rest of their planned hold
         (from detail.close_at) then close them, instead of abandoning the position and opening a new
         one on top (which fought for margin)."""
@@ -355,8 +364,8 @@ class SessionEngine:
         openh = [h for h in hedges if h["status"] in ("OPEN", "OPENING")]
         if not openh:
             return
-        ent = await self._entropy_client(owner)
-        lit = await self._lighter_client(owner)
+        ent = await self._entropy_client(owner, profile)
+        lit = await self._lighter_client(owner, profile)
         for h in openh:
             if await self._stopping(sid):
                 return
@@ -374,20 +383,22 @@ class SessionEngine:
                 if det.get("close_at"):
                     remaining = (datetime.fromisoformat(det["close_at"]) - datetime.now(timezone.utc)).total_seconds()
             await self._say(owner, f"↩️ {pair.label}: підхопив відкритий хедж після рестарту — "
-                                   f"{('закрию за ' + self._fmt(remaining)) if remaining > 0 else 'закриваю зараз'}.")
+                                   f"{('закрию за ' + self._fmt(remaining)) if remaining > 0 else 'закриваю зараз'}.",
+                            profile)
             since_ms = int(h["opened_at"].timestamp() * 1000) if h.get("opened_at") else None
             if remaining > 0:
-                await self.place_stops(ent, lit, pair, owner=owner)
-                hit = await self.guard_legs(owner, ent, lit, pair, seconds=remaining, sid=sid)
+                await self.place_stops(ent, lit, pair, owner=owner, profile=profile)
+                hit = await self.guard_legs(owner, ent, lit, pair, profile=profile, seconds=remaining, sid=sid)
                 if hit:
-                    res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms)
+                    res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms, profile=profile)
                     await self._store.update_hedge(h["id"], status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"])
                     continue
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms, maker=True, sid=sid,
-                                          timeout=cfg.get("fill_timeout", 90), reprice_s=cfg.get("reprice_s"))
+                                          timeout=cfg.get("fill_timeout", 90), reprice_s=cfg.get("reprice_s"),
+                                          profile=profile)
             await self._store.update_hedge(h["id"], status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"])
             vol = float(h.get("notional_usd", 0) or 0) * 2
-            await self._stat(owner, sid, opened_at=h.get("opened_at"), closed_at=datetime.now(timezone.utc),
+            await self._stat(owner, sid, profile, opened_at=h.get("opened_at"), closed_at=datetime.now(timezone.utc),
                              coin=pair.label, side=h.get("entropy_side", ""), open_status="OK", status="CLOSED",
                              pnl=res["pnl"], fees=res["fees"], lighter_vol=vol, entropy_vol=vol)
 
@@ -417,7 +428,7 @@ class SessionEngine:
     STOP_BUFFER = 0.01          # stop sits 1% of price before the liquidation price (user's rule)
     STOP_SLIPPAGE = 0.03        # worst execution price accepted once the stop fires
 
-    async def place_stops(self, ent, lit, pair, owner=None) -> dict:
+    async def place_stops(self, ent, lit, pair, owner=None, profile: str = "") -> dict:
         """Put a reduce-only stop-market on each leg at liquidation ±1% of price:
         long -> liq × 1.01, short -> liq × 0.99. Liquidation prices come from the venues themselves
         (Hyperliquid position.liquidationPx; Lighter isolated position.liquidation_price). Idempotent:
@@ -475,7 +486,8 @@ class SessionEngine:
 
         failed = [f"{v}: {out[v]['error']}" for v in ("entropy", "lighter") if out[v].get("error")]
         if owner and failed:
-            await self._say(owner, f"⚠️ {pair.label}: стоп не виставлено — " + "; ".join(html.escape(f) for f in failed))
+            await self._say(owner, f"⚠️ {pair.label}: стоп не виставлено — "
+                                   + "; ".join(html.escape(f) for f in failed), profile)
         return out
 
     @staticmethod
@@ -487,13 +499,13 @@ class SessionEngine:
                 parts.append(f"{name} стоп {v['stop']:g} (ліквідація {v['liq']:g})")
         return ("🛡 " + ", ".join(parts) + ". ") if parts else ""
 
-    async def guard_legs(self, owner, ent, lit, pair, *, seconds: float, sid: int | None = None,
-                         poll: float = 5.0) -> str | None:
+    async def guard_legs(self, owner, ent, lit, pair, *, profile: str = "", seconds: float,
+                         sid: int | None = None, poll: float = 5.0) -> str | None:
         """Hold for `seconds` (or until STOP) while watching both legs. If one leg disappears — its stop
         fired or it was liquidated — the other is closed at market at once, so the hedge never sits as
         naked delta. Returns "entropy"/"lighter" (the leg that went first) or None if the hold ended
         normally. Reads that fail are skipped, never mistaken for a flat position."""
-        key = (owner, pair.key)
+        key = (owner, profile, pair.key)
         lmk = None
         with contextlib.suppress(Exception):
             lmk = (await md.lighter_markets(await self._exec.http(), self._cfg.lighter_api_url)).get(pair.lighter)
@@ -537,29 +549,30 @@ class SessionEngine:
                             finally:
                                 self._closing.discard(key)
                             tail = f" Помилка закриття: {html.escape(str(err))}" if err else ""
-                            await self._say(owner, f"🛑 {pair.label}: нога на {'Entropy' if e_gone else 'Lighter'} закрилась "
-                                                   f"(стоп або ліквідація) — закрив {other} маркетом.{tail}")
+                            await self._say(owner, f"🛑 {pair.label}: нога на {'Entropy' if e_gone else 'Lighter'} "
+                                                   f"закрилась (стоп або ліквідація) — закрив {other} "
+                                                   f"маркетом.{tail}", profile)
                             return first
             await asyncio.sleep(min(poll, max(0.2, end - time.time())))
         return None
 
-    def watch_manual(self, owner, ent, lit, pair) -> None:
+    def watch_manual(self, owner, ent, lit, pair, profile: str = "") -> None:
         """Guard a hedge opened by hand in the bot until it is closed (no hold timer)."""
-        key = (owner, pair.key)
+        key = (owner, profile, pair.key)
         old = self._watchers.pop(key, None)
         if old:
             old.cancel()
 
         async def run():
             with contextlib.suppress(asyncio.CancelledError):
-                await self.guard_legs(owner, ent, lit, pair, seconds=30 * 86400)
+                await self.guard_legs(owner, ent, lit, pair, profile=profile, seconds=30 * 86400)
             self._watchers.pop(key, None)
 
-        self._watchers[key] = asyncio.create_task(run(), name=f"guard-{owner}-{pair.key}")
+        self._watchers[key] = asyncio.create_task(run(), name=f"guard-{owner}-{profile}-{pair.key}")
 
     async def open_maker_first(self, ent, lit, plan, *, timeout: float, sid: int | None = None,
                                until_complete: bool = False, owner=None, pair=None,
-                               reprice_s: float | None = None):
+                               reprice_s: float | None = None, profile: str = ""):
         """Open a planned hedge maker-first and verify the Lighter leg actually landed.
 
         Returns core.execution.FillResult. Shared with the bot's manual open. Assumes Lighter is flat
@@ -569,7 +582,8 @@ class SessionEngine:
         async def ping(filled: float, target: float) -> None:
             if owner:
                 await self._say(owner, f"⏳ {pair.label if pair else ''}: лімітка на Entropy заповнена на "
-                                       f"{filled / target * 100:.0f}% ({filled:g} з {target:g}) — дотягую до повного розміру.")
+                                       f"{filled / target * 100:.0f}% ({filled:g} з {target:g}) — "
+                                       f"дотягую до повного розміру.", profile)
 
         fr = await self._exec.fill(ent, lit, plan.entropy_market, plan.lighter_market,
                                    e_is_buy=e.is_buy, e_target=e.size, l_is_ask=l.is_ask, l_target=l.size,
@@ -619,14 +633,16 @@ class SessionEngine:
         if fr.error:
             LOGGER.warning("maker close %s: %s — falling back to market", pair.label, fr.error)
 
-    async def _cancel_hedge(self, ent, lit, pair, owner=None, since_ms=None, lit_equity_before=None) -> dict:
+    async def _cancel_hedge(self, ent, lit, pair, owner=None, since_ms=None, lit_equity_before=None,
+                            profile: str = "") -> dict:
         # Same flatten path as a normal close: flatten whatever filled on both venues and pull the
         # unfilled maker legs, so a one-sided fill can never be left as naked delta.
         return await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms,
-                                       lit_equity_before=lit_equity_before)
+                                       lit_equity_before=lit_equity_before, profile=profile)
 
     async def _close_hedge(self, ent, lit, pair, owner=None, since_ms=None, lit_equity_before=None,
-                           maker=False, sid=None, timeout: float = 60, reprice_s: float | None = None) -> dict:
+                           maker=False, sid=None, timeout: float = 60, reprice_s: float | None = None,
+                           profile: str = "") -> dict:
         """Flatten BOTH legs simultaneously and return {pnl, fees, errors}.
 
         PnL/fees: the Entropy leg's realized PnL and fee are read from the exchange's own fills since
@@ -634,7 +650,7 @@ class SessionEngine:
         PnL read just before flattening (RH-Lighter fee is 0). A failed close is reported, not swallowed
         — a leg left open ties up margin and blocks the next hedge."""
         errors: list[str] = []
-        key = (owner, pair.key)
+        key = (owner, profile, pair.key)
         self._closing.add(key)
         try:
             return await self._close_hedge_inner(ent, lit, pair, owner, since_ms, lit_equity_before, maker, sid, timeout,
@@ -704,7 +720,7 @@ class SessionEngine:
                 l_pnl = after - lit_equity_before
 
         if owner and errors:
-            await self._say(owner, f"⚠️ {pair.label}: " + "; ".join(html.escape(str(e)) for e in errors))
+            await self._say(owner, f"⚠️ {pair.label}: " + "; ".join(html.escape(str(e)) for e in errors), profile)
         return {"pnl": round(e_pnl + l_pnl, 4), "fees": round(e_fee, 4), "errors": errors}
 
     async def _close_lighter(self, lit, lmk, mark) -> str | None:
@@ -764,34 +780,37 @@ class SessionEngine:
             LOGGER.exception("session build_plan failed")
             return None, leverage
 
-    async def _entropy_client(self, owner):
-        cached = self._clients.get(owner, {}).get("entropy")
+    async def _entropy_client(self, owner, profile: str = ""):
+        cached = self._clients.get((owner, profile), {}).get("entropy")
         if cached is not None:
             return cached
-        c = await self._store.get_credentials(owner, "entropy")
+        c = await self._store.get_credentials(owner, "entropy", profile)
         if not c:
             return None
+        proxy = await self._store.get_proxy(owner, profile)
         client = await asyncio.to_thread(
-            EntropyClient, self._cfg.hyperliquid_api_url, c.meta["wallet_address"], c.secret, self._cfg.entropy_dex)
-        self._clients.setdefault(owner, {})["entropy"] = client
+            EntropyClient, self._cfg.hyperliquid_api_url, c.meta["wallet_address"], c.secret,
+            self._cfg.entropy_dex, proxy)
+        self._clients.setdefault((owner, profile), {})["entropy"] = client
         return client
 
-    async def _lighter_client(self, owner):
-        cached = self._clients.get(owner, {}).get("lighter")
+    async def _lighter_client(self, owner, profile: str = ""):
+        cached = self._clients.get((owner, profile), {}).get("lighter")
         if cached is not None:
             return cached
-        c = await self._store.get_credentials(owner, "lighter")
+        c = await self._store.get_credentials(owner, "lighter", profile)
         if not c:
             return None
+        proxy = await self._store.get_proxy(owner, profile)
         # MUST build on the event loop: the Lighter SDK creates an aiohttp connector in its constructor
         # (asyncio.get_running_loop()); a worker thread has none. The constructor does no network.
         client = LighterClient(self._cfg.lighter_api_url, int(c.meta["account_index"]), c.secret,
-                               int(c.meta.get("api_key_index", 0)))
-        self._clients.setdefault(owner, {})["lighter"] = client
+                               int(c.meta.get("api_key_index", 0)), proxy)
+        self._clients.setdefault((owner, profile), {})["lighter"] = client
         return client
 
-    async def _drop_clients(self, owner) -> None:
-        entry = self._clients.pop(owner, None)
+    async def _drop_clients(self, owner, profile: str = "") -> None:
+        entry = self._clients.pop((owner, profile), None)
         if entry and entry.get("lighter"):
             with contextlib.suppress(Exception):
                 await entry["lighter"].close()
@@ -809,13 +828,13 @@ class SessionEngine:
                 return
             await asyncio.sleep(min(1.5, max(0.05, end - time.time())))
 
-    async def _finish(self, sid: int, owner: int, cfg: dict | None = None) -> None:
+    async def _finish(self, sid: int, owner: int, profile: str = "", cfg: dict | None = None) -> None:
         # Session over (STOP or duration): close whatever is still open the same way hedges normally
         # close — Entropy maker limit first, Lighter at market as it fills — then sweep EVERY venue at
         # market so nothing is ever left behind (maker timeout, positions from other coins, leftovers).
         with contextlib.suppress(Exception):
-            ent = await self._entropy_client(owner)
-            lit = await self._lighter_client(owner)
+            ent = await self._entropy_client(owner, profile)
+            lit = await self._lighter_client(owner, profile)
             try:
                 if ent and lit:
                     open_pairs = []
@@ -826,10 +845,11 @@ class SessionEngine:
                     if open_pairs:
                         t = float((cfg or {}).get("fill_timeout", 90))
                         await self._say(owner, "⏹ Закриваю відкриті хеджі ліміткою на Entropy "
-                                               f"(до {self._fmt(t)}, далі — маркетом)…")
+                                               f"(до {self._fmt(t)}, далі — маркетом)…", profile)
                         await asyncio.gather(*(self._guard(self._close_hedge(ent, lit, pair, owner=owner, maker=True,
                                                                              timeout=t,
-                                                                             reprice_s=(cfg or {}).get("reprice_s")))
+                                                                             reprice_s=(cfg or {}).get("reprice_s"),
+                                                                             profile=profile))
                                                for pair in open_pairs))
                 # 1) cancel all resting orders on both venues at once
                 await asyncio.gather(
@@ -860,7 +880,7 @@ class SessionEngine:
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
             finally:
-                await self._drop_clients(owner)   # session over — release cached clients
+                await self._drop_clients(owner, profile)   # session over — release cached clients
         # Mark any DB hedges still marked open as closed.
         with contextlib.suppress(Exception):
             for h in await self._store.session_hedges(sid):
@@ -873,8 +893,8 @@ class SessionEngine:
                 rows = [{"pnl": h.get("realized_pnl"), "fees": h.get("fees"),
                          "lighter_vol": h.get("lighter_vol"), "entropy_vol": h.get("entropy_vol")}
                         for h in closed]
-                await self._sheets.append_totals(owner, sid, rows)
-        await self._say(owner, await self._summary(sid))
+                await self._sheets.append_totals(owner, sid, profile, rows)
+        await self._say(owner, await self._summary(sid), profile)
 
     async def _summary(self, sid: int) -> str:
         hedges = await self._store.session_hedges(sid)

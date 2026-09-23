@@ -23,13 +23,21 @@ from hyperliquid.info import Info
 
 
 class EntropyClient:
-    def __init__(self, api_url: str, wallet_address: str, agent_private_key: str, dex: str = "io") -> None:
+    def __init__(self, api_url: str, wallet_address: str, agent_private_key: str, dex: str = "io",
+                 proxy: str | None = None) -> None:
         self._address = wallet_address
         self._dex = dex
         self._agent = EthAccount.from_key(agent_private_key)
         # perp_dexs loads the builder DEX meta so order()/positions resolve "io:<ASSET>" names.
         self._info = Info(api_url, skip_ws=True, perp_dexs=[dex])
         self._exchange = Exchange(self._agent, api_url, account_address=wallet_address, perp_dexs=[dex])
+        if proxy:
+            # The SDK is requests-based and exposes its Session, so a proxy is just session.proxies
+            # (requests also understands socks5:// when PySocks is installed). Both objects need it:
+            # Info reads state, Exchange signs and sends -- a proxy on only one would still expose
+            # the server's own IP on half the traffic, which defeats the point of having one.
+            for api in (self._info, self._exchange):
+                api.session.proxies = {"http": proxy, "https": proxy}
 
     @staticmethod
     def order_error(resp) -> str | None:
