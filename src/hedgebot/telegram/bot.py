@@ -43,6 +43,18 @@ NL = "\n"
 MENU_BTN = "☰ Меню"  # the one persistent reply-keyboard button, always at the bottom of the chat
 
 
+# Every callback that opens the "send me a value" conversation, and the entry-point pattern BUILT
+# from it. These must not be maintained separately: a button whose callback is missing from the
+# pattern falls through to the plain router, which has no case for it, so pressing it does nothing
+# at all -- silently, with no error anywhere. Add the callback here and the button works.
+INPUT_CALLBACKS = (
+    "key:lighter", "key:entropy", "key:gsheets", "cfg:margin",
+    "sess:hold", "sess:pause", "sess:timeout", "sess:margin", "sess:reprice",
+)
+INPUT_PATTERN = "^(" + "|".join(re.escape(c) for c in INPUT_CALLBACKS) + ")$"
+SESS_INPUTS = tuple(c for c in INPUT_CALLBACKS if c.startswith("sess:"))
+SESS_INPUT_FLOWS = tuple(c.replace(":", "_") for c in SESS_INPUTS)
+
 SESS_DEFAULT = {
     "coins": [PAIRS[0].key], "leverage": 3, "margin": 5.0,
     "hold_min": 1800, "hold_max": 7200, "pause_on": False, "pause_min": 300, "pause_max": 1800,
@@ -88,7 +100,7 @@ class HedgeBot:
     def register(self, app: Application) -> None:
         app.add_handler(CommandHandler("start", self._start))
         app.add_handler(ConversationHandler(
-            entry_points=[CallbackQueryHandler(self._begin_input, pattern=r"^(key:(lighter|entropy|gsheets)|cfg:margin|sess:(hold|pause|timeout|margin))$")],
+            entry_points=[CallbackQueryHandler(self._begin_input, pattern=INPUT_PATTERN)],
             states={ASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._got_input)]},
             # ANY navigation button (Назад/Меню) ENDS the input flow and routes normally — otherwise a
             # prompt whose Назад points to open/sess/stats left the conversation stuck in ASK, and the
@@ -517,7 +529,7 @@ class HedgeBot:
                 "💵 Надішли <b>маржу в USD на ногу</b> числом (розмір позиції = маржа × плече):",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="open")]]),
                 parse_mode=ParseMode.HTML)
-        elif data in ("sess:hold", "sess:pause", "sess:timeout", "sess:margin", "sess:reprice"):
+        elif data in SESS_INPUTS:
             ctx.user_data.clear()
             ctx.user_data["flow"] = "sess_" + data.split(":", 1)[1]
             back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
@@ -663,7 +675,7 @@ class HedgeBot:
             await self._open_config(update, ctx)
             return ConversationHandler.END
 
-        if flow in ("sess_hold", "sess_pause", "sess_timeout", "sess_margin", "sess_reprice"):
+        if flow in SESS_INPUT_FLOWS:
             s = ctx.chat_data.setdefault("sess", dict(SESS_DEFAULT))
             back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
             try:
