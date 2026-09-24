@@ -93,6 +93,42 @@ def _floor(x: float, decimals: int) -> float:
     return math.floor(x * f + 1e-9) / f
 
 
+def split_sizes(e_total: float, l_total: float, emk: EntropyMarket, lmk: LighterMarket,
+                e_px: float, l_px: float, parts: int) -> list[tuple[float, float]]:
+    """Cut a planned hedge into `parts` (entropy_size, lighter_size) chunks, largest-legal-first.
+
+    Splitting exists to stop one big market order from walking Lighter's book: each chunk is filled
+    on Entropy as a maker order and mirrored on Lighter straight away, so the taker side arrives in
+    slices instead of all at once.
+
+    `parts` is a ceiling, not a promise. Both venues reject dust (Entropy under $10, Lighter under
+    its min_base/min_quote), so asking for more parts than the size can carry would produce chunks
+    that no venue accepts and an open that never completes -- the count is lowered instead, and the
+    caller tells the user. Rounding remainders all land on the LAST chunk so the parts still sum to
+    the full planned size.
+    """
+    parts = max(1, int(parts))
+    if e_total <= 0 or l_total <= 0:
+        return [(e_total, l_total)]
+    # The smallest chunk each venue will take, with headroom so a price tick can't push it under.
+    min_e = (ENTROPY_MIN_NOTIONAL * 1.15 / e_px) if e_px > 0 else 0.0
+    min_l = max(lmk.min_base, ((lmk.min_quote or 0) * 1.15 / l_px) if l_px > 0 else 0.0)
+    if min_e > 0:
+        parts = min(parts, max(1, int(e_total // min_e)))
+    if min_l > 0:
+        parts = min(parts, max(1, int(l_total // min_l)))
+    if parts <= 1:
+        return [(e_total, l_total)]
+    e_step = _floor(e_total / parts, emk.sz_decimals)
+    l_step = _floor(l_total / parts, lmk.size_decimals)
+    if e_step <= 0 or l_step <= 0:
+        return [(e_total, l_total)]
+    out = [(e_step, l_step) for _ in range(parts - 1)]
+    out.append((round(e_total - e_step * (parts - 1), emk.sz_decimals + 2),
+                round(l_total - l_step * (parts - 1), lmk.size_decimals + 2)))
+    return out
+
+
 @dataclass
 class FillResult:
     e_filled: float = 0.0          # Entropy size that filled (units of the asset)

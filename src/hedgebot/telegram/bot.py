@@ -50,7 +50,7 @@ MENU_BTN = "☰ Меню"  # the one persistent reply-keyboard button, always at
 # at all -- silently, with no error anywhere. Add the callback here and the button works.
 INPUT_CALLBACKS = (
     "key:lighter", "key:entropy", "key:gsheets", "cfg:margin",
-    "sess:hold", "sess:pause", "sess:timeout", "sess:margin", "sess:reprice",
+    "sess:hold", "sess:pause", "sess:timeout", "sess:margin", "sess:reprice", "sess:split",
     "prof:add", "prof:proxy",
 )
 # Dynamic callbacks: a row index is appended (prof:ren:0). Same list, same rules as above.
@@ -66,6 +66,9 @@ SESS_DEFAULT = {
     "coins": [PAIRS[0].key], "leverage": 3, "margin": 5.0,
     "hold_min": 1800, "hold_max": 7200, "pause_on": False, "pause_min": 300, "pause_max": 1800,
     "duration": 86400, "fill_timeout": 90, "reprice_s": 8, "dry_run": True, "notify_each": False,
+    # Split mode: набирати позицію кількома лімітками замість однієї, щоб кожен хедж на Lighter був
+    # дрібним і не рухав стакан. Вимкнено — класика лишається поведінкою за замовчуванням.
+    "split_on": False, "split_parts": 10, "split_gap_s": 7,
 }
 
 
@@ -387,6 +390,10 @@ class HedgeBot:
             await self._sess_config(update, ctx)
         elif data == "sess:pausetoggle":
             ctx.chat_data["sess"]["pause_on"] = not ctx.chat_data["sess"]["pause_on"]
+            await self._sess_config(update, ctx)
+        elif data == "sess:splittoggle":
+            sess = ctx.chat_data.setdefault("sess", dict(SESS_DEFAULT))
+            sess["split_on"] = not sess.get("split_on")
             await self._sess_config(update, ctx)
         elif data == "sess:dry":
             ctx.chat_data["sess"]["dry_run"] = not ctx.chat_data["sess"]["dry_run"]
@@ -731,6 +738,14 @@ class HedgeBot:
             back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
             if data == "sess:margin":
                 msg = "💵 Надішли <b>маржу в USD на ногу</b> числом (розмір = маржа × плече):"
+            elif data == "sess:split":
+                msg = ("🧩 Надішли <b>кількість частин і паузу в секундах</b> — два числа через "
+                       "пробіл, напр. <code>10 7</code>.\n\n"
+                       "Позиція набиратиметься стількома лімітками поспіль: кожна частина "
+                       "відкривається на Entropy і одразу хеджується на Lighter, потім пауза — і "
+                       "наступна. Дрібніші маркет-ордери менше рухають стакан Lighter.\n\n"
+                       "Закриття йде так само. Якщо частина виходить меншою за мінімум біржі, "
+                       "бот сам зменшить їх кількість і скаже про це.")
             elif data == "sess:reprice":
                 msg = ("🎯 Надішли <b>час життя лімітки в секундах</b> (напр. 8).\n\n"
                        "Лімітка ставиться за 2 тіки від ціни і стоїть рівно стільки — не менше і не "
@@ -938,6 +953,11 @@ class HedgeBot:
                     s["fill_timeout"] = max(5, int(float(text)))
                 elif flow == "sess_reprice":
                     s["reprice_s"] = max(1, int(float(text)))
+                elif flow == "sess_split":
+                    a, b = (float(x) for x in text.replace(",", ".").split()[:2])
+                    s["split_parts"] = max(1, min(int(a), 100))
+                    s["split_gap_s"] = max(0, min(int(b), 600))
+                    s["split_on"] = s["split_parts"] > 1
                 else:
                     a, b = (float(x) for x in text.replace(",", ".").split()[:2])
                     lo, hi = sorted((a, b))
@@ -1055,6 +1075,7 @@ class HedgeBot:
             f"⏸ Пауза: <b>{pause}</b>\n"
             f"🗓 Тривалість: <b>{self._fmt_secs(s['duration'])}</b>\n"
             f"⏳ Таймаут лімітки: <b>{s['fill_timeout']}с</b>   🎯 Крок лімітки: <b>{s.get('reprice_s', 8)}с</b>\n"
+            f"🧩 Набір: <b>{('розбивка ' + str(s.get('split_parts', 10)) + ' × ' + str(s.get('split_gap_s', 7)) + 'с') if s.get('split_on') else 'класика (одна лімітка)'}</b>\n"
             f"🔔 Алерти по хеджах: <b>{'увімк' if s.get('notify_each') else 'вимк (у таблицю)'}</b>\n"
             f"🧪 Режим: <b>{'DRY-RUN (тест)' if s['dry_run'] else 'LIVE (реальні ордери)'}</b>\n\n"
             "<i>Хеджі відкриваються/закриваються самі, час — рандом у межах утримання.</i>"
@@ -1069,6 +1090,10 @@ class HedgeBot:
             [InlineKeyboardButton("🗓 Тривалість", callback_data="sess:dur"),
              InlineKeyboardButton("⏳ Таймаут", callback_data="sess:timeout")],
             [InlineKeyboardButton(f"🎯 Крок лімітки {s.get('reprice_s', 8)}с", callback_data="sess:reprice")],
+            [InlineKeyboardButton(f"🧩 Розбивка: {'увімк' if s.get('split_on') else 'вимк'}",
+                                  callback_data="sess:splittoggle"),
+             InlineKeyboardButton(f"{s.get('split_parts', 10)} × {s.get('split_gap_s', 7)}с",
+                                  callback_data="sess:split")],
             [InlineKeyboardButton(f"🔔 Алерти: {'увімк' if s.get('notify_each') else 'вимк'}", callback_data="sess:notify"),
              InlineKeyboardButton(f"🧪 {'DRY-RUN' if s['dry_run'] else 'LIVE'}", callback_data="sess:dry")],
             [InlineKeyboardButton("▶️ Старт", callback_data="sess:start")],

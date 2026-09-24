@@ -40,7 +40,7 @@ import aiohttp
 from ..exchanges import market_data as md
 from ..exchanges.hyperliquid_entropy import EntropyClient
 from ..exchanges.lighter_client import LighterClient
-from .execution import MakerExecutor
+from .execution import FillResult, MakerExecutor, split_sizes
 from .hedge import plan_hedge
 from ..pairs import PAIRS, get as get_pair
 
@@ -218,6 +218,10 @@ class SessionEngine:
         await self._live_cycle(owner, profile, sid, pair, leverage, margin, None, hold, cfg)
 
     async def _live_cycle(self, owner, profile, sid, pair, leverage, margin, entropy_long, hold, cfg) -> None:
+        # Split mode: build the position as several maker orders instead of one, to keep each Lighter
+        # hedge small enough not to move the book. Off by default -- classic is one order.
+        parts = int(cfg.get("split_parts", 1)) if cfg.get("split_on") else 1
+        gap_s = float(cfg.get("split_gap_s", 0)) if cfg.get("split_on") else 0.0
         opened_at = datetime.now(timezone.utc)
         opened_ms = int(opened_at.timestamp() * 1000)
         # Clamp leverage to what BOTH venues allow for this coin (Lighter caps OAI/ANTH at 5x); the
@@ -269,7 +273,8 @@ class SessionEngine:
             # Sessions never move on to the next cycle with a half-filled leg.
             fr = await self.open_maker_first(ent, lit, plan, timeout=cfg.get("fill_timeout", 90), sid=sid,
                                              until_complete=True, owner=owner, pair=pair,
-                                             reprice_s=cfg.get("reprice_s"), profile=profile)
+                                             reprice_s=cfg.get("reprice_s"), profile=profile,
+                                             parts=parts, gap_s=gap_s)
             if fr.error or fr.unhedged > 0:
                 # A leg failed, or a partial fill is too small to hedge on Lighter — flatten both.
                 res = await self._cancel_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
@@ -323,7 +328,7 @@ class SessionEngine:
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
                                           lit_equity_before=lit_equity_before, maker=True, sid=sid,
                                           timeout=cfg.get("fill_timeout", 90), reprice_s=cfg.get("reprice_s"),
-                                          profile=profile)
+                                          profile=profile, parts=parts, gap_s=gap_s)
             await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
                                            entropy_vol=notional * 2, lighter_vol=notional * 2)
             lit_mark = "✓" if not res.get("errors") else "✗"
@@ -587,32 +592,78 @@ class SessionEngine:
 
     async def open_maker_first(self, ent, lit, plan, *, timeout: float, sid: int | None = None,
                                until_complete: bool = False, owner=None, pair=None,
-                               reprice_s: float | None = None, profile: str = ""):
+                               reprice_s: float | None = None, profile: str = "",
+                               parts: int = 1, gap_s: float = 0.0):
         """Open a planned hedge maker-first and verify the Lighter leg actually landed.
 
-        Returns core.execution.FillResult. Shared with the bot's manual open. Assumes Lighter is flat
-        on this market beforehand (one session per owner, hedges closed between cycles)."""
+        With `parts` > 1 the size is opened as that many maker orders, `gap_s` apart. Each chunk is
+        mirrored on Lighter the moment IT fills, so the taker side reaches the book in slices instead
+        of one lump — which is the whole point: a single large market order walks the book and pays
+        for every level it eats.
+
+        A chunk that fails or is stopped ends the ladder and returns what is on so far; the caller
+        flattens both venues, exactly as it does for a failed single open. Returns a combined
+        core.execution.FillResult."""
         e, l = plan.entropy, plan.lighter
+        chunks = split_sizes(e.size, l.size, plan.entropy_market, plan.lighter_market,
+                             plan.entropy_price, plan.lighter_price, parts)
+        if owner and parts > 1 and len(chunks) < parts:
+            await self._say(owner, f"ℹ️ {pair.label if pair else ''}: розбивку зменшено до "
+                                   f"{len(chunks)} част. — менші за мінімум біржі.", profile)
+        total = FillResult()
+        done = 0
+        for i, (e_sz, l_sz) in enumerate(chunks, start=1):
+            if i > 1:
+                if gap_s > 0:
+                    if sid is not None:
+                        await self._interruptible_sleep(sid, gap_s)
+                    else:
+                        await asyncio.sleep(gap_s)
+                if sid is not None and await self._stopping(sid):
+                    break
+            fr = await self._maker_pass(ent, lit, plan, e_sz, l_sz, timeout=timeout, sid=sid,
+                                        until_complete=until_complete, owner=owner, pair=pair,
+                                        reprice_s=reprice_s, profile=profile,
+                                        part=(i, len(chunks)) if len(chunks) > 1 else None)
+            total.e_filled += fr.e_filled
+            total.l_done += fr.l_done
+            total.unhedged = fr.unhedged
+            total.notes += fr.notes
+            if fr.error or fr.unhedged > 0 or not fr.complete:
+                total.error = fr.error
+                break
+            done = i
+        total.complete = done == len(chunks)
+        return total
+
+    async def _maker_pass(self, ent, lit, plan, e_size: float, l_size: float, *, timeout: float,
+                          sid, until_complete: bool, owner, pair, reprice_s, profile: str,
+                          part: tuple[int, int] | None):
+        """One maker order for `e_size`, hedged on Lighter as it fills."""
+        e, l = plan.entropy, plan.lighter
+        tag = f"{pair.label if pair else ''}{f' (частина {part[0]}/{part[1]})' if part else ''}"
         stopping = (lambda: self._stopping(sid)) if sid is not None else None
+
         async def ping(filled: float, target: float) -> None:
             if owner:
-                await self._say(owner, f"⏳ {pair.label if pair else ''}: лімітка на Entropy заповнена на "
+                await self._say(owner, f"⏳ {tag}: лімітка на Entropy заповнена на "
                                        f"{filled / target * 100:.0f}% ({filled:g} з {target:g}) — "
                                        f"дотягую до повного розміру.", profile)
 
+        # Measured as a DELTA: with a ladder the Lighter leg is already non-zero from earlier chunks,
+        # so comparing against the absolute position would read every previous chunk as this one's.
+        before = await self._lighter_abs(lit, l.market_index)
         fr = await self._exec.fill(ent, lit, plan.entropy_market, plan.lighter_market,
-                                   e_is_buy=e.is_buy, e_target=e.size, l_is_ask=l.is_ask, l_target=l.size,
-                                   closing=False, timeout=timeout, stopping=stopping,
-                                   until_complete=until_complete, on_progress=ping, reprice_s=reprice_s)
+                                   e_is_buy=e.is_buy, e_target=e_size, l_is_ask=l.is_ask,
+                                   l_target=l_size, closing=False, timeout=timeout,
+                                   stopping=stopping, until_complete=until_complete,
+                                   on_progress=ping, reprice_s=reprice_s)
         if fr.error or fr.l_done <= 0:
             return fr
         # IOC can fill short on a thin book — top the Lighter leg up once if it's missing a real chunk.
         await asyncio.sleep(0.5)
-        have = 0.0
-        with contextlib.suppress(Exception):
-            lp = await lit.position(l.market_index)
-            have = float(lp.get("abs", 0) or 0) if lp else 0.0
-        short = round(fr.l_done - have, plan.lighter_market.size_decimals)
+        after = await self._lighter_abs(lit, l.market_index)
+        short = round(fr.l_done - (after - before), plan.lighter_market.size_decimals)
         if short > 0:
             lpx = await self._exec.lighter_mid(l.market_index) or 0.0
             lmk = plan.lighter_market
@@ -624,8 +675,16 @@ class SessionEngine:
                 fr.unhedged = short   # a real gap that can't be topped up — caller flattens both
         return fr
 
+    @staticmethod
+    async def _lighter_abs(lit, market_index: int) -> float:
+        try:
+            lp = await lit.position(market_index)
+            return float(lp.get("abs", 0) or 0) if lp else 0.0
+        except Exception:  # noqa: BLE001 — treated as "unchanged", the top-up check just skips
+            return 0.0
+
     async def _maker_close(self, ent, lit, pair, lmk, *, timeout: float, sid: int | None,
-                           reprice_s: float | None = None) -> None:
+                           reprice_s: float | None = None, parts: int = 1, gap_s: float = 0.0) -> None:
         """Reduce the hedge maker-first: Entropy reduce-only limit, Lighter reduce-only at market as it
         fills. Whatever is left afterwards is flattened by the caller's market pass."""
         emk = None
@@ -640,13 +699,31 @@ class SessionEngine:
             lpos = await lit.position(lmk.market_id)
         l_abs = float(lpos.get("abs", 0) or 0) if lpos else 0.0
         l_is_ask = (lpos["size"] > 0) if lpos else (szi < 0)   # sell to close a Lighter long
+        # Same ladder on the way out: a big reduce-only market order walks Lighter's book just as
+        # hard as an entry does.
+        lpx = await self._exec.lighter_mid(lmk.market_id) or 0.0
+        chunks = split_sizes(abs(szi), l_abs, emk, lmk, lpx, lpx, parts)
+        # A hard ceiling on the whole ladder: the caller's market pass flattens whatever is left, so
+        # overrunning costs nothing but time — and a slow book must not leave legs open for minutes.
+        budget = time.monotonic() + max(60.0, len(chunks) * (gap_s + 30.0))
         # No `stopping` here: STOP is usually what asked for this close, so it must not abort it.
-        # The maker order gets its timeout, then the caller's market pass finishes the job.
-        fr = await self._exec.fill(ent, lit, emk, lmk, e_is_buy=szi < 0, e_target=abs(szi),
-                                   l_is_ask=l_is_ask, l_target=l_abs, closing=True,
-                                   timeout=timeout, stopping=None, reprice_s=reprice_s)
-        if fr.error:
-            LOGGER.warning("maker close %s: %s — falling back to market", pair.label, fr.error)
+        # Each order gets its timeout, then the caller's market pass finishes the job.
+        for i, (e_sz, l_sz) in enumerate(chunks, start=1):
+            if i > 1:
+                if gap_s > 0:
+                    await asyncio.sleep(gap_s)
+                if time.monotonic() > budget:
+                    LOGGER.info("maker close %s: ladder out of time at %d/%d — market pass takes the rest",
+                                pair.label, i, len(chunks))
+                    return
+            fr = await self._exec.fill(ent, lit, emk, lmk, e_is_buy=szi < 0, e_target=e_sz,
+                                       l_is_ask=l_is_ask, l_target=l_sz, closing=True,
+                                       timeout=timeout, stopping=None, reprice_s=reprice_s)
+            if fr.error:
+                LOGGER.warning("maker close %s: %s — falling back to market", pair.label, fr.error)
+                return
+            if not fr.complete:
+                return              # timed out mid-chunk; the market pass finishes it
 
     async def _cancel_hedge(self, ent, lit, pair, owner=None, since_ms=None, lit_equity_before=None,
                             profile: str = "") -> dict:
@@ -657,7 +734,7 @@ class SessionEngine:
 
     async def _close_hedge(self, ent, lit, pair, owner=None, since_ms=None, lit_equity_before=None,
                            maker=False, sid=None, timeout: float = 60, reprice_s: float | None = None,
-                           profile: str = "") -> dict:
+                           profile: str = "", parts: int = 1, gap_s: float = 0.0) -> dict:
         """Flatten BOTH legs simultaneously and return {pnl, fees, errors}.
 
         PnL/fees: the Entropy leg's realized PnL and fee are read from the exchange's own fills since
@@ -669,7 +746,7 @@ class SessionEngine:
         self._closing.add(key)
         try:
             return await self._close_hedge_inner(ent, lit, pair, owner, since_ms, lit_equity_before, maker, sid, timeout,
-                                                 errors, reprice_s)
+                                                 errors, reprice_s, profile, parts, gap_s)
         finally:
             self._closing.discard(key)
             w = self._watchers.pop(key, None)
@@ -677,7 +754,7 @@ class SessionEngine:
                 w.cancel()
 
     async def _close_hedge_inner(self, ent, lit, pair, owner, since_ms, lit_equity_before, maker, sid, timeout,
-                                 errors, reprice_s=None) -> dict:
+                                 errors, reprice_s=None, profile="", parts=1, gap_s=0.0) -> dict:
         lmk = mark = None
         with contextlib.suppress(Exception):
             http_timeout = aiohttp.ClientTimeout(total=8, connect=5)   # not `timeout`: that's the maker-close budget
@@ -698,7 +775,8 @@ class SessionEngine:
         # Maker-first close (normal closes): saves Entropy's taker fee. Anything it didn't close — timeout,
         # STOP, a leftover under the $10 floor — falls through to the market flatten below.
         if maker and lmk:
-            await self._maker_close(ent, lit, pair, lmk, timeout=timeout, sid=sid, reprice_s=reprice_s)
+            await self._maker_close(ent, lit, pair, lmk, timeout=timeout, sid=sid, reprice_s=reprice_s,
+                                    parts=parts, gap_s=gap_s)
             with contextlib.suppress(Exception):
                 mark = await md.lighter_mark(await self._exec.http(), self._cfg.lighter_api_url, lmk.market_id) or mark
 
