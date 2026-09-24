@@ -325,12 +325,16 @@ class Store:
             )
 
     async def update_hedge(self, hedge_id: int, **fields) -> None:
-        cols = {"status", "realized_pnl", "fees", "entropy_vol", "lighter_vol", "notional_usd"}
+        cols = {"status", "realized_pnl", "fees", "entropy_vol", "lighter_vol", "notional_usd",
+                "opened_at"}
         sets, vals = [], []
         for k, v in fields.items():
             if k in cols:
                 vals.append(v)
                 sets.append(f"{k} = ${len(vals)+1}")
+            elif k == "detail":
+                vals.append(json.dumps(v))
+                sets.append(f"detail = ${len(vals)+1}::jsonb")
         if not sets:
             return
         if fields.get("status") == "CLOSED":

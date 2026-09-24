@@ -232,10 +232,13 @@ class SessionEngine:
         side = "LONG" if entropy_long else "SHORT"
         if int(leverage) < int(cfg["leverage"]):
             await self._say(owner, f"ℹ️ {pair.label}: плече знижено до {leverage}x (макс для цієї монети).", profile)
-        close_at = opened_at + timedelta(seconds=hold)
+        # started_at, NOT opened_at: the maker order can work for a long time (until_complete has no
+        # deadline), and the hold clock only starts once the whole size is on. Writing a close_at here
+        # produced a countdown that had not started yet and could never come true.
+        detail = {"hold": hold, "started_at": opened_at.isoformat(),
+                  "entropy_px": plan.entropy_price, "lighter_px": plan.lighter_price}
         hid = await self._store.new_hedge(owner, profile, sid, pair.key, notional, side, "OPENING",
-                                          {"hold": hold, "close_at": close_at.isoformat(),
-                                           "entropy_px": plan.entropy_price, "lighter_px": plan.lighter_price})
+                                          detail)
         ent = await self._entropy_client(owner, profile)
         lit = await self._lighter_client(owner, profile)
         if not ent or not lit:
@@ -296,7 +299,12 @@ class SessionEngine:
                 await self._store.update_hedge(hid, notional_usd=notional)
                 await self._say(owner, f"ℹ️ {pair.label}: зупинка під час набору — відкрито "
                                        f"${notional:g} з ${planned:g}/ногу (обидві ноги захеджовані).", profile)
-            await self._store.update_hedge(hid, status="OPEN")
+            # The position exists only now, so this is the time worth recording -- and the time the
+            # hold is measured from. `opened_ms` deliberately stays at the cycle start: the opening
+            # fills happened before this point and the PnL window must still cover them.
+            opened_at = datetime.now(timezone.utc)
+            detail = {**detail, "close_at": (opened_at + timedelta(seconds=hold)).isoformat()}
+            await self._store.update_hedge(hid, status="OPEN", opened_at=opened_at, detail=detail)
             l_side = "SHORT" if entropy_long else "LONG"
             stops = await self.place_stops(ent, lit, pair, owner=owner, profile=profile)
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (Entropy {side} ✓ / Lighter {l_side} ✓). "
@@ -385,7 +393,14 @@ class SessionEngine:
             await self._say(owner, f"↩️ {pair.label}: підхопив відкритий хедж після рестарту — "
                                    f"{('закрию за ' + self._fmt(remaining)) if remaining > 0 else 'закриваю зараз'}.",
                             profile)
-            since_ms = int(h["opened_at"].timestamp() * 1000) if h.get("opened_at") else None
+            # Fills from the opening happen BEFORE opened_at now, so the PnL window starts at the
+            # cycle's own start when we have it; opened_at is only the fallback for older rows.
+            since = None
+            with contextlib.suppress(Exception):
+                if det.get("started_at"):
+                    since = datetime.fromisoformat(det["started_at"])
+            since = since or h.get("opened_at")
+            since_ms = int(since.timestamp() * 1000) if since else None
             if remaining > 0:
                 await self.place_stops(ent, lit, pair, owner=owner, profile=profile)
                 hit = await self.guard_legs(owner, ent, lit, pair, profile=profile, seconds=remaining, sid=sid)

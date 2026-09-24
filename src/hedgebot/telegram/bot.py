@@ -1081,17 +1081,21 @@ class HedgeBot:
         auto re-anchor after a notification."""
         cfg = sess_row["config"]
         hedges = await self._store.session_hedges(sess_row["id"])
-        opened = [h for h in hedges if h["status"] in ("OPEN", "OPENING")]
+        # OPENING is NOT open: the maker order is still working and no hold has started. Counting
+        # the two together is what made a hedge look overdue when its clock had not begun.
+        filling = [h for h in hedges if h["status"] == "OPENING"]
+        opened = [h for h in hedges if h["status"] == "OPEN"]
         closed = [h for h in hedges if h["status"] == "CLOSED"]
         text = (
             f"🤖 <b>Авто-сесія — {'⏹ зупиняється…' if sess_row['status']=='STOPPING' else '🟢 активна'}</b>\n\n"
             f"Режим: {'DRY-RUN' if cfg.get('dry_run') else 'LIVE'}\n"
-            f"Хеджів: {len(hedges)} (відкрито {len(opened)}, закрито {len(closed)})\n"
+            f"Хеджів: {len(hedges)} (відкрито {len(opened)}, закрито {len(closed)}"
+            + (f", набирається {len(filling)}" if filling else "") + ")\n"
             f"Монети: {', '.join(get_pair(k).label for k in cfg.get('coins', []))}\n"
         )
-        if opened:
+        if opened or filling:
             text += "\n<b>Відкриті зараз:</b>\n"
-            for h in opened:
+            for h in opened + filling:
                 pair = get_pair(h["pair_key"])
                 label = pair.label if pair else h["pair_key"]
                 det = h.get("detail")
@@ -1099,8 +1103,14 @@ class HedgeBot:
                     with contextlib.suppress(Exception):
                         det = json.loads(det or "{}")
                 det = det if isinstance(det, dict) else {}
-                text += (f"• {label} {h.get('entropy_side','')}: відкрито {self._hhmm(h.get('opened_at'))} "
-                         f"→ закриється ≈ {self._hhmm(det.get('close_at'))}\n")
+                if h["status"] == "OPENING":
+                    text += (f"• {label} {h.get('entropy_side','')}: ⏳ набирається з "
+                             f"{self._hhmm(det.get('started_at'))} — лімітка ще не заповнилась, "
+                             f"відлік утримання не почався\n")
+                else:
+                    text += (f"• {label} {h.get('entropy_side','')}: відкрито "
+                             f"{self._hhmm(h.get('opened_at'))} "
+                             f"→ закриється ≈ {self._hhmm(det.get('close_at'))}\n")
             text += "<i>Час у UTC.</i>\n"
         rows = [
             [InlineKeyboardButton("⏹ Стоп (закрити все)", callback_data="sess:stop")],
