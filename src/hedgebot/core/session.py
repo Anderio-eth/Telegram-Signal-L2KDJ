@@ -43,7 +43,7 @@ import aiohttp
 from ..exchanges import market_data as md
 from ..exchanges.hyperliquid_entropy import EntropyClient
 from ..exchanges.lighter_client import LighterClient
-from .execution import FillResult, MakerExecutor, split_sizes
+from .execution import ENTROPY_MIN_NOTIONAL, FillResult, MakerExecutor, split_sizes
 from .hedge import cheaper_is_entropy, plan_hedge
 from ..pairs import PAIRS, get as get_pair
 
@@ -378,10 +378,82 @@ class SessionEngine:
                     return False
         return True
 
+    async def _resume_open(self, owner, profile, sid, cfg, h, det, pair, ent, lit):
+        """Carry on building a position a restart caught mid-fill.
+
+        Returns the refreshed detail dict once the size is complete, "empty" when nothing was ever
+        opened, or "failed" when it could not be finished (the caller then flattens). Deploying a
+        change must not cost the user a position: whatever is already on is kept, the side is taken
+        from the book rather than re-decided, and only the missing part is bought."""
+        planned = float(h.get("notional_usd") or 0)
+        szi = await self._exec.entropy_szi(ent, pair.entropy)
+        if szi is None:
+            return "failed"
+        if abs(szi) <= 0:
+            return "empty"
+        # A position exists, so the direction is settled — pass it explicitly so the plan does not
+        # re-pick a side (and so open_maker_first leaves its price check switched off).
+        entropy_long = szi > 0
+        full, _ = await self._build_plan(pair, cfg.get("margin", 5), cfg.get("leverage", 3), entropy_long)
+        if full is None or not full.ok or full.entropy.size <= 0:
+            return "failed"
+
+        # Whatever the restart interrupted, the two legs may be one chunk apart. Square them BEFORE
+        # adding anything, because that gap is naked delta — the one thing this bot must never carry.
+        await self._resync_legs(ent, lit, pair, full, szi, owner, profile)
+
+        left = full.entropy.size - abs(szi)
+        left_usd = left * (full.entropy_price or 0)
+        if left <= 0 or left_usd < ENTROPY_MIN_NOTIONAL:
+            await self._say(owner, f"↩️ {pair.label}: позиція вже набрана — продовжую утримання.", profile)
+        else:
+            part, _ = await self._build_plan(pair, cfg.get("margin", 5), cfg.get("leverage", 3),
+                                             entropy_long, notional_override=left_usd)
+            if part is None or not part.ok:
+                return "failed"
+            await self._say(owner, f"↩️ {pair.label}: після рестарту добираю залишок "
+                                   f"${left_usd:.0f} з ${planned:.0f} — сесія продовжується.", profile)
+            parts = int(cfg.get("split_parts", 1)) if cfg.get("split_on") else 1
+            gap_s = float(cfg.get("split_gap_s", 0)) if cfg.get("split_on") else 0.0
+            fr = await self.open_maker_first(ent, lit, part, sid=sid, until_complete=True, owner=owner,
+                                             pair=pair, reprice_s=cfg.get("reprice_s"), profile=profile,
+                                             parts=parts, gap_s=gap_s)
+            if fr.error or fr.unhedged > 0 or not fr.complete:
+                return "failed"
+
+        hold = float(det.get("hold") or cfg.get("hold_min", 1800))
+        opened_at = datetime.now(timezone.utc)
+        det = {**det, "close_at": (opened_at + timedelta(seconds=hold)).isoformat(), "resumed": True}
+        await self._store.update_hedge(h["id"], status="OPEN", opened_at=opened_at, detail=det,
+                                       entropy_side="LONG" if entropy_long else "SHORT")
+        return det
+
+    async def _resync_legs(self, ent, lit, pair, plan, szi, owner, profile) -> None:
+        """Bring Lighter back to the size Entropy is actually holding.
+
+        A crash between an Entropy fill and its Lighter mirror leaves the pair unhedged by one chunk.
+        The venues' sizes differ slightly (each is notional / its own price), so the comparison goes
+        through the plan's own ratio rather than assuming they match one to one."""
+        lmk = plan.lighter_market
+        ratio = (plan.lighter.size / plan.entropy.size) if plan.entropy.size else 1.0
+        want = abs(szi) * ratio
+        have = await self._lighter_abs(lit, plan.lighter.market_index)
+        gap = round(want - have, lmk.size_decimals)
+        px = await self._exec.lighter_mid(plan.lighter.market_index) or 0.0
+        if abs(gap) < lmk.min_base or abs(gap) * px < (lmk.min_quote or 0):
+            return                                   # within dust of each other: nothing to fix
+        is_ask = plan.lighter.is_ask if gap > 0 else (not plan.lighter.is_ask)
+        err = await self._exec.lighter_market_order(lit, lmk, abs(gap), is_ask, reduce_only=gap < 0)
+        await self._say(owner, f"🧮 {pair.label}: рестарт застав ноги врозріз — "
+                               f"{'дохеджував' if gap > 0 else 'зрізав зайве на'} Lighter "
+                               f"{abs(gap):g}." + (f" Помилка: {html.escape(str(err))}" if err else ""), profile)
+
     async def _adopt_open_hedges(self, owner, profile, sid, cfg) -> None:
-        """After a restart, finish hedges that were left OPEN — wait out the rest of their planned hold
-        (from detail.close_at) then close them, instead of abandoning the position and opening a new
-        one on top (which fought for margin)."""
+        """After a restart, pick hedges up where they were left.
+
+        Still being built (OPENING) -> finish building it, then hold it out. Already open -> wait the
+        rest of its planned hold (detail.close_at) and close. Either way the position is kept: a
+        redeploy is not a reason to give one up, and opening a new one on top fought for margin."""
         hedges = await self._store.session_hedges(sid)
         openh = [h for h in hedges if h["status"] in ("OPEN", "OPENING")]
         if not openh:
@@ -400,11 +472,22 @@ class SessionEngine:
                 with contextlib.suppress(Exception):
                     det = json.loads(det or "{}")
             det = det if isinstance(det, dict) else {}
+            if h["status"] == "OPENING":
+                # Caught mid-fill: finish the size rather than throw the position away.
+                outcome = await self._resume_open(owner, profile, sid, cfg, h, det, pair, ent, lit)
+                if outcome == "empty":
+                    await self._store.update_hedge(h["id"], status="CANCELLED")
+                    continue
+                if outcome == "failed":
+                    await self._say(owner, f"⚠️ {pair.label}: не вдалось добрати позицію після "
+                                           f"рестарту — закриваю її.", profile)
+                else:
+                    det = outcome
             remaining = 0.0
             with contextlib.suppress(Exception):
                 if det.get("close_at"):
                     remaining = (datetime.fromisoformat(det["close_at"]) - datetime.now(timezone.utc)).total_seconds()
-            await self._say(owner, f"↩️ {pair.label}: підхопив відкритий хедж після рестарту — "
+            await self._say(owner, f"↩️ {pair.label}: підхопив хедж після рестарту — "
                                    f"{('закрию за ' + self._fmt(remaining)) if remaining > 0 else 'закриваю зараз'}.",
                             profile)
             # Fills from the opening happen BEFORE opened_at now, so the PnL window starts at the
@@ -898,9 +981,10 @@ class SessionEngine:
         except Exception:  # noqa: BLE001 — a failed read just leaves the side as planned
             return None
 
-    async def _build_plan(self, pair, margin, leverage, entropy_long):
+    async def _build_plan(self, pair, margin, leverage, entropy_long, notional_override=None):
         """Returns (plan, effective_leverage). Leverage is clamped to the lower of the two venues'
-        per-coin maxima, and the notional = margin × that effective leverage."""
+        per-coin maxima, and the notional = margin × that effective leverage — unless
+        `notional_override` names it directly, which is how a resumed position sizes its remainder."""
         try:
             timeout = aiohttp.ClientTimeout(total=8, connect=5)
             async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -916,7 +1000,7 @@ class SessionEngine:
                 if not eprice or not lprice:
                     return None, leverage
             eff = max(1, min(int(leverage), int(emk.max_leverage or leverage), int(lmk.max_leverage or leverage)))
-            notional = float(margin) * eff
+            notional = float(notional_override) if notional_override else float(margin) * eff
             plan = plan_hedge(pair, notional, entropy_long=entropy_long, entropy_price=eprice,
                               lighter_price=lprice, entropy_market=emk, lighter_market=lmk)
             return plan, eff
