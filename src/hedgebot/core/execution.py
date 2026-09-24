@@ -45,10 +45,8 @@ MAKER_TICKS = 2            # how far off the mid the Entropy limit rests (user: 
 REPRICE_S = 8.0            # default seconds a resting order is left to work; per-session overridable
 # Once the order has STARTED filling, keep working it to the full size for up to this long (the
 # plain timeout only covers "nothing filled yet"). A big order on a thin io book fills in pieces —
-# giving up at the first timeout left a $5k hedge at $2k.
-# With until_complete=True (how sessions open), there is no cap at all: the order is re-quoted until
-# the whole size is filled or the user stops the session, because a half-open hedge is not the hedge
-# the user asked for.
+# giving up at the first timeout left a $5k hedge at $2k. Applies only WITHOUT until_complete, i.e.
+# to closes and to manual opens.
 PARTIAL_GRACE_S = 600.0
 PROGRESS_PING_S = 300.0    # how often to report "still filling" while a long fill works
 POLL_S = 0.4               # position poll cadence while the maker order works
@@ -136,6 +134,7 @@ class FillResult:
     complete: bool = False         # Entropy reached its target
     error: str | None = None       # a hard failure (order rejected, Lighter hedge failed)
     unhedged: float = 0.0          # Lighter size still owed (below its minimum) — caller must resolve
+    e_is_buy: bool | None = None   # the side actually used (side_check may have flipped it)
     notes: list[str] = field(default_factory=list)
 
 
@@ -229,6 +228,7 @@ class MakerExecutor:
         until_complete: bool = False,
         on_progress=None,
         reprice_s: float | None = None,
+        side_check=None,
     ) -> FillResult:
         """Work a post-only Entropy order for `e_target` and mirror each fill on Lighter.
 
@@ -236,21 +236,35 @@ class MakerExecutor:
         each venue's price and rounding differ); fills are mirrored pro rata. `stopping` is an async
         callable -> bool (STOP pressed). Never returns with a resting Entropy order.
 
-        `timeout` only bounds the wait while NOTHING has filled. After the first fill:
-          · until_complete=False — keep working for PARTIAL_GRACE_S, then return what filled;
-          · until_complete=True  — keep working until the full size is filled or STOP.
+        `timeout` applies only when `until_complete` is False (closes, manual opens): it bounds the
+        wait while nothing has filled, and PARTIAL_GRACE_S extends it once something has.
+
+        With `until_complete=True` there is NO deadline of any kind. The quote is re-priced to within
+        MAKER_TICKS of the CURRENT price every `reprice_s`, so an unfilled order costs nothing to
+        leave standing, and giving up on it would only abandon a hedge that the next re-quote was
+        about to fill. Only STOP ends that loop.
         `on_progress(filled, target)` is called about every PROGRESS_PING_S during a long fill.
         `reprice_s` is how long one quote is left to work before it is cancelled and re-quoted
-        (defaults to REPRICE_S)."""
+        (defaults to REPRICE_S).
+
+        `side_check` is an async callable -> bool|None consulted before every quote while NOTHING has
+        filled yet: it returns which side Entropy should take right now. Nothing is on the book yet at
+        that point, so the direction is still free to change — and over a long unfilled wait the
+        cross-venue gap can invert, which would otherwise leave the hedge opened on the wrong side of
+        it. Once the first lot fills the side is locked, and the side actually used comes back on the
+        result."""
         market = emk.name
         hold_s = max(1.0, float(reprice_s if reprice_s is not None else REPRICE_S))
         res = FillResult()
+        res.e_is_buy = e_is_buy
         start_szi = await self.entropy_szi(ent, market)
         if start_szi is None:
             res.error = "не вдалось прочитати позицію Entropy"
             return res
         ratio = l_target / e_target if e_target > 0 else 0.0
-        deadline = time.monotonic() + max(5.0, float(timeout))
+        # No deadline when the caller wants the whole size: see the docstring. A close never passes
+        # until_complete, so it keeps its timeout and its caller's market flatten.
+        deadline = math.inf if until_complete else time.monotonic() + max(5.0, float(timeout))
         extended = False
         last_ping = time.monotonic()
         order_px: float | None = None
@@ -292,16 +306,16 @@ class MakerExecutor:
                     # a little past it, and Lighter must mirror what actually filled.
                     progress = abs(szi - start_szi)
                     res.e_filled = progress
-                    if progress > 0 and not extended:
+                    if progress > 0 and not extended and not until_complete:
                         # First fill: stop counting the "nothing happened" timeout.
                         deadline = max(deadline, time.monotonic() + PARTIAL_GRACE_S)
                         extended = True
-                    if progress > 0 and until_complete:
-                        deadline = time.monotonic() + 3600     # rolling: only STOP ends this
-                        if on_progress and time.monotonic() - last_ping >= PROGRESS_PING_S:
-                            last_ping = time.monotonic()
-                            with contextlib.suppress(Exception):
-                                await on_progress(progress, e_target)
+                    # Report even at 0%: with no deadline, silence is indistinguishable from a hang,
+                    # and "what is it waiting for" is exactly the question an unbounded wait raises.
+                    if until_complete and on_progress and time.monotonic() - last_ping >= PROGRESS_PING_S:
+                        last_ping = time.monotonic()
+                        with contextlib.suppress(Exception):
+                            await on_progress(progress, e_target)
                     if not await hedge_owed(final=False):
                         return res
                     if progress >= e_target * 0.999:
@@ -336,6 +350,16 @@ class MakerExecutor:
                     continue                     # re-read the position before sizing the new quote
 
                 if order_px is None:
+                    if side_check is not None and progress <= 0:
+                        # Still flat, so the direction is still ours to choose.
+                        want = await side_check()
+                        if want is not None and want != e_is_buy:
+                            e_is_buy = want
+                            l_is_ask = want        # hedge.py: Lighter is the opposite leg
+                            res.e_is_buy = e_is_buy
+                            res.notes.append("напрямок перевернуто: ціни помінялись місцями")
+                            LOGGER.info("%s: flipping side before the first fill -> entropy %s",
+                                        market, "LONG" if e_is_buy else "SHORT")
                     remaining = _floor(e_target - progress, emk.sz_decimals)
                     mid = (bid + ask) / 2
                     if remaining <= 0:

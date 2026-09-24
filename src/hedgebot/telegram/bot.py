@@ -99,6 +99,33 @@ class HedgeBot:
         # by handlers and by the notification re-anchor (push_menu), so they never fight.
         self._anchor: dict[int, int] = {}
 
+    async def _sess_draft(self, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> dict:
+        """The session-config draft belonging to the CURRENT profile.
+
+        chat_data is per chat, not per profile. Holding one draft there meant that after switching
+        profiles the screen still showed the previous account's settings — and the next save wrote
+        them onto the new profile, silently overwriting it. The draft carries the profile it was
+        loaded for and is reloaded the moment that changes."""
+        profile = await self._prof(owner)
+        if "sess" not in ctx.chat_data or ctx.chat_data.get("sess_profile") != profile:
+            saved = (await self._store.load_settings(owner, profile)).get("session_cfg") or {}
+            ctx.chat_data["sess"] = {**SESS_DEFAULT, **saved,
+                                     "coins": list(saved.get("coins") or SESS_DEFAULT["coins"])}
+            ctx.chat_data["sess_profile"] = profile
+        return ctx.chat_data["sess"]
+
+    async def _open_draft(self, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> dict:
+        """The manual-open draft for the current profile — same reasoning as _sess_draft."""
+        profile = await self._prof(owner)
+        if "draft" not in ctx.chat_data or ctx.chat_data.get("draft_profile") != profile:
+            saved = (await self._store.load_settings(owner, profile)).get("draft") or {}
+            if not saved.get("side_manual"):
+                saved.pop("entropy_long", None)   # drafts saved before auto-side: go auto
+            ctx.chat_data["draft"] = {"pair": PAIRS[0].key, "leverage": 3, "margin": 5.0,
+                                      "entropy_long": None, **saved}
+            ctx.chat_data["draft_profile"] = profile
+        return ctx.chat_data["draft"]
+
     async def _prof(self, owner: int) -> str:
         """The profile every screen is acting on. Resolved inside the helpers instead of being
         threaded through each handler, so a screen that forgets to ask still acts on the account the
@@ -339,28 +366,23 @@ class HedgeBot:
         elif data == "refresh":
             await q.edit_message_text(**await self._main_menu(owner, force_bal=True))
         elif data == "open":
-            if "draft" not in ctx.chat_data:
-                saved = (await self._store.load_settings(owner, await self._prof(owner))).get("draft") or {}
-                if not saved.get("side_manual"):
-                    saved.pop("entropy_long", None)   # drafts saved before auto-side: go auto
-                ctx.chat_data["draft"] = {
-                    "pair": PAIRS[0].key, "leverage": 3, "margin": 5.0, "entropy_long": None, **saved}
+            await self._open_draft(ctx, owner)
             await self._open_config(update, ctx)
         elif data == "cfg:pair":
-            d = ctx.chat_data["draft"]
+            d = await self._open_draft(ctx, owner)
             keys = [p.key for p in PAIRS]
             d["pair"] = keys[(keys.index(d["pair"]) + 1) % len(keys)]
             await self._open_config(update, ctx)
         elif data == "cfg:side":
             # Auto -> Entropy LONG -> Entropy SHORT -> Auto
-            d = ctx.chat_data["draft"]
+            d = await self._open_draft(ctx, owner)
             nxt = {None: True, True: False, False: None}[d.get("entropy_long")]
             d["entropy_long"], d["side_manual"] = nxt, nxt is not None
             await self._open_config(update, ctx)
         elif data == "cfg:lev":
             await self._lev_menu(update, ctx)
         elif data.startswith("setlev:"):
-            ctx.chat_data["draft"]["leverage"] = int(data.split(":", 1)[1])
+            (await self._open_draft(ctx, owner))["leverage"] = int(data.split(":", 1)[1])
             await self._open_config(update, ctx)
         elif data == "cfg:preview":
             await self._preview(update, ctx, owner)
@@ -372,7 +394,7 @@ class HedgeBot:
             await self._sess_coins(update, ctx)
         elif data.startswith("scoin:"):
             key = data.split(":", 1)[1]
-            coins = ctx.chat_data["sess"]["coins"]
+            coins = (await self._sess_draft(ctx, owner))["coins"]
             if key in coins:
                 coins.remove(key)
             else:
@@ -381,25 +403,27 @@ class HedgeBot:
         elif data == "sess:lev":
             await self._sess_lev(update, ctx)
         elif data.startswith("sslev:"):
-            ctx.chat_data["sess"]["leverage"] = int(data.split(":", 1)[1])
+            (await self._sess_draft(ctx, owner))["leverage"] = int(data.split(":", 1)[1])
             await self._sess_config(update, ctx)
         elif data == "sess:dur":
             await self._sess_dur(update, ctx)
         elif data.startswith("ssdur:"):
-            ctx.chat_data["sess"]["duration"] = int(data.split(":", 1)[1])
+            (await self._sess_draft(ctx, owner))["duration"] = int(data.split(":", 1)[1])
             await self._sess_config(update, ctx)
         elif data == "sess:pausetoggle":
-            ctx.chat_data["sess"]["pause_on"] = not ctx.chat_data["sess"]["pause_on"]
+            sess = await self._sess_draft(ctx, owner)
+            sess["pause_on"] = not sess.get("pause_on")
             await self._sess_config(update, ctx)
         elif data == "sess:splittoggle":
-            sess = ctx.chat_data.setdefault("sess", dict(SESS_DEFAULT))
+            sess = await self._sess_draft(ctx, owner)
             sess["split_on"] = not sess.get("split_on")
             await self._sess_config(update, ctx)
         elif data == "sess:dry":
-            ctx.chat_data["sess"]["dry_run"] = not ctx.chat_data["sess"]["dry_run"]
+            sess = await self._sess_draft(ctx, owner)
+            sess["dry_run"] = not sess.get("dry_run")
             await self._sess_config(update, ctx)
         elif data == "sess:notify":
-            s = ctx.chat_data.setdefault("sess", dict(SESS_DEFAULT))
+            s = await self._sess_draft(ctx, owner)
             s["notify_each"] = not s.get("notify_each", False)
             await self._sess_config(update, ctx)
         elif data == "sess:start":
@@ -502,6 +526,8 @@ class HedgeBot:
             if not prof["selected"]:
                 await self._store.select_profile(owner, prof["name"])
                 await self._forget(owner)          # every screen now speaks to the other account
+                for k in ("sess", "sess_profile", "draft", "draft_profile", "plan_ready"):
+                    ctx.chat_data.pop(k, None)     # drafts belong to the profile they were loaded for
             await self._refresh_menu(update, ctx, owner, f"👤 Профіль: <b>{html.escape(prof['name'])}</b>")
         elif action == "del":
             lock = await self._keys_locked(owner, prof["name"])
@@ -752,9 +778,11 @@ class HedgeBot:
                        "більше. Потім бот її знімає, хеджує на Lighter те, що встигло залитись, і "
                        "ставить нову лімітку на залишок. І так, поки не набереться весь розмір.")
             elif data == "sess:timeout":
-                msg = ("⏳ Надішли <b>таймаут лімітки в секундах</b> (напр. 90).\n\n"
-                       "Скільки лімітка на Entropy може чекати заповнення (бот переставляє її за ціною). "
-                       "Не заповнилась — цикл пропускається без позиції; на закритті — дозакриваємо маркетом.")
+                msg = ("⏳ Надішли <b>таймаут лімітки на ЗАКРИТТІ</b>, у секундах (напр. 90).\n\n"
+                       "Скільки reduce-only лімітка на Entropy може чекати, перш ніж залишок "
+                       "дозакриється маркетом.\n\n"
+                       "На <b>відкритті</b> таймауту немає: лімітка переставляється за ціною, поки не "
+                       "набере повний розмір або поки ти не натиснеш СТОП.")
             elif data == "sess:hold":
                 msg = ("⏱ Надішли <b>діапазон утримання у хвилинах</b> — два числа через пробіл.\n\n"
                        "Напр. <code>30 120</code> (30хв–2г) або <code>60 1440</code> (1г–24г).\n"
@@ -941,7 +969,7 @@ class HedgeBot:
             return ConversationHandler.END
 
         if flow in SESS_INPUT_FLOWS:
-            s = ctx.chat_data.setdefault("sess", dict(SESS_DEFAULT))
+            s = await self._sess_draft(ctx, owner)
             back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="sess")]])
             try:
                 if flow == "sess_margin":
@@ -982,7 +1010,7 @@ class HedgeBot:
 
     # ── open hedge (config screen) ───────────────────────────────────────────────────────────────
     async def _open_config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        d = ctx.chat_data["draft"]
+        d = await self._open_draft(ctx, update.effective_user.id)
         with contextlib.suppress(Exception):
             oid = update.effective_user.id
             await self._store.save_draft(oid, await self._prof(oid), d)  # remember last settings
@@ -1017,7 +1045,7 @@ class HedgeBot:
         await self._edit_anchor(update, ctx, text, InlineKeyboardMarkup(rows))
 
     async def _lev_menu(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        cur = ctx.chat_data["draft"]["leverage"]
+        cur = (await self._open_draft(ctx, update.effective_user.id))["leverage"]
         def b(n): return InlineKeyboardButton(f"{'✅ ' if n == cur else ''}{n}x", callback_data=f"setlev:{n}")
         rows = [[b(1), b(2), b(3), b(4), b(5)], [b(6), b(7), b(8), b(9), b(10)],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="open")]]
@@ -1045,9 +1073,7 @@ class HedgeBot:
         if active:
             await self._sess_active(update, ctx, active)
             return
-        if "sess" not in ctx.chat_data:
-            saved = (await self._store.load_settings(owner, await self._prof(owner))).get("session_cfg") or {}
-            ctx.chat_data["sess"] = {**SESS_DEFAULT, **saved, "coins": list(saved.get("coins") or SESS_DEFAULT["coins"])}
+        await self._sess_draft(ctx, owner)
         await self._sess_config(update, ctx)
 
     async def _reprice_s(self, owner: int):
@@ -1059,7 +1085,7 @@ class HedgeBot:
         return None
 
     async def _sess_config(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        s = ctx.chat_data["sess"]
+        s = await self._sess_draft(ctx, update.effective_user.id)
         with contextlib.suppress(Exception):
             oid = update.effective_user.id
             await self._store.save_session_cfg(oid, await self._prof(oid), s)
@@ -1074,7 +1100,7 @@ class HedgeBot:
             f"⏱ Утримання: <b>{hold}</b>\n"
             f"⏸ Пауза: <b>{pause}</b>\n"
             f"🗓 Тривалість: <b>{self._fmt_secs(s['duration'])}</b>\n"
-            f"⏳ Таймаут лімітки: <b>{s['fill_timeout']}с</b>   🎯 Крок лімітки: <b>{s.get('reprice_s', 8)}с</b>\n"
+            f"⏳ Таймаут закриття: <b>{s['fill_timeout']}с</b>   🎯 Крок лімітки: <b>{s.get('reprice_s', 8)}с</b>\n"
             f"🧩 Набір: <b>{('розбивка ' + str(s.get('split_parts', 10)) + ' × ' + str(s.get('split_gap_s', 7)) + 'с') if s.get('split_on') else 'класика (одна лімітка)'}</b>\n"
             f"🔔 Алерти по хеджах: <b>{'увімк' if s.get('notify_each') else 'вимк (у таблицю)'}</b>\n"
             f"🧪 Режим: <b>{'DRY-RUN (тест)' if s['dry_run'] else 'LIVE (реальні ордери)'}</b>\n\n"
@@ -1088,7 +1114,7 @@ class HedgeBot:
              InlineKeyboardButton("⏸ Пауза", callback_data="sess:pause")],
             [InlineKeyboardButton(f"⏸ Пауза: {'увімк' if s['pause_on'] else 'вимк'}", callback_data="sess:pausetoggle")],
             [InlineKeyboardButton("🗓 Тривалість", callback_data="sess:dur"),
-             InlineKeyboardButton("⏳ Таймаут", callback_data="sess:timeout")],
+             InlineKeyboardButton("⏳ Таймаут закриття", callback_data="sess:timeout")],
             [InlineKeyboardButton(f"🎯 Крок лімітки {s.get('reprice_s', 8)}с", callback_data="sess:reprice")],
             [InlineKeyboardButton(f"🧩 Розбивка: {'увімк' if s.get('split_on') else 'вимк'}",
                                   callback_data="sess:splittoggle"),
@@ -1165,7 +1191,7 @@ class HedgeBot:
             LOGGER.debug("push_menu failed", exc_info=True)
 
     async def _sess_coins(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        chosen = ctx.chat_data["sess"]["coins"]
+        chosen = (await self._sess_draft(ctx, update.effective_user.id))["coins"]
         rows = [[InlineKeyboardButton(f"{'✅ ' if p.key in chosen else '⬜ '}{p.label}", callback_data=f"scoin:{p.key}")]
                 for p in PAIRS]
         rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="sess")])
@@ -1173,21 +1199,21 @@ class HedgeBot:
                                 "рандомній з обраних:", InlineKeyboardMarkup(rows))
 
     async def _sess_lev(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        cur = ctx.chat_data["sess"]["leverage"]
+        cur = (await self._sess_draft(ctx, update.effective_user.id))["leverage"]
         def b(n): return InlineKeyboardButton(f"{'✅ ' if n == cur else ''}{n}x", callback_data=f"sslev:{n}")
         rows = [[b(1), b(2), b(3), b(4), b(5)], [b(6), b(7), b(8), b(9), b(10)],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="sess")]]
         await self._edit_anchor(update, ctx, LEV_HINT, InlineKeyboardMarkup(rows))
 
     async def _sess_dur(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        cur = ctx.chat_data["sess"]["duration"]
+        cur = (await self._sess_draft(ctx, update.effective_user.id))["duration"]
         opts = [("12г", 43200), ("1д", 86400), ("3д", 259200), ("7д", 604800)]
         rows = [[InlineKeyboardButton(f"{'✅ ' if v == cur else ''}{lbl}", callback_data=f"ssdur:{v}") for lbl, v in opts],
                 [InlineKeyboardButton("⬅️ Назад", callback_data="sess")]]
         await self._edit_anchor(update, ctx, "🗓 <b>Тривалість сесії</b>:", InlineKeyboardMarkup(rows))
 
     async def _sess_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
-        s = ctx.chat_data.get("sess", dict(SESS_DEFAULT))
+        s = await self._sess_draft(ctx, owner)
         # Never stack sessions — two sessions fight over the same margin (the "not enough margin"
         # flood). If one is already running, just show it.
         active = await self._store.active_session(owner, await self._prof(owner))
@@ -1206,17 +1232,20 @@ class HedgeBot:
         await self._sess_open(update, ctx, owner)
 
     async def _sess_stop(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, owner: int) -> None:
-        # Stop EVERY running session for this owner — earlier double-taps may have stacked several,
-        # and the user expects "Стоп" to wind them all down and flatten everything.
+        # ONLY the selected profile's session. Profiles are separate accounts trading in parallel, so
+        # stopping the one on screen must never wind down another account's session and flatten its
+        # positions. (Stacked duplicates within one profile are still swept up: the loop stops every
+        # running row of THAT profile.)
+        profile = await self._prof(owner)
         stopped = 0
         if self._engine:
             for srow in await self._store.running_sessions():
-                if srow.get("owner_id") == owner:
+                if srow.get("owner_id") == owner and (srow.get("profile") or "") == profile:
                     await self._engine.stop_session(srow["id"])
                     stopped += 1
         await update.callback_query.answer(
-            f"⏹ Зупиняю {stopped} сесі(ю/ї), закриваю позиції…" if stopped else "Немає активних сесій",
-            show_alert=True)
+            f"⏹ Зупиняю сесію «{profile}», закриваю її позиції…" if stopped
+            else f"На профілі «{profile}» немає активної сесії", show_alert=True)
         await self._sess_open(update, ctx, owner)
 
     async def _preview(self, update: Update, ctx, owner: int) -> None:

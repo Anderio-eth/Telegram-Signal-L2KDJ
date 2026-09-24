@@ -41,7 +41,7 @@ from ..exchanges import market_data as md
 from ..exchanges.hyperliquid_entropy import EntropyClient
 from ..exchanges.lighter_client import LighterClient
 from .execution import FillResult, MakerExecutor, split_sizes
-from .hedge import plan_hedge
+from .hedge import cheaper_is_entropy, plan_hedge
 from ..pairs import PAIRS, get as get_pair
 
 LOGGER = logging.getLogger(__name__)
@@ -289,9 +289,8 @@ class SessionEngine:
             if fr.e_filled <= 0:
                 # The limit never filled: no position anywhere, nothing to unwind. Skip this cycle.
                 await self._store.update_hedge(hid, status="CANCELLED")
-                await self._hedge_alert(cfg, owner, f"⏭ {pair.label}: лімітка на Entropy не заповнилась за "
-                                                    f"{self._fmt(cfg.get('fill_timeout', 90))} — пропускаю цикл.",
-                                        profile)
+                await self._hedge_alert(cfg, owner, f"⏭ {pair.label}: зупинка до першого заповнення — "
+                                                    f"позиції немає, пропускаю цикл.", profile)
                 await self._stat(owner, sid, profile, opened_at=opened_at, closed_at=datetime.now(timezone.utc),
                                  coin=pair.label, side=side, open_status="НЕ ЗАПОВНИЛОСЬ", status="CANCELLED",
                                  pnl=0.0, fees=0.0, lighter_vol=0.0, entropy_vol=0.0)
@@ -307,9 +306,15 @@ class SessionEngine:
             # The position exists only now, so this is the time worth recording -- and the time the
             # hold is measured from. `opened_ms` deliberately stays at the cycle start: the opening
             # fills happened before this point and the PnL window must still cover them.
+            if fr.e_is_buy is not None and fr.e_is_buy != entropy_long:
+                # The gap inverted while the first order waited; the hedge is on the other way round.
+                entropy_long = fr.e_is_buy
+                side = "LONG" if entropy_long else "SHORT"
+                detail = {**detail, "side_flipped": True}
             opened_at = datetime.now(timezone.utc)
             detail = {**detail, "close_at": (opened_at + timedelta(seconds=hold)).isoformat()}
-            await self._store.update_hedge(hid, status="OPEN", opened_at=opened_at, detail=detail)
+            await self._store.update_hedge(hid, status="OPEN", opened_at=opened_at, detail=detail,
+                                           entropy_side=side)
             l_side = "SHORT" if entropy_long else "LONG"
             stops = await self.place_stops(ent, lit, pair, owner=owner, profile=profile)
             await self._hedge_alert(cfg, owner, f"✅ {pair.label} відкрито (Entropy {side} ✓ / Lighter {l_side} ✓). "
@@ -612,6 +617,12 @@ class SessionEngine:
                                    f"{len(chunks)} част. — менші за мінімум біржі.", profile)
         total = FillResult()
         done = 0
+        # The side can still change while the FIRST order is unfilled; once it fills, every later
+        # chunk must use the same direction or it would unwind what is already on.
+        e_is_buy, l_is_ask = e.is_buy, l.is_ask
+        side_check = (
+            (lambda: self._side_now(pair)) if (pair is not None and getattr(plan, "auto_side", False))
+            else None)
         for i, (e_sz, l_sz) in enumerate(chunks, start=1):
             if i > 1:
                 if gap_s > 0:
@@ -624,7 +635,15 @@ class SessionEngine:
             fr = await self._maker_pass(ent, lit, plan, e_sz, l_sz, timeout=timeout, sid=sid,
                                         until_complete=until_complete, owner=owner, pair=pair,
                                         reprice_s=reprice_s, profile=profile,
-                                        part=(i, len(chunks)) if len(chunks) > 1 else None)
+                                        part=(i, len(chunks)) if len(chunks) > 1 else None,
+                                        e_is_buy=e_is_buy, l_is_ask=l_is_ask,
+                                        side_check=side_check if i == 1 else None)
+            if fr.e_is_buy is not None and fr.e_is_buy != e_is_buy:
+                e_is_buy, l_is_ask = fr.e_is_buy, fr.e_is_buy
+                if owner:
+                    await self._say(owner, f"🔀 {pair.label if pair else ''}: поки лімітка стояла, ціни "
+                                           f"помінялись місцями — відкриваю Entropy "
+                                           f"{'LONG' if e_is_buy else 'SHORT'}.", profile)
             total.e_filled += fr.e_filled
             total.l_done += fr.l_done
             total.unhedged = fr.unhedged
@@ -634,30 +653,38 @@ class SessionEngine:
                 break
             done = i
         total.complete = done == len(chunks)
+        total.e_is_buy = e_is_buy
         return total
 
     async def _maker_pass(self, ent, lit, plan, e_size: float, l_size: float, *, timeout: float,
                           sid, until_complete: bool, owner, pair, reprice_s, profile: str,
-                          part: tuple[int, int] | None):
+                          part: tuple[int, int] | None, e_is_buy: bool | None = None,
+                          l_is_ask: bool | None = None, side_check=None):
         """One maker order for `e_size`, hedged on Lighter as it fills."""
         e, l = plan.entropy, plan.lighter
+        e_is_buy = e.is_buy if e_is_buy is None else e_is_buy
+        l_is_ask = l.is_ask if l_is_ask is None else l_is_ask
         tag = f"{pair.label if pair else ''}{f' (частина {part[0]}/{part[1]})' if part else ''}"
         stopping = (lambda: self._stopping(sid)) if sid is not None else None
 
         async def ping(filled: float, target: float) -> None:
-            if owner:
-                await self._say(owner, f"⏳ {tag}: лімітка на Entropy заповнена на "
-                                       f"{filled / target * 100:.0f}% ({filled:g} з {target:g}) — "
-                                       f"дотягую до повного розміру.", profile)
+            if not owner:
+                return
+            if filled <= 0:
+                await self._say(owner, f"⏳ {tag}: лімітка на Entropy стоїть, ще нічого не залилось — "
+                                       f"переставляю її за ціною і чекаю.", profile)
+            else:
+                await self._say(owner, f"⏳ {tag}: заповнено {filled / target * 100:.0f}% "
+                                       f"({filled:g} з {target:g}) — дотягую до повного розміру.", profile)
 
         # Measured as a DELTA: with a ladder the Lighter leg is already non-zero from earlier chunks,
         # so comparing against the absolute position would read every previous chunk as this one's.
         before = await self._lighter_abs(lit, l.market_index)
         fr = await self._exec.fill(ent, lit, plan.entropy_market, plan.lighter_market,
-                                   e_is_buy=e.is_buy, e_target=e_size, l_is_ask=l.is_ask,
+                                   e_is_buy=e_is_buy, e_target=e_size, l_is_ask=l_is_ask,
                                    l_target=l_size, closing=False, timeout=timeout,
                                    stopping=stopping, until_complete=until_complete,
-                                   on_progress=ping, reprice_s=reprice_s)
+                                   on_progress=ping, reprice_s=reprice_s, side_check=side_check)
         if fr.error or fr.l_done <= 0:
             return fr
         # IOC can fill short on a thin book — top the Lighter leg up once if it's missing a real chunk.
@@ -668,7 +695,7 @@ class SessionEngine:
             lpx = await self._exec.lighter_mid(l.market_index) or 0.0
             lmk = plan.lighter_market
             if short >= lmk.min_base and short * lpx >= (lmk.min_quote or 0):
-                err = await self._exec.lighter_market_order(lit, lmk, short, l.is_ask, reduce_only=False)
+                err = await self._exec.lighter_market_order(lit, lmk, short, l_is_ask, reduce_only=False)
                 if err:
                     fr.error = f"Lighter (добір): {err}"
             elif short * lpx > 1.0:
@@ -847,6 +874,25 @@ class SessionEngine:
         return "позиція ще відкрита після закриття" if (pos and pos.get("abs", 0) > 0) else None
 
     # ── shared build/clients (mirrors the bot's) ───────────────────────────────────────────────────
+    async def _side_now(self, pair) -> bool | None:
+        """Which venue is cheaper RIGHT NOW -> True when Entropy should be the LONG leg.
+
+        Deliberately lighter than _build_plan: only the two prices matter, sizes and leverage do not
+        change with the direction. None means "could not read" — the caller then keeps its side."""
+        try:
+            s = await self._exec.http()
+            eprice = (self._feed.mid(pair.entropy) if self._feed else None)
+            if not eprice:
+                eprice = (await md.entropy_marks(s, self._cfg.hyperliquid_api_url,
+                                                 self._cfg.entropy_dex)).get(pair.entropy)
+            lmk = (await md.lighter_markets(s, self._cfg.lighter_api_url)).get(pair.lighter)
+            lprice = await md.lighter_mark(s, self._cfg.lighter_api_url, lmk.market_id) if lmk else None
+            if not eprice or not lprice:
+                return None
+            return cheaper_is_entropy(float(eprice), float(lprice))
+        except Exception:  # noqa: BLE001 — a failed read just leaves the side as planned
+            return None
+
     async def _build_plan(self, pair, margin, leverage, entropy_long):
         """Returns (plan, effective_leverage). Leverage is clamped to the lower of the two venues'
         per-coin maxima, and the notional = margin × that effective leverage."""

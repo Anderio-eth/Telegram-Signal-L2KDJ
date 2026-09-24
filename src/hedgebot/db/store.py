@@ -326,7 +326,7 @@ class Store:
 
     async def update_hedge(self, hedge_id: int, **fields) -> None:
         cols = {"status", "realized_pnl", "fees", "entropy_vol", "lighter_vol", "notional_usd",
-                "opened_at"}
+                "opened_at", "entropy_side"}
         sets, vals = [], []
         for k, v in fields.items():
             if k in cols:
