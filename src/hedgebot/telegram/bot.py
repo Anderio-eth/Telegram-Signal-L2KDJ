@@ -50,7 +50,7 @@ MENU_BTN = "☰ Меню"  # the one persistent reply-keyboard button, always at
 # at all -- silently, with no error anywhere. Add the callback here and the button works.
 INPUT_CALLBACKS = (
     "key:lighter", "key:entropy", "key:gsheets", "cfg:margin",
-    "sess:hold", "sess:pause", "sess:timeout", "sess:margin", "sess:reprice", "sess:split",
+    "sess:hold", "sess:pause", "sess:margin", "sess:reprice", "sess:split",
     "prof:add", "prof:proxy",
 )
 # Dynamic callbacks: a row index is appended (prof:ren:0). Same list, same rules as above.
@@ -65,7 +65,7 @@ SESS_INPUT_FLOWS = tuple(c.replace(":", "_") for c in SESS_INPUTS)
 SESS_DEFAULT = {
     "coins": [PAIRS[0].key], "leverage": 3, "margin": 5.0,
     "hold_min": 1800, "hold_max": 7200, "pause_on": False, "pause_min": 300, "pause_max": 1800,
-    "duration": 86400, "fill_timeout": 90, "reprice_s": 8, "dry_run": True, "notify_each": False,
+    "duration": 86400, "reprice_s": 8, "dry_run": True, "notify_each": False,
     # Split mode: набирати позицію кількома лімітками замість однієї, щоб кожен хедж на Lighter був
     # дрібним і не рухав стакан. Вимкнено — класика лишається поведінкою за замовчуванням.
     "split_on": False, "split_parts": 10, "split_gap_s": 7,
@@ -777,12 +777,7 @@ class HedgeBot:
                        "Лімітка ставиться за 2 тіки від ціни і стоїть рівно стільки — не менше і не "
                        "більше. Потім бот її знімає, хеджує на Lighter те, що встигло залитись, і "
                        "ставить нову лімітку на залишок. І так, поки не набереться весь розмір.")
-            elif data == "sess:timeout":
-                msg = ("⏳ Надішли <b>таймаут лімітки на ЗАКРИТТІ</b>, у секундах (напр. 90).\n\n"
-                       "Скільки reduce-only лімітка на Entropy може чекати, перш ніж залишок "
-                       "дозакриється маркетом.\n\n"
-                       "На <b>відкритті</b> таймауту немає: лімітка переставляється за ціною, поки не "
-                       "набере повний розмір або поки ти не натиснеш СТОП.")
+
             elif data == "sess:hold":
                 msg = ("⏱ Надішли <b>діапазон утримання у хвилинах</b> — два числа через пробіл.\n\n"
                        "Напр. <code>30 120</code> (30хв–2г) або <code>60 1440</code> (1г–24г).\n"
@@ -977,8 +972,6 @@ class HedgeBot:
                     if value <= 0:
                         raise ValueError
                     s["margin"] = value
-                elif flow == "sess_timeout":
-                    s["fill_timeout"] = max(5, int(float(text)))
                 elif flow == "sess_reprice":
                     s["reprice_s"] = max(1, int(float(text)))
                 elif flow == "sess_split":
@@ -1100,7 +1093,7 @@ class HedgeBot:
             f"⏱ Утримання: <b>{hold}</b>\n"
             f"⏸ Пауза: <b>{pause}</b>\n"
             f"🗓 Тривалість: <b>{self._fmt_secs(s['duration'])}</b>\n"
-            f"⏳ Таймаут закриття: <b>{s['fill_timeout']}с</b>   🎯 Крок лімітки: <b>{s.get('reprice_s', 8)}с</b>\n"
+            f"🎯 Крок лімітки: <b>{s.get('reprice_s', 8)}с</b>\n"
             f"🧩 Набір: <b>{('розбивка ' + str(s.get('split_parts', 10)) + ' × ' + str(s.get('split_gap_s', 7)) + 'с') if s.get('split_on') else 'класика (одна лімітка)'}</b>\n"
             f"🔔 Алерти по хеджах: <b>{'увімк' if s.get('notify_each') else 'вимк (у таблицю)'}</b>\n"
             f"🧪 Режим: <b>{'DRY-RUN (тест)' if s['dry_run'] else 'LIVE (реальні ордери)'}</b>\n\n"
@@ -1113,8 +1106,7 @@ class HedgeBot:
             [InlineKeyboardButton("⏱ Утримання", callback_data="sess:hold"),
              InlineKeyboardButton("⏸ Пауза", callback_data="sess:pause")],
             [InlineKeyboardButton(f"⏸ Пауза: {'увімк' if s['pause_on'] else 'вимк'}", callback_data="sess:pausetoggle")],
-            [InlineKeyboardButton("🗓 Тривалість", callback_data="sess:dur"),
-             InlineKeyboardButton("⏳ Таймаут закриття", callback_data="sess:timeout")],
+            [InlineKeyboardButton("🗓 Тривалість", callback_data="sess:dur")],
             [InlineKeyboardButton(f"🎯 Крок лімітки {s.get('reprice_s', 8)}с", callback_data="sess:reprice")],
             [InlineKeyboardButton(f"🧩 Розбивка: {'увімк' if s.get('split_on') else 'вимк'}",
                                   callback_data="sess:splittoggle"),

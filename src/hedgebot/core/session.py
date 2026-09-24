@@ -13,9 +13,12 @@ Two modes:
                away. Closing is the same in reverse (reduce-only limit on Entropy, then Lighter),
                followed by a market pass that flattens anything the maker order didn't.
 
-`fill_timeout` is how long the Entropy limit may work (re-quoting as the price moves). Nothing filled
-by then -> the cycle is skipped with no position. Partly filled -> the filled part is kept if it could
-be hedged, otherwise both legs are flattened so no naked delta is ever left.
+Neither side has a deadline. The Entropy limit is re-quoted to within a couple of ticks of the CURRENT
+price every `reprice_s` until it has the full size, opening and closing alike — each filled slice is
+mirrored on the other venue immediately, so the hedge is delta-neutral throughout and an unfilled
+order costs nothing to leave standing. STOP stops the session from opening the NEXT position; the one
+already on still leaves by limit. The only market orders a normal cycle sends are the Lighter mirrors,
+a sub-$10 remainder the venues will not quote, and the emergency flatten when a leg is liquidated.
 
 Live fill detection reads real positions on both venues; close is reduce-only on both (Entropy market
 close, Lighter reduce-only IOC crossing the book). PnL logged to the sheet is each leg's unrealised
@@ -271,7 +274,7 @@ class SessionEngine:
             # Maker-first: Entropy post-only limit, Lighter at market as it fills (see core/execution).
             # until_complete: a hedge is either opened at the size the user asked for, or not opened.
             # Sessions never move on to the next cycle with a half-filled leg.
-            fr = await self.open_maker_first(ent, lit, plan, timeout=cfg.get("fill_timeout", 90), sid=sid,
+            fr = await self.open_maker_first(ent, lit, plan, sid=sid,
                                              until_complete=True, owner=owner, pair=pair,
                                              reprice_s=cfg.get("reprice_s"), profile=profile,
                                              parts=parts, gap_s=gap_s)
@@ -332,7 +335,7 @@ class SessionEngine:
                 return
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=opened_ms,
                                           lit_equity_before=lit_equity_before, maker=True, sid=sid,
-                                          timeout=cfg.get("fill_timeout", 90), reprice_s=cfg.get("reprice_s"),
+                                          reprice_s=cfg.get("reprice_s"),
                                           profile=profile, parts=parts, gap_s=gap_s,
                                           until_complete=True)
             await self._store.update_hedge(hid, status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"],
@@ -420,7 +423,7 @@ class SessionEngine:
                     await self._store.update_hedge(h["id"], status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"])
                     continue
             res = await self._close_hedge(ent, lit, pair, owner=owner, since_ms=since_ms, maker=True, sid=sid,
-                                          timeout=cfg.get("fill_timeout", 90), reprice_s=cfg.get("reprice_s"),
+                                          reprice_s=cfg.get("reprice_s"),
                                           profile=profile, until_complete=True)
             await self._store.update_hedge(h["id"], status="CLOSED", realized_pnl=res["pnl"], fees=res["fees"])
             vol = float(h.get("notional_usd", 0) or 0) * 2
@@ -596,7 +599,7 @@ class SessionEngine:
 
         self._watchers[key] = asyncio.create_task(run(), name=f"guard-{owner}-{profile}-{pair.key}")
 
-    async def open_maker_first(self, ent, lit, plan, *, timeout: float, sid: int | None = None,
+    async def open_maker_first(self, ent, lit, plan, *, timeout: float = 90.0, sid: int | None = None,
                                until_complete: bool = False, owner=None, pair=None,
                                reprice_s: float | None = None, profile: str = "",
                                parts: int = 1, gap_s: float = 0.0):
@@ -732,27 +735,18 @@ class SessionEngine:
         # hard as an entry does.
         lpx = await self._exec.lighter_mid(lmk.market_id) or 0.0
         chunks = split_sizes(abs(szi), l_abs, emk, lmk, lpx, lpx, parts)
-        # A SCHEDULED close has no deadline, for the same reason an open has none: both legs shrink
-        # together, so the position stays hedged the whole way and an unfilled reduce-only order costs
-        # nothing to leave standing. A dust remainder still returns early (see execution.fill), so it
-        # cannot hang on the last few dollars, and the caller's market pass sweeps that up.
-        #
-        # `until_complete` therefore also decides who may interrupt. Normally this close ignores STOP,
-        # because STOP is usually what ASKED for it — but with no deadline that would make STOP do
-        # nothing at all, so an unbounded close listens for it and hands over to the market pass.
-        budget = None if until_complete else time.monotonic() + max(60.0, len(chunks) * (gap_s + 30.0))
-        stopping = (lambda: self._stopping(sid)) if (until_complete and sid is not None) else None
+        # No deadline, for the same reason an open has none: both legs shrink together, so the
+        # position stays hedged the whole way down and an unfilled reduce-only order costs nothing to
+        # leave standing. STOP does not cut this short either — it stops the session from opening the
+        # NEXT position; the one already on still leaves by limit, which is the whole point of never
+        # paying the taker fee. A dust remainder (under Entropy's $10) still returns early, and the
+        # caller's market pass sweeps that up — the only market order a normal close ever sends.
         for i, (e_sz, l_sz) in enumerate(chunks, start=1):
-            if i > 1:
-                if gap_s > 0:
-                    await asyncio.sleep(gap_s)
-                if budget is not None and time.monotonic() > budget:
-                    LOGGER.info("maker close %s: ladder out of time at %d/%d — market pass takes the rest",
-                                pair.label, i, len(chunks))
-                    return
+            if i > 1 and gap_s > 0:
+                await asyncio.sleep(gap_s)
             fr = await self._exec.fill(ent, lit, emk, lmk, e_is_buy=szi < 0, e_target=e_sz,
                                        l_is_ask=l_is_ask, l_target=l_sz, closing=True,
-                                       timeout=timeout, stopping=stopping, reprice_s=reprice_s,
+                                       timeout=timeout, stopping=None, reprice_s=reprice_s,
                                        until_complete=until_complete)
             if fr.error:
                 LOGGER.warning("maker close %s: %s — falling back to market", pair.label, fr.error)
@@ -993,13 +987,12 @@ class SessionEngine:
                         if pair and float(p.get("szi", 0) or 0) != 0:
                             open_pairs.append(pair)
                     if open_pairs:
-                        t = float((cfg or {}).get("fill_timeout", 90))
-                        await self._say(owner, "⏹ Закриваю відкриті хеджі ліміткою на Entropy "
-                                               f"(до {self._fmt(t)}, далі — маркетом)…", profile)
+                        await self._say(owner, "⏹ Сесія завершується: нових позицій не відкриваю, "
+                                               "відкриті закриваю ліміткою на Entropy…", profile)
                         await asyncio.gather(*(self._guard(self._close_hedge(ent, lit, pair, owner=owner, maker=True,
-                                                                             timeout=t,
                                                                              reprice_s=(cfg or {}).get("reprice_s"),
-                                                                             profile=profile))
+                                                                             profile=profile,
+                                                                             until_complete=True))
                                                for pair in open_pairs))
                 # 1) cancel all resting orders on both venues at once
                 await asyncio.gather(
